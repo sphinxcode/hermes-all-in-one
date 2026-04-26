@@ -64,6 +64,19 @@ webui_manager = WebUIManager()
 dashboard_manager = DashboardManager()
 gateway_manager = GatewayManager()
 _status_cache: dict[str, object] = {"ts": 0.0, "data": None}
+_dav_middleware: WSGIMiddleware | None = None
+
+
+def _get_dav_middleware() -> WSGIMiddleware:
+    global _dav_middleware
+    if _dav_middleware is None:
+        _dav_middleware = WSGIMiddleware(build_dav_app())
+    return _dav_middleware
+
+
+class DeferredDAVApp:
+    async def __call__(self, scope, receive, send) -> None:
+        await _get_dav_middleware()(scope, receive, send)
 
 
 def dashboard_update_not_supported_status() -> dict[str, object]:
@@ -127,6 +140,7 @@ def _admin_required(request: Request) -> Response | None:
 
 async def on_startup() -> None:
     ensure_runtime_dirs()
+    _get_dav_middleware()
     webui_manager.start()
     webui_manager.wait_until_ready(timeout=30)
     dashboard_manager.start()
@@ -452,7 +466,7 @@ routes = [
     Route("/admin/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/admin/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
-    Mount("/dav", app=WSGIMiddleware(build_dav_app())),
+    Mount("/dav", app=DeferredDAVApp()),
     Route("/dashboard", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard/{path:path}", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard-api/hermes/update", dashboard_update_not_supported, methods=["POST"]),
