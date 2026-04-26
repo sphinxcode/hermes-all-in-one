@@ -99,6 +99,7 @@ function renderStatus(status) {
   latestStatus = status;
 
   const webui = status.webui || {};
+  const dashboard = status.dashboard || {};
   const gateway = status.gateway || {};
   const model = status.model || {};
   const paths = status.paths || {};
@@ -116,6 +117,13 @@ function renderStatus(status) {
     gLine.textContent = gateway.running
       ? gateway.healthy ? `Running · healthy (uptime ${gateway.uptime_seconds || 0}s)` : 'Starting…'
       : `Stopped · autostart ${status.autostart ? 'eligible' : 'not ready (needs provider + channel)'}`;
+  }
+
+  const dLine = qs('#dashboard-status-line');
+  if (dLine) {
+    dLine.textContent = dashboard.healthy
+      ? `Healthy on ${dashboard.internal_base_url || '127.0.0.1:9119'}`
+      : dashboard.running ? 'Starting up…' : 'Not running';
   }
 
   const pLine = qs('#paths-line');
@@ -301,6 +309,24 @@ function wireRuntimeControls() {
       } finally {
         restartWebuiBtn.disabled = false;
         restartWebuiBtn.textContent = 'Restart WebUI';
+      }
+    });
+  }
+
+  const restartDashboardBtn = qs('#restart-dashboard');
+  if (restartDashboardBtn) {
+    restartDashboardBtn.addEventListener('click', async () => {
+      restartDashboardBtn.disabled = true;
+      restartDashboardBtn.textContent = 'Restarting…';
+      try {
+        const payload = await postJson('/admin/api/dashboard/restart', {});
+        if (payload.status) renderStatus(payload.status);
+        else await refreshStatus();
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        restartDashboardBtn.disabled = false;
+        restartDashboardBtn.textContent = 'Restart Dashboard';
       }
     });
   }
