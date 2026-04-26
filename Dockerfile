@@ -20,6 +20,11 @@ COPY start.sh /app/start.sh
 ARG HERMES_WEBUI_VERSION=unknown
 
 RUN printf "__version__ = '%s'\n" "$HERMES_WEBUI_VERSION" > /app/vendor/hermes-webui/api/_version.py \
+    && cd /app/vendor/hermes-agent/web \
+    && npm ci --prefer-offline --no-audit \
+    && npm run build \
+    && npm cache clean --force \
+    && cd /app \
     && uv pip install --system --no-cache -e "/app/vendor/hermes-agent[messaging]" \
     && uv pip install --system --no-cache -r /app/vendor/hermes-webui/requirements.txt \
     && uv pip install --system --no-cache -r /app/requirements-control-plane.txt \
@@ -33,9 +38,12 @@ ENV HOME=/data \
     HERMES_CONFIG_PATH=/data/.hermes/config.yaml \
     HERMES_WEBUI_STATE_DIR=/data/webui \
     HERMES_WEBUI_AGENT_DIR=/app/vendor/hermes-agent \
+    HERMES_WEB_DIST=/app/vendor/hermes-agent/hermes_cli/web_dist \
     HERMES_WORKSPACE_DIR=/data/workspace \
     CONTROL_PLANE_INTERNAL_WEBUI_HOST=127.0.0.1 \
     CONTROL_PLANE_INTERNAL_WEBUI_PORT=8788 \
+    CONTROL_PLANE_INTERNAL_DASHBOARD_HOST=127.0.0.1 \
+    CONTROL_PLANE_INTERNAL_DASHBOARD_PORT=9119 \
     HERMES_GATEWAY_AUTOSTART=auto \
     PORT=8787
 

@@ -43,14 +43,16 @@ from control_plane.config import (
     provider_catalog,
     save_channel_values,
 )
+from control_plane.dashboard_manager import DashboardManager
 from control_plane.gateway_manager import GatewayManager
-from control_plane.proxy import proxy_to_webui
+from control_plane.proxy import proxy_to_dashboard, proxy_to_webui
 from control_plane.webui_manager import WebUIManager
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 webui_manager = WebUIManager()
+dashboard_manager = DashboardManager()
 gateway_manager = GatewayManager()
 _status_cache: dict[str, object] = {"ts": 0.0, "data": None}
 
@@ -69,6 +71,7 @@ def _current_status() -> dict:
     config = load_yaml_config(HERMES_CONFIG_PATH)
     data = {
         "webui": webui_manager.status(),
+        "dashboard": dashboard_manager.status(),
         "gateway": gateway_manager.status(),
         "model": extract_model_config(config),
         "channels": channel_summary(env_values),
@@ -99,6 +102,8 @@ async def on_startup() -> None:
     ensure_runtime_dirs()
     webui_manager.start()
     webui_manager.wait_until_ready(timeout=30)
+    dashboard_manager.start()
+    dashboard_manager.wait_until_ready(timeout=30)
     if gateway_manager.should_autostart():
         gateway_manager.start()
     _invalidate_status_cache()
@@ -106,22 +111,26 @@ async def on_startup() -> None:
 
 async def on_shutdown() -> None:
     gateway_manager.stop()
+    dashboard_manager.stop()
     webui_manager.stop()
 
 
 async def health(request: Request) -> JSONResponse:
     status = _current_status()
     webui_ok = bool(status["webui"]["healthy"])
+    dashboard_ok = bool(status["dashboard"]["healthy"])
+    all_ok = webui_ok and dashboard_ok
     payload = {
-        "status": "ok" if webui_ok else "degraded",
+        "status": "ok" if all_ok else "degraded",
         "service": "hermes-control-plane",
         "webui": status["webui"],
+        "dashboard": status["dashboard"],
         "gateway": {
             "running": status["gateway"]["running"],
             "healthy": status["gateway"]["healthy"],
         },
     }
-    return JSONResponse(payload, status_code=200 if webui_ok else 503)
+    return JSONResponse(payload, status_code=200 if all_ok else 503)
 
 
 async def admin_login_page(request: Request) -> HTMLResponse:
@@ -263,9 +272,43 @@ async def api_webui_action(request: Request) -> Response:
     return JSONResponse({"ok": True, "status": webui_manager.status()})
 
 
+async def api_dashboard_action(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    action = request.path_params["action"]
+    if action == "restart":
+        dashboard_manager.restart()
+        dashboard_manager.wait_until_ready(timeout=30)
+    else:
+        return JSONResponse({"error": "unknown action"}, status_code=400)
+    _invalidate_status_cache()
+    return JSONResponse({"ok": True, "status": dashboard_manager.status()})
+
+
 async def proxy_catchall(request: Request) -> Response:
     path = request.path_params.get("path", "")
     return await proxy_to_webui(request, path)
+
+
+async def proxy_dashboard_app(request: Request) -> Response:
+    path = request.path_params.get("path", "")
+    return await proxy_to_dashboard(request, path, rewrite_html=True)
+
+
+async def proxy_dashboard_api(request: Request) -> Response:
+    path = request.path_params.get("path", "")
+    return await proxy_to_dashboard(request, f"api/{path}")
+
+
+async def proxy_dashboard_assets(request: Request) -> Response:
+    path = request.path_params.get("path", "")
+    return await proxy_to_dashboard(request, f"assets/{path}")
+
+
+async def proxy_dashboard_plugins(request: Request) -> Response:
+    path = request.path_params.get("path", "")
+    return await proxy_to_dashboard(request, f"dashboard-plugins/{path}")
 
 
 routes = [
@@ -280,7 +323,16 @@ routes = [
     Route("/admin/api/channels", api_channel_values, methods=["GET"]),
     Route("/admin/api/channels/save", api_channel_save, methods=["POST"]),
     Route("/admin/api/webui/{action}", api_webui_action, methods=["POST"]),
+    Route("/admin/api/dashboard/{action}", api_dashboard_action, methods=["POST"]),
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
+    Route("/dashboard", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard/", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard/{path:path}", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard-api", proxy_dashboard_api, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard-api/", proxy_dashboard_api, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard-api/{path:path}", proxy_dashboard_api, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard-assets/{path:path}", proxy_dashboard_assets, methods=["GET", "OPTIONS", "HEAD"]),
+    Route("/dashboard-plugins/{path:path}", proxy_dashboard_plugins, methods=["GET", "OPTIONS", "HEAD"]),
     Route("/", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/{path:path}", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
 ]

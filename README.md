@@ -28,6 +28,7 @@ Log in with `HERMES_ADMIN_PASSWORD` (or `HERMES_WEBUI_PASSWORD` if admin passwor
 | Surface | URL | What it is |
 |---------|-----|-----------|
 | **WebUI** | `/` | Hermes chat interface in the browser |
+| **Dashboard** | `/dashboard` | Hermes-agent native dashboard (sessions, config, plugins) |
 | **Control Plane** | `/admin` | Provider + channel setup, gateway controls, logs |
 | **Health** | `/health` | Railway health check endpoint |
 
@@ -44,6 +45,10 @@ Everything shares one Hermes identity — the same memory, skills, config, and S
 **Hermes WebUI** — `/`
 
 ![Hermes WebUI](assets/hermeswebui.png)
+
+**Hermes Dashboard** — `/dashboard`
+
+Uses the Hermes-agent native dashboard UI, proxied through the control plane.
 
 ---
 
