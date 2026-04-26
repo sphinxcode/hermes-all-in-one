@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from control_plane.config import HERMES_CONFIG_PATH, HERMES_ENV_PATH, HERMES_HOME, HOME_DIR, should_autostart_gateway
+from control_plane.config import HERMES_CONFIG_PATH, HERMES_ENV_PATH, HERMES_HOME, HOME_DIR, load_env_file, should_autostart_gateway
 
 
 class GatewayManager:
@@ -37,6 +37,7 @@ class GatewayManager:
             if self.is_running():
                 return
             env = os.environ.copy()
+            env.update(load_env_file(HERMES_ENV_PATH))
             env.update(
                 {
                     "HOME": str(HOME_DIR),

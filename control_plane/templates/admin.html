@@ -20,6 +20,7 @@
           <button class="nav-link active" data-panel="overview">Overview</button>
           <button class="nav-link" data-panel="providers">Providers</button>
           <button class="nav-link" data-panel="channels">Channels</button>
+          <button class="nav-link" data-panel="users">Users <span class="pairing-badge" id="pending-count" style="display:none"></span></button>
           <button class="nav-link" data-panel="logs">Logs</button>
         </nav>
         <div class="sidebar-footer">
@@ -155,27 +156,35 @@
 
         <!-- CHANNELS -->
         <section class="panel" id="panel-channels">
+
+          <article class="card" style="margin-bottom:18px">
+            <span class="eyebrow">Gateway access</span>
+            <h3>User authorization mode</h3>
+            <p class="muted">Controls who can message your bot. Per-channel allowlists (below) take priority. If no allowlists are set, users go through the pairing approval flow in the Users tab — unless you enable open access here.</p>
+            <form id="gateway-access-form" class="form-grid">
+              <label class="toggle-row">
+                <input type="checkbox" id="input-GATEWAY_ALLOW_ALL_USERS">
+                <span>Allow all users — skip allowlists and pairing (use with caution)</span>
+              </label>
+              <div class="form-actions">
+                <button class="primary-button" type="submit">Save access settings</button>
+              </div>
+            </form>
+            <div class="inline-status" id="gateway-access-form-status" style="display:none"></div>
+          </article>
+
           <div class="grid two-up">
 
             <article class="card">
               <span class="eyebrow">Telegram</span>
               <h3>Bot connection</h3>
-              <p class="muted">Your Hermes agent's Telegram identity. The bot token connects the gateway; allowed user IDs control who can chat.</p>
+              <p class="muted">Paste your bot token from <strong>@BotFather</strong>. Users are managed via the pairing flow in the Users tab.</p>
               <form id="telegram-form" class="form-grid" data-channel="telegram">
                 <label>
                   <span>Bot token</span>
                   <input type="password" name="TELEGRAM_BOT_TOKEN" id="input-TELEGRAM_BOT_TOKEN"
                     placeholder="123456:ABCdef… — leave blank to keep current">
                   <small class="field-hint" id="hint-TELEGRAM_BOT_TOKEN"></small>
-                </label>
-                <label>
-                  <span>Allowed user IDs</span>
-                  <input type="text" name="TELEGRAM_ALLOWED_USERS" id="input-TELEGRAM_ALLOWED_USERS"
-                    placeholder="e.g. 123456789,987654321">
-                  <small class="field-hint">
-                    Comma-separated numeric Telegram user IDs. Only these users can chat with your bot.
-                    Don't know your ID? Message <strong>@userinfobot</strong> on Telegram.
-                  </small>
                 </label>
                 <div class="form-actions">
                   <button class="primary-button" type="submit">Save Telegram</button>
@@ -187,19 +196,13 @@
             <article class="card">
               <span class="eyebrow">Discord</span>
               <h3>Bot connection</h3>
-              <p class="muted">Connect your Hermes agent to a Discord server.</p>
+              <p class="muted">Connect your Hermes agent to a Discord server. Users are managed via pairing.</p>
               <form id="discord-form" class="form-grid" data-channel="discord">
                 <label>
                   <span>Bot token</span>
                   <input type="password" name="DISCORD_BOT_TOKEN" id="input-DISCORD_BOT_TOKEN"
                     placeholder="Leave blank to keep current">
                   <small class="field-hint" id="hint-DISCORD_BOT_TOKEN"></small>
-                </label>
-                <label>
-                  <span>Allowed user IDs</span>
-                  <input type="text" name="DISCORD_ALLOWED_USERS" id="input-DISCORD_ALLOWED_USERS"
-                    placeholder="Optional — comma-separated Discord user IDs">
-                  <small class="field-hint" id="hint-DISCORD_ALLOWED_USERS"></small>
                 </label>
                 <div class="form-actions">
                   <button class="primary-button" type="submit">Save Discord</button>
@@ -254,6 +257,57 @@
               <div class="inline-status" id="email-form-status" style="display:none"></div>
             </article>
 
+          </div>
+        </section>
+
+        <!-- USERS -->
+        <section class="panel" id="panel-users">
+          <div class="grid">
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <span class="eyebrow">Pending</span>
+                  <h3>Pairing requests</h3>
+                </div>
+                <button class="secondary-button small-button" id="refresh-pairing" type="button">Refresh</button>
+              </div>
+              <p class="muted">When an unauthorized user messages your bot, they receive a pairing code. Approve or deny them here.</p>
+              <div id="pending-list">
+                <p class="muted" id="pending-empty">No pending pairing requests.</p>
+                <table class="data-table" id="pending-table" style="display:none">
+                  <thead>
+                    <tr>
+                      <th>Platform</th>
+                      <th>Username</th>
+                      <th>User ID</th>
+                      <th>Age</th>
+                      <th class="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="pending-tbody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="card">
+              <span class="eyebrow">Approved</span>
+              <h3>Active users</h3>
+              <div id="approved-list">
+                <p class="muted" id="approved-empty">No approved users yet.</p>
+                <table class="data-table" id="approved-table" style="display:none">
+                  <thead>
+                    <tr>
+                      <th>Platform</th>
+                      <th>Username</th>
+                      <th>User ID</th>
+                      <th>Approved</th>
+                      <th class="col-actions">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="approved-tbody"></tbody>
+                </table>
+              </div>
+            </article>
           </div>
         </section>
 

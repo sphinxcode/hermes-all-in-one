@@ -154,14 +154,14 @@ async function loadChannelFormValues() {
     for (const [key, value] of Object.entries(values)) {
       const input = qs(`#input-${key}`);
       if (!input) continue;
-      if (input.type === 'password') {
-        // Show hint that a value is saved; don't put masked value in password field
+      if (input.type === 'checkbox') {
+        input.checked = (value || '').toLowerCase() === 'true';
+      } else if (input.type === 'password') {
         const hint = qs(`#hint-${key}`);
         if (hint && !hint.dataset.static) {
           hint.textContent = value ? `Saved (${value})` : '';
         }
       } else {
-        // Plaintext fields like TELEGRAM_ALLOWED_USERS — safe to show directly
         input.value = value || '';
       }
     }
@@ -261,8 +261,8 @@ function wireChannelForms() {
 
       try {
         const payload = await postJson('/admin/api/channels/save', data);
-        showStatus(statusEl, 'Saved.', 'success');
-        // Reload form values to reflect saved state
+        const msg = payload.restarted ? 'Saved — gateway restarting.' : 'Saved.';
+        showStatus(statusEl, msg, 'success');
         await loadChannelFormValues();
         await refreshStatus();
       } catch (err) {
@@ -271,6 +271,33 @@ function wireChannelForms() {
         if (btn) { btn.disabled = false; btn.textContent = origText; }
       }
     });
+  });
+}
+
+// ── Gateway access form ──────────────────────────────────────────────────────
+
+function wireGatewayAccessForm() {
+  const form = qs('#gateway-access-form');
+  const statusEl = qs('#gateway-access-form-status');
+  const checkbox = qs('#input-GATEWAY_ALLOW_ALL_USERS');
+  if (!form || !checkbox) return;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = { GATEWAY_ALLOW_ALL_USERS: checkbox.checked ? 'true' : 'false' };
+    const btn = form.querySelector('[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+    showStatus(statusEl, 'Saving…', 'info');
+    try {
+      const payload = await postJson('/admin/api/channels/save', data);
+      const msg = payload.restarted ? 'Saved — gateway restarting.' : 'Saved.';
+      showStatus(statusEl, msg, 'success');
+      await refreshStatus();
+    } catch (err) {
+      showStatus(statusEl, err.message, 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Save access settings'; }
+    }
   });
 }
 
@@ -366,6 +393,128 @@ function startPolling() {
   refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 5000);
 }
 
+// ── Pairing / Users ──────────────────────────────────────────────────────────
+
+function formatDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+async function loadPairing() {
+  try {
+    const [pendingRes, approvedRes] = await Promise.all([
+      fetch('/admin/api/pairing/pending', { headers: { Accept: 'application/json' } }),
+      fetch('/admin/api/pairing/approved', { headers: { Accept: 'application/json' } }),
+    ]);
+    if (pendingRes.ok) renderPending((await pendingRes.json()).pending || []);
+    if (approvedRes.ok) renderApproved((await approvedRes.json()).approved || []);
+  } catch (_) { /* non-fatal */ }
+}
+
+function renderPending(items) {
+  const empty = qs('#pending-empty');
+  const table = qs('#pending-table');
+  const tbody = qs('#pending-tbody');
+  const badge = qs('#pending-count');
+  if (!tbody) return;
+
+  if (badge) {
+    if (items.length > 0) {
+      badge.textContent = items.length;
+      badge.style.display = '';
+    } else {
+      badge.style.display = 'none';
+    }
+  }
+
+  if (items.length === 0) {
+    if (empty) empty.style.display = '';
+    if (table) table.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (table) table.style.display = '';
+
+  tbody.innerHTML = items.map(req => `
+    <tr>
+      <td class="platform">${esc(req.platform)}</td>
+      <td>${esc(req.user_name || '—')}</td>
+      <td class="mono">${esc(req.user_id)}</td>
+      <td>${req.age_minutes}m ago</td>
+      <td>
+        <div class="action-row">
+          <button class="btn-approve" onclick="approveUser('${esc(req.platform)}', '${esc(req.code)}')">Approve</button>
+          <button class="btn-deny" onclick="denyUser('${esc(req.platform)}', '${esc(req.code)}')">Deny</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function renderApproved(items) {
+  const empty = qs('#approved-empty');
+  const table = qs('#approved-table');
+  const tbody = qs('#approved-tbody');
+  if (!tbody) return;
+
+  if (items.length === 0) {
+    if (empty) empty.style.display = '';
+    if (table) table.style.display = 'none';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  if (table) table.style.display = '';
+
+  tbody.innerHTML = items.map(user => `
+    <tr>
+      <td class="platform">${esc(user.platform)}</td>
+      <td>${esc(user.user_name || '—')}</td>
+      <td class="mono">${esc(user.user_id)}</td>
+      <td>${formatDate(user.approved_at)}</td>
+      <td>
+        <div class="action-row">
+          <button class="btn-revoke" onclick="revokeUser('${esc(user.platform)}', '${esc(user.user_id)}')">Revoke</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function esc(str) {
+  const d = document.createElement('div');
+  d.textContent = str || '';
+  return d.innerHTML;
+}
+
+async function approveUser(platform, code) {
+  try {
+    await postJson('/admin/api/pairing/approve', { platform, code });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+async function denyUser(platform, code) {
+  try {
+    await postJson('/admin/api/pairing/deny', { platform, code });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+async function revokeUser(platform, userId) {
+  if (!confirm('Revoke access for this user?')) return;
+  try {
+    await postJson('/admin/api/pairing/revoke', { platform, user_id: userId });
+    await loadPairing();
+  } catch (err) { alert(err.message); }
+}
+
+function wirePairing() {
+  const refreshBtn = qs('#refresh-pairing');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', () => loadPairing());
+  }
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 wireNavigation();
@@ -373,6 +522,10 @@ wireRuntimeControls();
 wireProviderSelect();
 wireProviderForm();
 wireChannelForms();
+wireGatewayAccessForm();
+wirePairing();
 renderStatus(initialStatus);
 loadChannelFormValues();
 startPolling();
+loadPairing();
+setInterval(() => loadPairing(), 5000);
