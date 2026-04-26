@@ -502,7 +502,7 @@ The gateway starts automatically. Send `/start` to your bot on Telegram — it s
 
 `SOUL.md` controls the agent's persistent persona and behavior — its name, how it speaks, what it cares about. In this template it lives at `/data/.hermes/SOUL.md` on the persistent volume.
 
-Edit it directly from the Hermes WebUI, then restart the gateway from `/admin` → Overview → **Restart** to apply changes.
+Edit it from the Hermes WebUI under **Settings** → **System** → **SOUL.md**, then restart the gateway from `/admin` → Overview → **Restart** to apply changes.
 
 For full formatting guidance, persona examples, and what `SOUL.md` can control, see the [Hermes Agent documentation](https://github.com/NousResearch/hermes-agent).
 

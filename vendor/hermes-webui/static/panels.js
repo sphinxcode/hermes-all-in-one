@@ -1118,6 +1118,7 @@ let _settingsThemeOnOpen = null; // track theme at open time for discard revert
 let _settingsSkinOnOpen = null; // track skin at open time for discard revert
 let _settingsFontSizeOnOpen = null; // track font size at open time for discard revert
 let _settingsHermesDefaultModelOnOpen = '';
+let _settingsSoulOnOpen = '';
 let _settingsSection = 'conversation';
 
 function switchSettingsSection(name){
@@ -1243,6 +1244,31 @@ function _markSettingsDirty(){
   _settingsDirty = true;
 }
 
+async function _loadSoulSettings(){
+  const field=$('settingsSoul');
+  if(!field)return;
+  const pathEl=$('settingsSoulPath');
+  try{
+    const soul=await api('/api/soul');
+    field.value=soul.content||'';
+    _settingsSoulOnOpen=field.value;
+    if(pathEl)pathEl.textContent=soul.path||'';
+    field.oninput=_markSettingsDirty;
+  }catch(e){
+    if(pathEl)pathEl.textContent='Failed to load SOUL.md';
+  }
+}
+
+async function _saveSoulIfChanged(){
+  const field=$('settingsSoul');
+  if(!field)return;
+  if(field.value===_settingsSoulOnOpen)return;
+  const saved=await api('/api/soul',{method:'POST',body:JSON.stringify({content:field.value})});
+  _settingsSoulOnOpen=field.value;
+  const pathEl=$('settingsSoulPath');
+  if(pathEl&&saved.path)pathEl.textContent=saved.path;
+}
+
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
@@ -1335,6 +1361,7 @@ async function loadSettingsPanel(){
     // Password field: always blank (we don't send hash back)
     const pwField=$('settingsPassword');
     if(pwField){pwField.value='';pwField.addEventListener('input',_markSettingsDirty,{once:false});}
+    await _loadSoulSettings();
     // Show auth buttons only when auth is active
     try{
       const authStatus=await api('/api/auth/status');
@@ -1422,6 +1449,7 @@ async function saveSettings(andClose){
           if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
         }
       }
+      await _saveSoulIfChanged();
       _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showCliSessions,theme,skin,language,sidebarDensity});
       showToast(t(saved.auth_just_enabled?'settings_saved_pw':'settings_saved_pw_updated'));
       _hideSettingsPanel();
@@ -1438,6 +1466,7 @@ async function saveSettings(andClose){
         if(typeof showToast==='function') showToast('Failed to update default model — settings saved');
       }
     }
+    await _saveSoulIfChanged();
     _applySavedSettingsUi(saved, body, {sendKey,showTokenUsage,showCliSessions,theme,skin,language,sidebarDensity});
     showToast(t('settings_saved'));
     _hideSettingsPanel();

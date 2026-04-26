@@ -24,6 +24,24 @@ _PROVIDER_ALIASES = {
     "openai-codex": "openai",
 }
 
+
+def _active_soul_path() -> Path:
+    home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser().resolve()
+    return home / "SOUL.md"
+
+
+def _ensure_soul_file() -> Path:
+    path = _active_soul_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        try:
+            from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+            path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        except Exception:
+            path.write_text("", encoding="utf-8")
+    return path
+
 from api.config import (
     STATE_DIR,
     SESSION_DIR,
@@ -585,6 +603,19 @@ def handle_get(handler, parsed) -> bool:
         except Exception:
             pass
         return j(handler, settings)
+
+    if parsed.path == "/api/soul":
+        try:
+            path = _ensure_soul_file()
+            return j(
+                handler,
+                {
+                    "path": str(path),
+                    "content": path.read_text(encoding="utf-8", errors="replace"),
+                },
+            )
+        except OSError as exc:
+            return bad(handler, f"Failed to read SOUL.md: {exc}", 500)
 
     if parsed.path == "/api/reasoning":
         # Current reasoning config (shared source of truth with the CLI —
@@ -1329,6 +1360,19 @@ def handle_post(handler, parsed) -> bool:
         handler.end_headers()
         handler.wfile.write(response_body)
         return True
+
+    if parsed.path == "/api/soul":
+        content = body.get("content")
+        if not isinstance(content, str):
+            return bad(handler, "content must be a string", 400)
+        if len(content.encode("utf-8")) > 200_000:
+            return bad(handler, "SOUL.md is too large", 413)
+        try:
+            path = _ensure_soul_file()
+            path.write_text(content, encoding="utf-8")
+            return j(handler, {"ok": True, "path": str(path)})
+        except OSError as exc:
+            return bad(handler, f"Failed to write SOUL.md: {exc}", 500)
 
     if parsed.path == "/api/onboarding/setup":
         # Writing API keys to disk - restrict to local/private networks unless auth is active.

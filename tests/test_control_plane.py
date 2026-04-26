@@ -12,6 +12,7 @@ from control_plane.config import (
     should_autostart_gateway,
     write_env_updates,
 )
+from control_plane.server import dashboard_update_not_supported_status
 
 
 def test_write_env_updates_round_trips_values(tmp_path: Path):
@@ -89,3 +90,12 @@ def test_should_autostart_gateway_requires_provider_and_channel(tmp_path: Path):
 def test_admin_session_round_trip():
     cookie = create_admin_session()
     assert verify_admin_session(cookie) is True
+
+
+def test_dashboard_update_status_explains_container_redeploy_path():
+    status = dashboard_update_not_supported_status()
+
+    assert status["name"] == "hermes-update"
+    assert status["running"] is False
+    assert status["exit_code"] == 1
+    assert any("Railway/container image" in line for line in status["lines"])

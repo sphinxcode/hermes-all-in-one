@@ -57,6 +57,23 @@ gateway_manager = GatewayManager()
 _status_cache: dict[str, object] = {"ts": 0.0, "data": None}
 
 
+def dashboard_update_not_supported_status() -> dict[str, object]:
+    return {
+        "name": "hermes-update",
+        "running": False,
+        "exit_code": 1,
+        "pid": None,
+        "lines": [
+            "Hermes Agent updates are managed by the Railway/container image in this deployment.",
+            "",
+            "The dashboard's built-in update action expects /app/vendor/hermes-agent to be a writable Git checkout.",
+            "This all-in-one image bakes the vendored agent into the container, so in-place `hermes update` would be lost on the next deploy.",
+            "",
+            "To update Hermes Agent here, sync the vendored upstream locally, rebuild the image, and redeploy.",
+        ],
+    }
+
+
 def _invalidate_status_cache() -> None:
     _status_cache["ts"] = 0.0
     _status_cache["data"] = None
@@ -286,6 +303,20 @@ async def api_dashboard_action(request: Request) -> Response:
     return JSONResponse({"ok": True, "status": dashboard_manager.status()})
 
 
+async def dashboard_update_not_supported(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse({"ok": True, "pid": None, "name": "hermes-update"})
+
+
+async def dashboard_update_status(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse(dashboard_update_not_supported_status())
+
+
 async def proxy_catchall(request: Request) -> Response:
     path = request.path_params.get("path", "")
     return await proxy_to_webui(request, path)
@@ -339,6 +370,8 @@ routes = [
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
     Route("/dashboard", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard/{path:path}", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
+    Route("/dashboard-api/hermes/update", dashboard_update_not_supported, methods=["POST"]),
+    Route("/dashboard-api/actions/hermes-update/status", dashboard_update_status, methods=["GET"]),
     Route("/dashboard-api", proxy_dashboard_api, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard-api/{path:path}", proxy_dashboard_api, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard-assets/{path:path}", proxy_dashboard_assets, methods=["GET", "OPTIONS", "HEAD"]),
