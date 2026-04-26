@@ -164,7 +164,7 @@ async def admin_login(request: Request) -> Response:
         samesite="lax",
         max_age=24 * 60 * 60,
         secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "") == "https",
-        path="/admin",
+        path="/",
     )
     return response
 
@@ -292,21 +292,33 @@ async def proxy_catchall(request: Request) -> Response:
 
 
 async def proxy_dashboard_app(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
     path = request.path_params.get("path", "")
     return await proxy_to_dashboard(request, path, rewrite_html=True)
 
 
 async def proxy_dashboard_api(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
     path = request.path_params.get("path", "")
     return await proxy_to_dashboard(request, f"api/{path}")
 
 
 async def proxy_dashboard_assets(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
     path = request.path_params.get("path", "")
     return await proxy_to_dashboard(request, f"assets/{path}")
 
 
 async def proxy_dashboard_plugins(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
     path = request.path_params.get("path", "")
     return await proxy_to_dashboard(request, f"dashboard-plugins/{path}")
 
