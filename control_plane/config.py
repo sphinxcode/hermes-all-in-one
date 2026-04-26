@@ -32,6 +32,17 @@ ADMIN_SESSION_TTL = int(os.getenv("HERMES_ADMIN_SESSION_TTL", str(24 * 60 * 60))
 ADMIN_COOKIE_NAME = "hermes_admin_session"
 STATUS_CACHE_TTL = float(os.getenv("CONTROL_PLANE_STATUS_CACHE_TTL", "2.0"))
 
+
+def deployment_metadata() -> dict[str, str]:
+    return {
+        "public_domain": os.getenv("RAILWAY_PUBLIC_DOMAIN", ""),
+        "snapshot_id": os.getenv("RAILWAY_SNAPSHOT_ID", ""),
+        "git_commit_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA", ""),
+        "git_branch": os.getenv("RAILWAY_GIT_BRANCH", ""),
+        "git_repo_owner": os.getenv("RAILWAY_GIT_REPO_OWNER", ""),
+        "git_repo_name": os.getenv("RAILWAY_GIT_REPO_NAME", ""),
+    }
+
 _SUPPORTED_PROVIDER_SETUPS: dict[str, dict[str, Any]] = {
     "openrouter": {
         "label": "OpenRouter",
