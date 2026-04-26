@@ -105,12 +105,12 @@ def set_admin_cookie(response: Response, cookie_value: str) -> None:
         samesite="lax",
         max_age=ADMIN_SESSION_TTL,
         secure=request_is_secure(response.headers.get("x-forwarded-proto")),
-        path="/admin",
+        path="/",
     )
 
 
 def clear_admin_cookie(response: Response) -> None:
-    response.delete_cookie(ADMIN_COOKIE_NAME, path="/admin")
+    response.delete_cookie(ADMIN_COOKIE_NAME, path="/")
 
 
 def request_is_secure(proto_header: str | None) -> bool:
@@ -118,6 +118,6 @@ def request_is_secure(proto_header: str | None) -> bool:
 
 
 def admin_unauthorized_response(request: Request) -> Response:
-    if request.url.path.startswith("/admin/api/"):
+    if request.url.path.startswith(("/admin/api/", "/dashboard-api")):
         return JSONResponse({"error": "Authentication required"}, status_code=401)
     return RedirectResponse(url="/admin/login", status_code=302)
