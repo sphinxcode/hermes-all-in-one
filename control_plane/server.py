@@ -9,6 +9,7 @@ from pathlib import Path
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.middleware.wsgi import WSGIMiddleware
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
@@ -50,6 +51,7 @@ from control_plane.config import (
     revoke_user,
     save_channel_values,
 )
+from control_plane.dav import build_dav_app
 from control_plane.dashboard_manager import DashboardManager
 from control_plane.gateway_manager import GatewayManager
 from control_plane.proxy import proxy_to_dashboard, proxy_to_webui
@@ -450,6 +452,7 @@ routes = [
     Route("/admin/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/admin/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
+    Mount("/dav", app=WSGIMiddleware(build_dav_app())),
     Route("/dashboard", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard/{path:path}", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard-api/hermes/update", dashboard_update_not_supported, methods=["POST"]),
