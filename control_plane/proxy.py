@@ -25,6 +25,30 @@ _HOP_BY_HOP = {
 }
 
 
+def _rewrite_dashboard_location(location: str | None) -> str | None:
+    if not location or not location.startswith("/"):
+        return location
+    if location == "/":
+        return "/dashboard"
+    if location == "/api" or location.startswith("/api/"):
+        return "/dashboard-api" + location[4:]
+    if location.startswith("/assets/"):
+        return "/dashboard-assets" + location[7:]
+    if location.startswith("/dashboard-plugins/"):
+        return location
+    if location.startswith("/dashboard"):
+        return location
+    return "/dashboard" + location
+
+
+def _dashboard_response_headers(headers: dict[str, str]) -> dict[str, str]:
+    rewritten = dict(headers)
+    location = rewritten.get("location")
+    if location:
+        rewritten["location"] = _rewrite_dashboard_location(location) or location
+    return rewritten
+
+
 async def proxy_to_webui(request: Request, path: str) -> Response:
     upstream_path = "/" + path.lstrip("/")
     target_url = f"{INTERNAL_WEBUI_BASE}{upstream_path}"
@@ -138,6 +162,7 @@ async def proxy_to_dashboard(
                 for key, value in upstream_response.headers.items()
                 if key.lower() not in _HOP_BY_HOP
             }
+            response_headers = _dashboard_response_headers(response_headers)
             content_type = upstream_response.headers.get("content-type", "").lower()
             if "text/html" in content_type:
                 html = upstream_response.text
@@ -168,6 +193,7 @@ async def proxy_to_dashboard(
         for key, value in upstream_response.headers.items()
         if key.lower() not in _HOP_BY_HOP
     }
+    response_headers = _dashboard_response_headers(response_headers)
 
     async def _close_upstream() -> None:
         await upstream_response.aclose()
