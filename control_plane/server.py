@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -35,6 +36,7 @@ from control_plane.config import (
     apply_provider_setup,
     channel_form_values,
     channel_summary,
+    deployment_metadata,
     ensure_runtime_dirs,
     extract_model_config,
     load_env_file,
@@ -79,6 +81,7 @@ def _current_status() -> dict:
         "autostart": gateway_manager.should_autostart(),
         "provider_catalog": provider_catalog(),
         "unsupported_provider_note": UNSUPPORTED_PROVIDER_NOTE,
+        "deployment": deployment_metadata(),
         "paths": {
             "hermes_home": str(HERMES_CONFIG_PATH.parent),
             "config_path": str(HERMES_CONFIG_PATH),
@@ -125,6 +128,7 @@ async def health(request: Request) -> JSONResponse:
         "service": "hermes-control-plane",
         "webui": status["webui"],
         "dashboard": status["dashboard"],
+        "deployment": status["deployment"],
         "gateway": {
             "running": status["gateway"]["running"],
             "healthy": status["gateway"]["healthy"],
@@ -347,4 +351,14 @@ routes = [
     Route("/{path:path}", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
 ]
 
-app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    await on_startup()
+    try:
+        yield
+    finally:
+        await on_shutdown()
+
+
+app = Starlette(routes=routes, lifespan=lifespan)
