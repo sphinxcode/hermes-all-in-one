@@ -109,6 +109,9 @@ assert payload['paths']['workspace_dir'] == '/data/workspace'
 print('[smoke] admin status paths OK')
 PY
 
+dashboard_status="$(curl --silent --output /dev/null --write-out '%{http_code}' -b "${COOKIE_JAR}" "http://127.0.0.1:${HOST_PORT}/dashboard")"
+assert_eq "$dashboard_status" "200" "authenticated /dashboard should render"
+
 echo "[smoke] exercising control-plane actions"
 curl --silent --show-error --fail -b "${COOKIE_JAR}" -X POST "http://127.0.0.1:${HOST_PORT}/admin/api/webui/restart" -o /dev/null >/dev/null
 wait_for_health "http://127.0.0.1:${HOST_PORT}/health"
