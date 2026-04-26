@@ -24,6 +24,7 @@
         </nav>
         <div class="sidebar-footer">
           <a href="/" class="link-button">Open WebUI</a>
+          <a href="/dashboard" class="link-button">Open Dashboard</a>
           <form method="post" action="/admin/logout">
             <button class="ghost-button" type="submit">Sign out</button>
           </form>
@@ -34,10 +35,11 @@
         <header class="topbar">
           <div>
             <h1>Hermes Control Plane</h1>
-            <p>WebUI at <code>/</code> · Admin at <code>/admin</code> · One shared Hermes identity</p>
+            <p>WebUI at <code>/</code> · Dashboard at <code>/dashboard</code> · Admin at <code>/admin</code> · One shared Hermes identity</p>
           </div>
           <div class="topbar-actions">
             <button class="secondary-button" id="refresh-status" type="button">Refresh</button>
+            <button class="secondary-button" id="restart-dashboard" type="button">Restart Dashboard</button>
             <button class="primary-button" id="restart-webui" type="button">Restart WebUI</button>
           </div>
         </header>
@@ -49,6 +51,11 @@
               <span class="eyebrow">Public surface</span>
               <h2>WebUI</h2>
               <p id="webui-status-line" class="muted">Loading…</p>
+            </article>
+            <article class="card metric-card">
+              <span class="eyebrow">Public surface</span>
+              <h2>Dashboard</h2>
+              <p id="dashboard-status-line" class="muted">Loading…</p>
             </article>
             <article class="card metric-card">
               <span class="eyebrow">Gateway</span>

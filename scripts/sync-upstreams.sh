@@ -10,7 +10,7 @@ AGENT_REMOTE_REF="main"
 AGENT_PREFIX="vendor/hermes-agent"
 
 WEBUI_REMOTE_NAME="hermes-webui-upstream"
-WEBUI_REMOTE_URL="https://github.com/sphinxcode/hermes-webui.git"
+WEBUI_REMOTE_URL="https://github.com/nesquena/hermes-webui.git"
 WEBUI_REMOTE_REF="master"
 WEBUI_PREFIX="vendor/hermes-webui"
 
