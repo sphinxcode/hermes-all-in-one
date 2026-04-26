@@ -6,14 +6,18 @@ from wsgidav.fs_dav_provider import FilesystemProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 from control_plane.auth import admin_auth_enabled
-from control_plane.config import ADMIN_PASSWORD, DATA_DIR
+from control_plane.config import ADMIN_PASSWORD, DATA_DIR, WEBUI_AGENT_DIR
 
 _DAV_USERNAME = "admin"
 
 
 def build_dav_app() -> Callable:
+    provider_mapping: dict = {"/": FilesystemProvider(str(DATA_DIR))}
+    if WEBUI_AGENT_DIR.exists():
+        provider_mapping["/vendor/hermes-agent"] = FilesystemProvider(str(WEBUI_AGENT_DIR))
+
     config: dict = {
-        "provider_mapping": {"/": FilesystemProvider(str(DATA_DIR))},
+        "provider_mapping": provider_mapping,
         "verbose": 0,
         "logging": {"enable_loggers": []},
     }
