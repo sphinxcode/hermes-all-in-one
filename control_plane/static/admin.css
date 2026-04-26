@@ -136,6 +136,39 @@ input, select {
 .inline-status--success { background: rgba(16,185,129,.08); border-color: rgba(16,185,129,.3); color: #34d399; }
 .inline-status--error   { background: rgba(239,68,68,.08);  border-color: rgba(239,68,68,.3);  color: #f87171; }
 .inline-status--info    { background: var(--bg-muted); border-color: var(--border); color: var(--muted); }
+.data-table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+.data-table th {
+  text-align: left; padding: 8px 12px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--muted); border-bottom: 1px solid var(--border);
+}
+.data-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.data-table .col-actions { text-align: right; }
+.data-table .mono { font-family: "SFMono-Regular", ui-monospace, Consolas, monospace; font-size: 12px; }
+.data-table .platform { text-transform: capitalize; }
+.btn-approve {
+  padding: 6px 14px; border-radius: 10px; border: 0; cursor: pointer; font: inherit; font-size: 13px;
+  background: rgba(16,185,129,.15); color: #34d399; transition: background .18s;
+}
+.btn-approve:hover { background: rgba(16,185,129,.25); }
+.btn-deny, .btn-revoke {
+  padding: 6px 14px; border-radius: 10px; border: 0; cursor: pointer; font: inherit; font-size: 13px;
+  background: rgba(239,68,68,.12); color: #f87171; transition: background .18s;
+}
+.btn-deny:hover, .btn-revoke:hover { background: rgba(239,68,68,.22); }
+.action-row { display: flex; gap: 8px; justify-content: flex-end; }
+.toggle-row {
+  display: flex; align-items: center; gap: 12px; flex-direction: row; cursor: pointer;
+}
+.toggle-row input[type="checkbox"] {
+  width: 18px; height: 18px; accent-color: var(--primary); cursor: pointer; flex-shrink: 0;
+}
+.toggle-row span { color: var(--text); font-size: 14px; }
+.pairing-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
+  background: var(--danger); color: white; font-size: 11px; font-weight: 700;
+  margin-left: 8px; vertical-align: middle;
+}
 @media (max-width: 1080px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }

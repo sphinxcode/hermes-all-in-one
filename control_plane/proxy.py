@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import httpx
 from starlette.background import BackgroundTask
 from starlette.requests import Request
@@ -47,6 +49,18 @@ def _dashboard_response_headers(headers: dict[str, str]) -> dict[str, str]:
     if location:
         rewritten["location"] = _rewrite_dashboard_location(location) or location
     return rewritten
+
+
+def _dashboard_request_headers(headers_in: Mapping[str, str]) -> dict[str, str]:
+    headers = {}
+    for key, value in headers_in.items():
+        lower = key.lower()
+        if lower in _HOP_BY_HOP or lower == "host":
+            continue
+        headers[key] = value
+    # Dashboard enforces Host header checks. Always present the internal host.
+    headers["Host"] = f"{INTERNAL_DASHBOARD_HOST}:{INTERNAL_DASHBOARD_PORT}"
+    return headers
 
 
 async def proxy_to_webui(request: Request, path: str) -> Response:
@@ -135,14 +149,7 @@ async def proxy_to_dashboard(
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
 
-    headers = {}
-    for key, value in request.headers.items():
-        lower = key.lower()
-        if lower in _HOP_BY_HOP:
-            continue
-        headers[key] = value
-    # Dashboard enforces Host header checks. Always present the internal host.
-    headers["Host"] = f"{INTERNAL_DASHBOARD_HOST}:{INTERNAL_DASHBOARD_PORT}"
+    headers = _dashboard_request_headers(request.headers)
     headers["X-Forwarded-Host"] = request.headers.get("host", "")
     headers["X-Forwarded-Proto"] = request.url.scheme
     headers["X-Real-Host"] = request.headers.get("host", "")

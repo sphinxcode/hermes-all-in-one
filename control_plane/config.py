@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,17 @@ ADMIN_PASSWORD = os.getenv("HERMES_ADMIN_PASSWORD", os.getenv("HERMES_WEBUI_PASS
 ADMIN_SESSION_TTL = int(os.getenv("HERMES_ADMIN_SESSION_TTL", str(24 * 60 * 60)))
 ADMIN_COOKIE_NAME = "hermes_admin_session"
 STATUS_CACHE_TTL = float(os.getenv("CONTROL_PLANE_STATUS_CACHE_TTL", "2.0"))
+
+
+def deployment_metadata() -> dict[str, str]:
+    return {
+        "public_domain": os.getenv("RAILWAY_PUBLIC_DOMAIN", ""),
+        "snapshot_id": os.getenv("RAILWAY_SNAPSHOT_ID", ""),
+        "git_commit_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA", ""),
+        "git_branch": os.getenv("RAILWAY_GIT_BRANCH", ""),
+        "git_repo_owner": os.getenv("RAILWAY_GIT_REPO_OWNER", ""),
+        "git_repo_name": os.getenv("RAILWAY_GIT_REPO_NAME", ""),
+    }
 
 _SUPPORTED_PROVIDER_SETUPS: dict[str, dict[str, Any]] = {
     "openrouter": {
@@ -257,7 +270,8 @@ def should_autostart_gateway(
 
 
 def save_channel_values(env_path: Path, updates: dict[str, str | None]) -> dict[str, str]:
-    filtered = {key: value for key, value in updates.items() if key in CHANNEL_ENV_KEYS}
+    allowed = set(CHANNEL_ENV_KEYS) | GATEWAY_EXTRA_KEYS
+    filtered = {key: value for key, value in updates.items() if key in allowed}
     write_env_updates(env_path, filtered)
     return load_env_file(env_path)
 
@@ -272,14 +286,16 @@ def masked_env_snapshot(env_values: dict[str, str]) -> dict[str, str]:
     return masked
 
 
-_PLAINTEXT_CHANNEL_KEYS = {"TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS"}
+GATEWAY_EXTRA_KEYS = {"GATEWAY_ALLOW_ALL_USERS"}
+
+_PLAINTEXT_CHANNEL_KEYS = {"TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"}
 
 
 def channel_form_values(env_values: dict[str, str]) -> dict[str, str]:
     """Return channel env values safe to pre-populate form fields.
     Tokens/passwords are masked; user ID lists are returned plaintext."""
     result: dict[str, str] = {}
-    for key in CHANNEL_ENV_KEYS:
+    for key in (*CHANNEL_ENV_KEYS, *GATEWAY_EXTRA_KEYS):
         value = env_values.get(key, "")
         if not value:
             result[key] = ""
@@ -325,3 +341,112 @@ def provider_catalog() -> list[dict[str, Any]]:
         }
         for key, meta in _SUPPORTED_PROVIDER_SETUPS.items()
     ]
+
+
+_PAIRING_OLD = HERMES_HOME / "pairing"
+_PAIRING_NEW = HERMES_HOME / "platforms" / "pairing"
+CODE_TTL_SECONDS = 3600
+
+
+def _pairing_dir() -> Path:
+    """Resolve pairing directory — matches gateway's get_hermes_dir() logic."""
+    if _PAIRING_OLD.exists():
+        return _PAIRING_OLD
+    return _PAIRING_NEW
+
+
+def _load_pairing_json(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_pairing_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def pairing_platforms(suffix: str) -> list[str]:
+    d = _pairing_dir()
+    if not d.exists():
+        return []
+    return [
+        f.stem.rsplit(f"-{suffix}", 1)[0]
+        for f in d.glob(f"*-{suffix}.json")
+    ]
+
+
+def get_pending_pairings() -> list[dict[str, Any]]:
+    now = time.time()
+    results: list[dict[str, Any]] = []
+    d = _pairing_dir()
+    for platform in pairing_platforms("pending"):
+        pending = _load_pairing_json(d / f"{platform}-pending.json")
+        for code, info in pending.items():
+            age = now - info.get("created_at", now)
+            if age > CODE_TTL_SECONDS:
+                continue
+            results.append({
+                "platform": platform,
+                "code": code,
+                "user_id": info.get("user_id", ""),
+                "user_name": info.get("user_name", ""),
+                "age_minutes": int(age / 60),
+            })
+    return results
+
+
+def get_approved_users() -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    d = _pairing_dir()
+    for platform in pairing_platforms("approved"):
+        approved = _load_pairing_json(d / f"{platform}-approved.json")
+        for user_id, info in approved.items():
+            results.append({
+                "platform": platform,
+                "user_id": user_id,
+                "user_name": info.get("user_name", ""),
+                "approved_at": info.get("approved_at", 0),
+            })
+    return results
+
+
+def approve_pairing(platform: str, code: str) -> dict[str, str]:
+    d = _pairing_dir()
+    pending_path = d / f"{platform}-pending.json"
+    pending = _load_pairing_json(pending_path)
+    if code not in pending:
+        raise KeyError("Code not found or expired")
+    entry = pending.pop(code)
+    _save_pairing_json(pending_path, pending)
+    approved_path = d / f"{platform}-approved.json"
+    approved = _load_pairing_json(approved_path)
+    approved[entry["user_id"]] = {
+        "user_name": entry.get("user_name", ""),
+        "approved_at": time.time(),
+    }
+    _save_pairing_json(approved_path, approved)
+    return {"user_id": entry["user_id"], "user_name": entry.get("user_name", "")}
+
+
+def deny_pairing(platform: str, code: str) -> None:
+    pending_path = _pairing_dir() / f"{platform}-pending.json"
+    pending = _load_pairing_json(pending_path)
+    if code in pending:
+        del pending[code]
+        _save_pairing_json(pending_path, pending)
+
+
+def revoke_user(platform: str, user_id: str) -> None:
+    approved_path = _pairing_dir() / f"{platform}-approved.json"
+    approved = _load_pairing_json(approved_path)
+    if user_id in approved:
+        del approved[user_id]
+        _save_pairing_json(approved_path, approved)

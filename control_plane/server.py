@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -33,14 +34,20 @@ from control_plane.config import (
     WEBUI_STATE_DIR,
     WORKSPACE_DIR,
     apply_provider_setup,
+    approve_pairing,
     channel_form_values,
     channel_summary,
+    deployment_metadata,
+    deny_pairing,
     ensure_runtime_dirs,
     extract_model_config,
+    get_approved_users,
+    get_pending_pairings,
     load_env_file,
     load_yaml_config,
     masked_env_snapshot,
     provider_catalog,
+    revoke_user,
     save_channel_values,
 )
 from control_plane.dashboard_manager import DashboardManager
@@ -96,6 +103,7 @@ def _current_status() -> dict:
         "autostart": gateway_manager.should_autostart(),
         "provider_catalog": provider_catalog(),
         "unsupported_provider_note": UNSUPPORTED_PROVIDER_NOTE,
+        "deployment": deployment_metadata(),
         "paths": {
             "hermes_home": str(HERMES_CONFIG_PATH.parent),
             "config_path": str(HERMES_CONFIG_PATH),
@@ -142,6 +150,7 @@ async def health(request: Request) -> JSONResponse:
         "service": "hermes-control-plane",
         "webui": status["webui"],
         "dashboard": status["dashboard"],
+        "deployment": status["deployment"],
         "gateway": {
             "running": status["gateway"]["running"],
             "healthy": status["gateway"]["healthy"],
@@ -249,7 +258,9 @@ async def api_provider_setup(request: Request) -> Response:
         base_url=str(body.get("base_url") or ""),
     )
     _invalidate_status_cache()
-    if gateway_manager.should_autostart() and not gateway_manager.is_running():
+    if gateway_manager.is_running():
+        gateway_manager.restart()
+    elif gateway_manager.should_autostart():
         gateway_manager.start()
     return JSONResponse({"ok": True, "result": result, "status": _current_status()})
 
@@ -267,12 +278,22 @@ async def api_channel_save(request: Request) -> Response:
     if unauthorized:
         return unauthorized
     body = await request.json()
-    updates = {key: body.get(key) for key in CHANNEL_ENV_KEYS if key in body}
+    all_keys = set(CHANNEL_ENV_KEYS) | {"GATEWAY_ALLOW_ALL_USERS"}
+    updates = {key: body.get(key) for key in all_keys if key in body}
+    if "TELEGRAM_BOT_TOKEN" in updates:
+        updates.setdefault("TELEGRAM_ALLOWED_USERS", None)
+    if "DISCORD_BOT_TOKEN" in updates:
+        updates.setdefault("DISCORD_ALLOWED_USERS", None)
     env_values = save_channel_values(HERMES_ENV_PATH, updates)
     _invalidate_status_cache()
-    if gateway_manager.should_autostart() and not gateway_manager.is_running():
+    restarted = False
+    if gateway_manager.is_running():
+        gateway_manager.restart()
+        restarted = True
+    elif gateway_manager.should_autostart():
         gateway_manager.start()
-    return JSONResponse({"ok": True, "channels": channel_summary(env_values), "status": _current_status()})
+        restarted = True
+    return JSONResponse({"ok": True, "restarted": restarted, "channels": channel_summary(env_values), "status": _current_status()})
 
 
 async def api_webui_action(request: Request) -> Response:
@@ -315,6 +336,62 @@ async def dashboard_update_status(request: Request) -> Response:
     if unauthorized:
         return unauthorized
     return JSONResponse(dashboard_update_not_supported_status())
+
+
+async def api_pairing_pending(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse({"ok": True, "pending": get_pending_pairings()})
+
+
+async def api_pairing_approved(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    return JSONResponse({"ok": True, "approved": get_approved_users()})
+
+
+async def api_pairing_approve(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    code = str(body.get("code", "")).upper().strip()
+    if not platform or not code:
+        return JSONResponse({"error": "platform and code required"}, status_code=400)
+    try:
+        result = approve_pairing(platform, code)
+    except KeyError:
+        return JSONResponse({"error": "Code not found or expired"}, status_code=404)
+    return JSONResponse({"ok": True, **result})
+
+
+async def api_pairing_deny(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    code = str(body.get("code", "")).upper().strip()
+    if not platform or not code:
+        return JSONResponse({"error": "platform and code required"}, status_code=400)
+    deny_pairing(platform, code)
+    return JSONResponse({"ok": True})
+
+
+async def api_pairing_revoke(request: Request) -> Response:
+    unauthorized = _admin_required(request)
+    if unauthorized:
+        return unauthorized
+    body = await request.json()
+    platform = str(body.get("platform", "")).strip()
+    user_id = str(body.get("user_id", "")).strip()
+    if not platform or not user_id:
+        return JSONResponse({"error": "platform and user_id required"}, status_code=400)
+    revoke_user(platform, user_id)
+    return JSONResponse({"ok": True})
 
 
 async def proxy_catchall(request: Request) -> Response:
@@ -367,6 +444,11 @@ routes = [
     Route("/admin/api/channels/save", api_channel_save, methods=["POST"]),
     Route("/admin/api/webui/{action}", api_webui_action, methods=["POST"]),
     Route("/admin/api/dashboard/{action}", api_dashboard_action, methods=["POST"]),
+    Route("/admin/api/pairing/pending", api_pairing_pending),
+    Route("/admin/api/pairing/approved", api_pairing_approved),
+    Route("/admin/api/pairing/approve", api_pairing_approve, methods=["POST"]),
+    Route("/admin/api/pairing/deny", api_pairing_deny, methods=["POST"]),
+    Route("/admin/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
     Mount("/admin/static", app=StaticFiles(directory=str(BASE_DIR / "static")), name="admin-static"),
     Route("/dashboard", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
     Route("/dashboard/{path:path}", proxy_dashboard_app, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
@@ -380,4 +462,14 @@ routes = [
     Route("/{path:path}", proxy_catchall, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]),
 ]
 
-app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    await on_startup()
+    try:
+        yield
+    finally:
+        await on_shutdown()
+
+
+app = Starlette(routes=routes, lifespan=lifespan)

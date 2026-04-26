@@ -28,6 +28,7 @@ RUN printf "__version__ = '%s'\n" "$HERMES_WEBUI_VERSION" > /app/vendor/hermes-w
     && npm cache clean --force \
     && cd /app \
     && uv pip install --system --no-cache -e "/app/vendor/hermes-agent[messaging]" \
+    && uv pip install --system --no-cache fastapi "uvicorn[standard]" \
     && uv pip install --system --no-cache -r /app/vendor/hermes-webui/requirements.txt \
     && uv pip install --system --no-cache -r /app/requirements-control-plane.txt \
     && uv pip install --system --no-cache "mcp>=1.24.0" \
