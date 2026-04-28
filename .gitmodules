@@ -1,0 +1,3 @@
+[submodule "vendor/hermes-agent/tinker-atropos"]
+    path = vendor/hermes-agent/tinker-atropos
+    url = https://github.com/nousresearch/tinker-atropos
