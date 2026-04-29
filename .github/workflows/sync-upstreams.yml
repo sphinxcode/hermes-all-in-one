@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   sync:
@@ -41,15 +40,9 @@ jobs:
         run: |
           git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash -m "chore(sync): update vendor/hermes-webui from upstream" || true
 
-      - name: Create Pull Request if changes exist
+      - name: Push if changed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if ! git diff --quiet HEAD~1 HEAD; then
-            branch="sync-upstreams-$(date +%s)"
-            git checkout -b "$branch"
-            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
-            gh pr create --fill --base main --head "$branch"
-          else
-            echo "Nothing to push."
-          fi
+          git diff --quiet HEAD~1 HEAD 2>/dev/null && echo "Nothing to push." && exit 0
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/sphinxcode/hermes-all-in-one.git" main
