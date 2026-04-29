@@ -54,11 +54,13 @@ Both `provider` and `model` are **required**. If either is missing, the fallback
 | xAI (Grok) | `xai` (alias `grok`) | `XAI_API_KEY` (optional: `XAI_BASE_URL`) |
 | AWS Bedrock | `bedrock` | Standard boto3 auth (`AWS_REGION` + `AWS_PROFILE` or `AWS_ACCESS_KEY_ID`) |
 | Qwen Portal (OAuth) | `qwen-oauth` | `hermes model` (Qwen Portal OAuth; optional: `HERMES_QWEN_BASE_URL`) |
+| MiniMax (OAuth) | `minimax-oauth` | `hermes model` (MiniMax portal OAuth) |
 | OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
 | Kilo Code | `kilocode` | `KILOCODE_API_KEY` |
 | Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
 | Arcee AI | `arcee` | `ARCEEAI_API_KEY` |
+| GMI Cloud | `gmi` | `GMI_API_KEY` |
 | Alibaba / DashScope | `alibaba` | `DASHSCOPE_API_KEY` |
 | Hugging Face | `huggingface` | `HF_TOKEN` |
 | Custom endpoint | `custom` | `base_url` + `key_env` (see below) |
@@ -168,7 +170,6 @@ Hermes uses separate lightweight models for side tasks. Each task has its own pr
 | Session Search | Past session summarization | `auxiliary.session_search` |
 | Skills Hub | Skill search and discovery | `auxiliary.skills_hub` |
 | MCP | MCP helper operations | `auxiliary.mcp` |
-| Memory Flush | Memory consolidation | `auxiliary.flush_memories` |
 | Approval | Smart command-approval classification | `auxiliary.approval` |
 | Title Generation | Session title summaries | `auxiliary.title_generation` |
 
@@ -224,10 +225,6 @@ auxiliary:
     model: ""
 
   mcp:
-    provider: "auto"
-    model: ""
-
-  flush_memories:
     provider: "auto"
     model: ""
 ```
@@ -365,7 +362,6 @@ See [Scheduled Tasks (Cron)](/docs/user-guide/features/cron) for full configurat
 | Session search | Auto-detection chain | `auxiliary.session_search` |
 | Skills hub | Auto-detection chain | `auxiliary.skills_hub` |
 | MCP helpers | Auto-detection chain | `auxiliary.mcp` |
-| Memory flush | Auto-detection chain | `auxiliary.flush_memories` |
 | Approval classification | Auto-detection chain | `auxiliary.approval` |
 | Title generation | Auto-detection chain | `auxiliary.title_generation` |
 | Delegation | Provider override only (no automatic fallback) | `delegation.provider` / `delegation.model` |
