@@ -19,6 +19,7 @@ class GatewayManager:
         self.start_time: float | None = None
         self._lock = threading.Lock()
         self._restart_allowed = True
+        self._stopping = False
 
     def _monitor_process(self, proc: subprocess.Popen[str]) -> None:
         returncode = proc.wait()
@@ -75,6 +76,8 @@ class GatewayManager:
 
     def start(self) -> None:
         with self._lock:
+            if self._stopping:
+                return
             self._restart_allowed = True
             if self.is_running():
                 return
@@ -84,19 +87,29 @@ class GatewayManager:
         proc: subprocess.Popen[str] | None = None
         with self._lock:
             self._restart_allowed = False
+            if self._stopping:
+                return
             if not self.is_running():
+                self.process = None
+                self.start_time = None
                 return
             assert self.process is not None
+            self._stopping = True
             proc = self.process
-            self.process = None
-            self.start_time = None
         assert proc is not None
-        proc.terminate()
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        finally:
+            with self._lock:
+                if self.process is proc:
+                    self.process = None
+                    self.start_time = None
+                self._stopping = False
 
     def restart(self) -> None:
         self.stop()
