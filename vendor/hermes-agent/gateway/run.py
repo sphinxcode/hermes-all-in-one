@@ -5996,12 +5996,17 @@ class GatewayRunner:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
-        # When running under a service manager (systemd/launchd), use the
-        # service restart path: exit with code 75 so the service manager
-        # restarts us.  The detached subprocess approach (setsid + bash)
+        # When running under a service manager or control-plane supervisor,
+        # use the service restart path: exit with code 75 so the supervisor
+        # restarts us. The detached subprocess approach (setsid + bash)
         # doesn't work under systemd because KillMode=mixed kills all
-        # processes in the cgroup, including the detached helper.
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        # processes in the cgroup, including the detached helper, and it can
+        # race under control-plane-managed deployments by launching a second
+        # gateway before the first one fully releases platform resources.
+        _under_service = bool(
+            os.environ.get("INVOCATION_ID")
+            or os.environ.get("HERMES_GATEWAY_SERVICE_MANAGER")
+        )
         if _under_service:
             self.request_restart(detached=False, via_service=True)
         else:
