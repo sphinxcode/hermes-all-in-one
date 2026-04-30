@@ -18,6 +18,48 @@ class GatewayManager:
         self.logs: deque[str] = deque(maxlen=1000)
         self.start_time: float | None = None
         self._lock = threading.Lock()
+        self._restart_allowed = True
+        self._stopping = False
+
+    def _monitor_process(self, proc: subprocess.Popen[str]) -> None:
+        returncode = proc.wait()
+        should_restart = False
+        with self._lock:
+            if self.process is proc:
+                self.process = None
+                self.start_time = None
+                should_restart = returncode == 75 and self._restart_allowed
+        if should_restart:
+            self.logs.append("Gateway requested supervisor restart (exit 75); relaunching.")
+            try:
+                with self._lock:
+                    if self.process is None and self._restart_allowed:
+                        self._start_locked()
+            except Exception as exc:
+                self.logs.append(f"Gateway restart failed: {exc}")
+
+    def _start_locked(self) -> None:
+        env = os.environ.copy()
+        env.update(load_env_file(HERMES_ENV_PATH))
+        env.update(
+            {
+                "HOME": str(HOME_DIR),
+                "HERMES_HOME": str(HERMES_HOME),
+                "HERMES_CONFIG_PATH": str(HERMES_CONFIG_PATH),
+                "HERMES_GATEWAY_SERVICE_MANAGER": "control-plane",
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        self.process = subprocess.Popen(
+            ["hermes", "gateway"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        self.start_time = time.time()
+        threading.Thread(target=self._capture_stream, args=(self.process.stdout,), daemon=True).start()
+        threading.Thread(target=self._monitor_process, args=(self.process,), daemon=True).start()
 
     def _capture_stream(self, stream) -> None:
         if stream is None:
@@ -34,39 +76,40 @@ class GatewayManager:
 
     def start(self) -> None:
         with self._lock:
+            if self._stopping:
+                return
+            self._restart_allowed = True
             if self.is_running():
                 return
-            env = os.environ.copy()
-            env.update(load_env_file(HERMES_ENV_PATH))
-            env.update(
-                {
-                    "HOME": str(HOME_DIR),
-                    "HERMES_HOME": str(HERMES_HOME),
-                    "HERMES_CONFIG_PATH": str(HERMES_CONFIG_PATH),
-                    "PYTHONUNBUFFERED": "1",
-                }
-            )
-            self.process = subprocess.Popen(
-                ["hermes", "gateway"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-            )
-            self.start_time = time.time()
-            threading.Thread(target=self._capture_stream, args=(self.process.stdout,), daemon=True).start()
+            self._start_locked()
 
     def stop(self) -> None:
+        proc: subprocess.Popen[str] | None = None
         with self._lock:
+            self._restart_allowed = False
+            if self._stopping:
+                return
             if not self.is_running():
+                self.process = None
+                self.start_time = None
                 return
             assert self.process is not None
-            self.process.terminate()
+            self._stopping = True
+            proc = self.process
+        assert proc is not None
+        try:
+            proc.terminate()
             try:
-                self.process.wait(timeout=10)
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                proc.kill()
+                proc.wait(timeout=5)
+        finally:
+            with self._lock:
+                if self.process is proc:
+                    self.process = None
+                    self.start_time = None
+                self._stopping = False
 
     def restart(self) -> None:
         self.stop()
