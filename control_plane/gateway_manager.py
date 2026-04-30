@@ -18,6 +18,7 @@ class GatewayManager:
         self.logs: deque[str] = deque(maxlen=1000)
         self.start_time: float | None = None
         self._lock = threading.Lock()
+        self._restart_allowed = True
 
     def _monitor_process(self, proc: subprocess.Popen[str]) -> None:
         returncode = proc.wait()
@@ -26,11 +27,13 @@ class GatewayManager:
             if self.process is proc:
                 self.process = None
                 self.start_time = None
-                should_restart = returncode == 75
+                should_restart = returncode == 75 and self._restart_allowed
         if should_restart:
             self.logs.append("Gateway requested supervisor restart (exit 75); relaunching.")
             try:
-                self.start()
+                with self._lock:
+                    if self.process is None and self._restart_allowed:
+                        self._start_locked()
             except Exception as exc:
                 self.logs.append(f"Gateway restart failed: {exc}")
 
@@ -72,6 +75,7 @@ class GatewayManager:
 
     def start(self) -> None:
         with self._lock:
+            self._restart_allowed = True
             if self.is_running():
                 return
             self._start_locked()
@@ -79,6 +83,7 @@ class GatewayManager:
     def stop(self) -> None:
         proc: subprocess.Popen[str] | None = None
         with self._lock:
+            self._restart_allowed = False
             if not self.is_running():
                 return
             assert self.process is not None
