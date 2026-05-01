@@ -25,7 +25,7 @@ jobs:
       - name: Add remotes
         run: |
           git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
-          git remote add hermes-webui-upstream https://github.com/sphinxcode/hermes-webui.git || true
+          git remote add hermes-webui-upstream https://github.com/nesquena/hermes-webui.git || true
 
       - name: Fetch upstreams
         run: |
@@ -34,11 +34,11 @@ jobs:
 
       - name: Sync hermes-agent
         run: |
-          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash -m "chore(sync): update vendor/hermes-agent from upstream" || true
+          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash -m "chore(sync): update vendor/hermes-agent from upstream"
 
       - name: Sync hermes-webui
         run: |
-          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash -m "chore(sync): update vendor/hermes-webui from upstream" || true
+          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash -m "chore(sync): update vendor/hermes-webui from upstream"
 
       - name: Push if changed
         env:

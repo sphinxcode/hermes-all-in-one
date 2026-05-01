@@ -1,0 +1,142 @@
+name: Sync Upstreams
+
+on:
+  # schedule:
+  #   - cron: "0 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add remotes
+        run: |
+          git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
+          git remote add hermes-webui-upstream https://github.com/nesquena/hermes-webui.git || true
+
+      - name: Fetch upstreams
+        run: |
+          git fetch hermes-agent-upstream main
+          git fetch hermes-webui-upstream master
+
+      - name: Capture base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Sync hermes-agent
+        run: |
+          git subtree pull \
+            --prefix=vendor/hermes-agent \
+            hermes-agent-upstream \
+            main \
+            --squash \
+            -m "chore(sync): update vendor/hermes-agent from NousResearch/hermes-agent"
+
+      - name: Sync hermes-webui
+        run: |
+          git subtree pull \
+            --prefix=vendor/hermes-webui \
+            hermes-webui-upstream \
+            master \
+            --squash \
+            -m "chore(sync): update vendor/hermes-webui from nesquena/hermes-webui"
+
+      - name: Build PR metadata
+        id: meta
+        run: |
+          BASE_SHA="${{ steps.base.outputs.sha }}"
+          changed_files="$(git diff --name-only "$BASE_SHA" HEAD || true)"
+
+          changed=false
+          bullet_lines=""
+
+          if echo "$changed_files" | grep -q '^vendor/hermes-agent/'; then
+            changed=true
+            bullet_lines="${bullet_lines}- vendor/hermes-agent from NousResearch/hermes-agent\n"
+          fi
+
+          if echo "$changed_files" | grep -q '^vendor/hermes-webui/'; then
+            changed=true
+            bullet_lines="${bullet_lines}- vendor/hermes-webui from nesquena/hermes-webui\n"
+          fi
+
+          if [ "$changed" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          count="$(printf "%b" "$bullet_lines" | grep -c '^- ' || true)"
+
+          if [ "$count" -eq 1 ]; then
+            if printf "%b" "$bullet_lines" | grep -q 'vendor/hermes-agent'; then
+              title="chore(sync): update vendor/hermes-agent from NousResearch/hermes-agent"
+            else
+              title="chore(sync): update vendor/hermes-webui from nesquena/hermes-webui"
+            fi
+          else
+            title="chore(sync): update vendor/hermes-agent and vendor/hermes-webui"
+          fi
+
+          body="$(cat <<EOF
+          Automated upstream subtree sync.
+
+          Updated upstreams:
+          $(printf "%b" "$bullet_lines")
+          EOF
+          )"
+
+          {
+            echo "changed=true"
+            echo "title=$title"
+            echo "body<<EOF"
+            printf '%s\n' "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update sync PR
+        if: steps.meta.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export GH_TOKEN="$GITHUB_TOKEN"
+
+          branch="sync-upstreams"
+          title="${{ steps.meta.outputs.title }}"
+          body="${{ steps.meta.outputs.body }}"
+
+          git checkout -B "$branch"
+          git push \
+            --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$branch"
+
+          pr_number="$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number // empty')"
+
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --title "$title" \
+              --body "$body"
+          else
+            gh pr create \
+              --title "$title" \
+              --body "$body" \
+              --base main \
+              --head "$branch"
+          fi
