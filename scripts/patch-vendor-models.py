@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -87,14 +88,35 @@ def _load_openrouter_models() -> list[tuple[str, str]]:
 
 def _load_codex_models() -> list[str]:
     src = AGENT_CODEX.read_text(encoding="utf-8")
-    m = re.search(
-        r"DEFAULT_CODEX_MODELS\s*:\s*List\[str\]\s*=\s*\[(.*?)\]",
-        src, re.DOTALL,
-    )
-    if not m:
-        print("[patch] Warning: could not parse DEFAULT_CODEX_MODELS — skipping codex sync")
+    try:
+        module = ast.parse(src)
+    except SyntaxError:
+        print("[patch] Warning: could not parse codex_models.py — skipping codex sync")
         return []
-    return re.findall(r'"([^"]+)"', m.group(1))
+
+    for node in module.body:
+        target = None
+        value = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+            value = node.value
+        elif isinstance(node, ast.Assign):
+            for candidate in node.targets:
+                if isinstance(candidate, ast.Name):
+                    target = candidate.id
+                    value = node.value
+                    break
+        if target != "DEFAULT_CODEX_MODELS" or value is None:
+            continue
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            print("[patch] Warning: could not evaluate DEFAULT_CODEX_MODELS — skipping codex sync")
+            return []
+        return [model for model in parsed if isinstance(model, str)]
+
+    print("[patch] Warning: could not find DEFAULT_CODEX_MODELS — skipping codex sync")
+    return []
 
 
 def _patch_fallback_models(text: str, openrouter: list[tuple[str, str]]) -> str:

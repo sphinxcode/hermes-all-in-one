@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 
 import api.models as models
-from api.models import Session, _write_session_index
+from api.models import Session, _write_session_index, prune_session_from_index
 
 
 @pytest.fixture(autouse=True)
@@ -37,12 +37,16 @@ def _isolate_session_dir(tmp_path, monkeypatch):
     # Also patch the module-level references that Session uses
     monkeypatch.setattr(models.Session, "__module__", models.__name__)
 
-    # Clear the in-memory SESSIONS cache to avoid bleed
+    # Clear the in-memory SESSIONS and persisted-id caches to avoid bleed.
     models.SESSIONS.clear()
+    if hasattr(models, "_PERSISTED_SESSION_IDS_CACHE"):
+        models._PERSISTED_SESSION_IDS_CACHE = (None, None, frozenset())
 
     yield session_dir, index_file
 
     models.SESSIONS.clear()
+    if hasattr(models, "_PERSISTED_SESSION_IDS_CACHE"):
+        models._PERSISTED_SESSION_IDS_CACHE = (None, None, frozenset())
 
 
 def _make_session(session_id, title="Untitled", updated_at=None):
@@ -63,6 +67,175 @@ def _write_index_file(index_file, entries):
 def _read_index(index_file):
     """Read and parse the session index file."""
     return json.loads(index_file.read_text(encoding="utf-8"))
+
+
+def test_compact_exposes_last_message_at_from_message_timestamp():
+    s = Session(
+        session_id="sess_time",
+        title="Time",
+        updated_at=300.0,
+        messages=[
+            {"role": "user", "content": "old", "_ts": 100.0},
+            {"role": "tool", "content": "ignore", "timestamp": 400.0},
+            {"role": "assistant", "content": "latest", "timestamp": 200.0},
+        ],
+    )
+
+    compact = s.compact()
+
+    assert compact["updated_at"] == 300.0
+    assert compact["last_message_at"] == 200.0
+
+
+def test_compact_ignores_empty_partial_activity_for_last_message_at():
+    s = Session(
+        session_id="sess_partial_tail",
+        title="Partial tail",
+        updated_at=300.0,
+        messages=[
+            {"role": "user", "content": "today question", "timestamp": 200.0},
+            {"role": "assistant", "content": "today answer", "timestamp": 201.0},
+            {
+                "role": "assistant",
+                "content": "",
+                "_partial": True,
+                "timestamp": 100.0,
+                "reasoning": "old cancelled thinking",
+                "_partial_tool_calls": [{"name": "terminal", "done": True}],
+            },
+        ],
+    )
+
+    compact = s.compact()
+
+    assert compact["updated_at"] == 300.0
+    assert compact["last_message_at"] == 201.0
+
+
+def test_session_load_allows_hyphenated_safe_ids_but_rejects_traversal():
+    sid = "api-182894de593468b6"
+    s = _make_session(sid, "API session", updated_at=100)
+    s.path.write_text(json.dumps(s.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    assert Session.load(sid) is not None
+    assert Session.load_metadata_only(sid) is not None
+    assert Session.load("bad/../id") is None
+    assert Session.load_metadata_only("bad.id") is None
+
+
+def test_full_index_rebuild_includes_hyphenated_sessions():
+    sid = "reachy-voice-20260513-1131-d5542adf"
+    s = _make_session(sid, "Reachy voice", updated_at=100)
+    s.path.write_text(json.dumps(s.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    _write_session_index(updates=None)
+
+    ids = [entry["session_id"] for entry in _read_index(models.SESSION_INDEX_FILE)]
+    assert sid in ids
+
+
+def test_prune_session_from_index_removes_requested_row_only():
+    index_file = models.SESSION_INDEX_FILE
+    s_a = _make_session("sess_a", "A", updated_at=100)
+    s_b = _make_session("sess_b", "B", updated_at=200)
+    s_a.save()
+    s_b.save()
+
+    prune_session_from_index("sess_a")
+
+    index = _read_index(index_file)
+    ids = [entry["session_id"] for entry in index]
+    assert ids == ["sess_b"]
+    assert index_file.exists()
+    assert s_a.path.exists()
+    assert s_b.path.exists()
+
+
+def test_all_sessions_backfills_last_message_at_for_legacy_index_rows():
+    index_file = models.SESSION_INDEX_FILE
+    s = Session(
+        session_id="sess_legacy_index",
+        title="Legacy Index",
+        updated_at=300.0,
+        messages=[{"role": "assistant", "content": "reply", "_ts": 100.0}],
+    )
+    s.path.write_text(json.dumps(s.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_index_file(
+        index_file,
+        [
+            {
+                "session_id": s.session_id,
+                "title": s.title,
+                "updated_at": s.updated_at,
+                "workspace": s.workspace,
+                "model": s.model,
+                "message_count": 1,
+                "created_at": s.created_at,
+                "pinned": False,
+                "archived": False,
+            }
+        ],
+    )
+
+    rows = models.all_sessions()
+
+    assert rows[0]["session_id"] == s.session_id
+    assert rows[0]["last_message_at"] == 100.0
+
+    # Backfill must also be persisted to the index so subsequent /api/sessions
+    # polls don't re-read every legacy session file.  Without this, a 5-second
+    # poll cycle re-loads every legacy session JSON on every tick until each
+    # session is independently saved.
+    persisted = _read_index(index_file)
+    assert persisted[0]["session_id"] == s.session_id
+    assert persisted[0].get("last_message_at") == 100.0
+
+
+def test_all_sessions_prune_batches_persisted_id_snapshot(monkeypatch):
+    """Index pruning should not probe each backing file through the helper."""
+    index_file = models.SESSION_INDEX_FILE
+    entries = [
+        {
+            "session_id": "sess_a",
+            "title": "Alpha",
+            "updated_at": 200.0,
+            "last_message_at": 200.0,
+            "workspace": "/tmp",
+            "model": "test",
+            "message_count": 1,
+            "created_at": 100.0,
+            "pinned": False,
+            "archived": False,
+        },
+        {
+            "session_id": "sess_b",
+            "title": "Bravo",
+            "updated_at": 150.0,
+            "last_message_at": 150.0,
+            "workspace": "/tmp",
+            "model": "test",
+            "message_count": 1,
+            "created_at": 90.0,
+            "pinned": False,
+            "archived": False,
+        },
+    ]
+    for entry in entries:
+        (models.SESSION_DIR / f"{entry['session_id']}.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+    _write_index_file(index_file, entries)
+
+    def _assert_not_called(session_id, in_memory_ids=None):
+        raise AssertionError("all_sessions should batch persisted ids before pruning")
+
+    monkeypatch.setattr(models, "_index_entry_exists", _assert_not_called)
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    rows = models.all_sessions()
+
+    assert [row["session_id"] for row in rows] == ["sess_a", "sess_b"]
 
 
 # ── 6. test_incremental_patch_correctness ─────────────────────────────────
@@ -144,6 +317,358 @@ def test_new_session_appended_to_index():
     assert "sess_c" in ids, "New session C should appear in the index"
     assert "sess_a" in ids
     assert "sess_b" in ids
+
+
+def test_incremental_update_prunes_stale_entries():
+    """Ghost rows whose backing JSON file is gone must be dropped on the fast path.
+
+    This covers session-id rotation paths (e.g. compression) where the old id can
+    linger in `_index.json` after the file has been renamed.
+    """
+    index_file = models.SESSION_INDEX_FILE
+
+    stale = {
+        "session_id": "ghost_sid",
+        "title": "Ghost",
+        "updated_at": 150.0,
+        "workspace": "/tmp",
+        "model": "test",
+        "message_count": 1,
+        "created_at": 100.0,
+        "pinned": False,
+        "archived": False,
+    }
+    _write_index_file(index_file, [stale])
+
+    sA = _make_session("sess_a", "Alpha", updated_at=200.0)
+    sA.path.write_text(json.dumps(sA.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    _write_session_index(updates=[sA])
+
+    index = _read_index(index_file)
+    ids = {e["session_id"] for e in index}
+    assert "sess_a" in ids
+    assert "ghost_sid" not in ids, "stale entry with no backing file must be pruned"
+
+
+def test_load_metadata_only_does_not_parse_large_message_body():
+    """Large sessions must keep the metadata-only path cheap."""
+    s = Session(
+        session_id="sess_large",
+        title="Large Session",
+        messages=[{"role": "assistant", "content": "x" * 200_000}],
+        tool_calls=[{"id": "tool_1", "name": "read_file", "result": "y" * 10_000}],
+        input_tokens=123,
+        output_tokens=45,
+    )
+    s.save()
+
+    with patch.object(Session, "load", side_effect=AssertionError("full load should not run")):
+        meta = Session.load_metadata_only("sess_large")
+
+    assert meta is not None
+    assert meta.session_id == "sess_large"
+    assert meta.title == "Large Session"
+    assert meta.input_tokens == 123
+    assert meta.output_tokens == 45
+    assert meta.messages == []
+    assert meta.tool_calls == []
+    assert meta.compact()["message_count"] == 1
+
+
+def test_metadata_only_get_session_does_not_poison_full_session_cache():
+    s = Session(
+        session_id="sess_cache",
+        title="Cache Guard",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    s.save(skip_index=True)
+
+    meta = models.get_session("sess_cache", metadata_only=True)
+    assert meta.messages == []
+    assert "sess_cache" not in models.SESSIONS
+
+    full = models.get_session("sess_cache")
+    assert full.messages == [{"role": "user", "content": "hi"}]
+    assert models.SESSIONS["sess_cache"] is full
+
+
+def test_pre_compression_snapshot_marker_is_persisted_and_compact():
+    """Pre-compression snapshots keep a distinct marker from manual archived state."""
+    s = Session(
+        session_id="sess_snapshot",
+        title="Before Compression",
+        messages=[{"role": "user", "content": "hi"}],
+        pre_compression_snapshot=True,
+    )
+
+    s.save()
+
+    payload = json.loads(s.path.read_text(encoding="utf-8"))
+    assert payload["pre_compression_snapshot"] is True
+    compact = s.compact()
+    assert compact["pre_compression_snapshot"] is True
+    assert compact["archived"] is False
+
+
+def test_pre_compression_snapshot_hidden_from_active_sidebar_but_file_remains(monkeypatch):
+    """Preserved compression snapshots should not appear as active sidebar rows."""
+    snapshot = Session(
+        session_id="old_sid",
+        title="Long Conversation",
+        messages=[{"role": "user", "content": "pre-compression history"}],
+        pre_compression_snapshot=True,
+        updated_at=100.0,
+    )
+    continuation = Session(
+        session_id="new_sid",
+        title="Long Conversation",
+        messages=[{"role": "user", "content": "compressed continuation"}],
+        parent_session_id="old_sid",
+        updated_at=200.0,
+    )
+    snapshot.save(touch_updated_at=False)
+    continuation.save(touch_updated_at=False)
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    rows = models.all_sessions()
+
+    assert snapshot.path.exists(), "snapshot JSON must stay available for lineage traversal"
+    assert [row["session_id"] for row in rows] == ["new_sid"]
+
+
+def test_fuller_pre_compression_snapshot_replaces_shorter_visible_segment(monkeypatch):
+    """If the hidden snapshot has the fuller transcript, keep it reachable.
+
+    Auto-compression can leave a visible continuation segment in the sidebar
+    while the fuller transcript remains on disk marked as a pre-compression
+    snapshot. In that case the default session list should prefer the fuller
+    transcript so the conversation does not look like recent messages vanished.
+    """
+    snapshot = Session(
+        session_id="full_parent",
+        title="Long Conversation",
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "latest user"},
+            {"role": "assistant", "content": "latest answer"},
+        ],
+        pre_compression_snapshot=True,
+        updated_at=300.0,
+        last_message_at=300.0,
+    )
+    continuation = Session(
+        session_id="short_child",
+        title="Long Conversation",
+        messages=[{"role": "user", "content": "first"}],
+        parent_session_id="full_parent",
+        updated_at=250.0,
+        last_message_at=250.0,
+    )
+    snapshot.save(touch_updated_at=False)
+    continuation.save(touch_updated_at=False)
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    rows = models.all_sessions()
+
+    assert [row["session_id"] for row in rows] == ["full_parent"]
+    assert rows[0]["message_count"] == 4
+    assert rows[0]["pre_compression_snapshot"] is True
+
+
+def test_newer_continuation_beats_older_fuller_snapshot(monkeypatch):
+    """Do not hide a newer continuation behind an older fuller snapshot.
+
+    Compression snapshots can have a higher message count while still being
+    older than the continuation that contains the latest user-visible turns.
+    The sidebar should keep the newer continuation visible in that case.
+    """
+    snapshot = Session(
+        session_id="older_full_parent",
+        title="Long Conversation",
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": "fourth"},
+        ],
+        pre_compression_snapshot=True,
+        updated_at=300.0,
+        last_message_at=300.0,
+    )
+    continuation = Session(
+        session_id="newer_short_child",
+        title="Long Conversation",
+        messages=[
+            {"role": "user", "content": "latest task"},
+            {"role": "assistant", "content": "latest result"},
+        ],
+        parent_session_id="older_full_parent",
+        updated_at=450.0,
+        last_message_at=450.0,
+    )
+    snapshot.save(touch_updated_at=False)
+    continuation.save(touch_updated_at=False)
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    rows = models.all_sessions()
+
+    assert [row["session_id"] for row in rows] == ["newer_short_child"]
+    assert rows[0]["pre_compression_snapshot"] is False
+    assert rows[0]["message_count"] == 2
+
+
+def test_all_sessions_uses_sidecar_metadata_for_runtime_rows_when_index_message_count_is_stale(monkeypatch):
+    """Runtime-shaped rows may refresh from fuller sidecar metadata."""
+    session = Session(
+        session_id="stale_index_sid",
+        title="Reachy Mini Integration",
+        messages=[
+            {"role": "user", "content": "one", "timestamp": 100.0},
+            {"role": "assistant", "content": "two", "timestamp": 101.0},
+            {"role": "user", "content": "three", "timestamp": 102.0},
+        ],
+        updated_at=102.0,
+    )
+    session.save(touch_updated_at=False)
+    _write_index_file(
+        models.SESSION_INDEX_FILE,
+        [
+            {
+                "session_id": "stale_index_sid",
+                "title": "Reachy Mini Integration",
+                "message_count": 1,
+                "created_at": 100.0,
+                "updated_at": 100.0,
+                "last_message_at": 100.0,
+                "pinned": False,
+                "archived": False,
+                "active_stream_id": "stream-stale-index",
+            }
+        ],
+    )
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    rows = models.all_sessions()
+
+    assert rows[0]["session_id"] == "stale_index_sid"
+    assert rows[0]["message_count"] == 3
+    assert rows[0]["last_message_at"] == 102.0
+
+
+def test_all_sessions_sidecar_refresh_stays_metadata_only(monkeypatch):
+    """Refreshing runtime sidebar rows must not hydrate large sidecar messages."""
+    session = Session(
+        session_id="metadata_refresh_sid",
+        title="Metadata Refresh",
+        messages=[
+            {"role": "user", "content": "one", "timestamp": 100.0},
+            {"role": "assistant", "content": "x" * 200_000, "timestamp": 101.0},
+            {"role": "user", "content": "three", "timestamp": 102.0},
+        ],
+        parent_session_id="parent_sid",
+        updated_at=102.0,
+    )
+    session.save(touch_updated_at=False)
+    _write_index_file(
+        models.SESSION_INDEX_FILE,
+        [
+            {
+                "session_id": "metadata_refresh_sid",
+                "title": "Metadata Refresh",
+                "message_count": 1,
+                "created_at": 100.0,
+                "updated_at": 100.0,
+                "last_message_at": 100.0,
+                "pinned": False,
+                "archived": False,
+                "active_stream_id": "stream-metadata-refresh",
+            }
+        ],
+    )
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    with patch.object(Session, "load", side_effect=AssertionError("full sidecar load should not run")):
+        rows = models.all_sessions()
+
+    assert rows[0]["session_id"] == "metadata_refresh_sid"
+    assert rows[0]["message_count"] == 3
+    assert rows[0]["last_message_at"] == 102.0
+
+
+def test_all_sessions_does_not_refresh_lineage_rows_from_sidecars(monkeypatch):
+    """Lineage rows are enriched from state.db; do not read every sidecar per poll."""
+    _write_index_file(
+        models.SESSION_INDEX_FILE,
+        [
+            {
+                "session_id": "lineage_sid",
+                "title": "Lineage Row",
+                "message_count": 7,
+                "created_at": 100.0,
+                "updated_at": 101.0,
+                "last_message_at": 101.0,
+                "pinned": False,
+                "archived": False,
+                "parent_session_id": "parent_sid",
+                "_lineage_root_id": "root_sid",
+                "_compression_segment_count": 2,
+            }
+        ],
+    )
+    (models.SESSION_DIR / "lineage_sid.json").write_text(
+        json.dumps(
+            {
+                "session_id": "lineage_sid",
+                "title": "Lineage Row",
+                "messages": [{"role": "user", "content": "sidecar"}],
+                "message_count": 99,
+                "updated_at": 200.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _sessions: None)
+
+    with patch.object(Session, "load_metadata_only", side_effect=AssertionError("lineage rows must not refresh sidecars")):
+        rows = models.all_sessions()
+
+    assert rows[0]["session_id"] == "lineage_sid"
+    assert rows[0]["message_count"] == 7
+
+
+def test_load_metadata_only_skips_index_read_when_sidecar_has_message_count(monkeypatch):
+    """Modern sidecars already carry message_count; avoid an _index.json read per row."""
+    session = Session(
+        session_id="metadata_count_sid",
+        title="Metadata Count",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    session.save(touch_updated_at=False)
+
+    def _fail_index_lookup(_sid):
+        raise AssertionError("message_count sidecar should not need index lookup")
+
+    monkeypatch.setattr(models, "_lookup_index_message_count", _fail_index_lookup)
+
+    meta = Session.load_metadata_only("metadata_count_sid")
+
+    assert meta is not None
+    assert meta.compact()["message_count"] == 1
+
+
+def test_session_save_does_not_persist_metadata_message_count_hint():
+    s = Session(
+        session_id="sess_private_hint",
+        title="Private Hint",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    s._metadata_message_count = 10
+    s.save(skip_index=True)
+
+    payload = json.loads(s.path.read_text(encoding="utf-8"))
+    assert "_metadata_message_count" not in payload
 
 
 # ── 8. test_first_call_full_rebuild ──────────────────────────────────────
@@ -348,3 +873,83 @@ def test_deadlock_guard_on_fallback():
     # The index should still be valid after fallback
     index = _read_index(index_file)
     assert isinstance(index, list)
+
+
+def test_incremental_index_disk_io_runs_outside_lock(monkeypatch):
+    """Fast-path disk I/O (fsync/replace) must run after releasing LOCK."""
+    index_file = models.SESSION_INDEX_FILE
+
+    sA = _make_session("sess_a", "Alpha", updated_at=100.0)
+    sA.path.write_text(json.dumps(sA.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_session_index(updates=None)  # seed index
+
+    sA.title = "Alpha V2"
+    sA.updated_at = 200.0
+
+    fsync_lock_states = []
+    original_fsync = models.os.fsync
+
+    def _observing_fsync(fd):
+        fsync_lock_states.append(models.LOCK.locked())
+        return original_fsync(fd)
+
+    monkeypatch.setattr(models.os, "fsync", _observing_fsync)
+
+    _write_session_index(updates=[sA])
+
+    assert fsync_lock_states, "Expected at least one fsync call during index write"
+    assert not any(fsync_lock_states), (
+        "_write_session_index fast path must not hold LOCK during fsync/disk I/O"
+    )
+
+
+def test_full_rebuild_index_disk_io_runs_outside_lock(monkeypatch):
+    """Full-rebuild disk I/O (fsync/replace) must run after releasing LOCK."""
+    sA = _make_session("sess_a", "Alpha", updated_at=100.0)
+    sA.path.write_text(json.dumps(sA.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fsync_lock_states = []
+    original_fsync = models.os.fsync
+
+    def _observing_fsync(fd):
+        fsync_lock_states.append(models.LOCK.locked())
+        return original_fsync(fd)
+
+    monkeypatch.setattr(models.os, "fsync", _observing_fsync)
+
+    _write_session_index(updates=None)
+
+    assert fsync_lock_states, "Expected at least one fsync call during index write"
+    assert not any(fsync_lock_states), (
+        "_write_session_index full rebuild must not hold LOCK during fsync/disk I/O"
+    )
+
+
+def test_all_sessions_ignores_stale_index_entries():
+    """Reading via all_sessions() must not surface ghost rows from _index.json."""
+    index_file = models.SESSION_INDEX_FILE
+
+    valid_session = _make_session("sess_a", "Alpha", updated_at=200.0)
+    valid_session.path.write_text(
+        json.dumps(valid_session.__dict__, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    valid = valid_session.compact()
+    stale = {
+        "session_id": "ghost_sid",
+        "title": "Ghost",
+        "updated_at": 150.0,
+        "workspace": "/tmp",
+        "model": "test",
+        "message_count": 1,
+        "created_at": 100.0,
+        "pinned": False,
+        "archived": False,
+    }
+    _write_index_file(index_file, [stale, valid])
+
+    rows = models.all_sessions()
+    ids = {e["session_id"] for e in rows}
+    assert "sess_a" in ids
+    assert "ghost_sid" not in ids

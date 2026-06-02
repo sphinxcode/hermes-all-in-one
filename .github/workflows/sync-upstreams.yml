@@ -22,27 +22,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add remotes
+      - name: Sync vendored upstreams
         run: |
-          git remote add hermes-agent-upstream https://github.com/NousResearch/hermes-agent.git || true
-          git remote add hermes-webui-upstream https://github.com/sphinxcode/hermes-webui.git || true
-
-      - name: Fetch upstreams
-        run: |
-          git fetch hermes-agent-upstream main
-          git fetch hermes-webui-upstream master
-
-      - name: Sync hermes-agent
-        run: |
-          git subtree pull --prefix=vendor/hermes-agent hermes-agent-upstream main --squash -m "chore(sync): update vendor/hermes-agent from upstream" || true
-
-      - name: Sync hermes-webui
-        run: |
-          git subtree pull --prefix=vendor/hermes-webui hermes-webui-upstream master --squash -m "chore(sync): update vendor/hermes-webui from upstream" || true
+          bash scripts/sync-upstreams.sh
 
       - name: Push if changed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git diff --quiet HEAD~1 HEAD 2>/dev/null && echo "Nothing to push." && exit 0
+          if git diff --quiet origin/main HEAD; then
+            echo "Nothing to push."
+            exit 0
+          fi
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/sphinxcode/hermes-all-in-one.git" main

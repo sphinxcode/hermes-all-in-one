@@ -86,10 +86,10 @@ def test_cancel_nonexistent_stream(cleanup_test_sessions):
     assert data["ok"] is True
     assert data["cancelled"] is False
 
-def test_cancel_button_in_html(cleanup_test_sessions):
+def test_send_button_in_html(cleanup_test_sessions):
     src, _ = get_text("/")
-    assert "btnCancel" in src
-    assert "cancelStream" in src
+    assert "btnSend" in src                   # single primary action button present
+    assert 'id="btnCancel"' not in src        # deprecated composer cancel button removed
 
 def test_cancel_function_in_boot_js(cleanup_test_sessions):
     src, _ = get_text("/static/boot.js")
@@ -106,12 +106,82 @@ def test_crons_output_limit_param(cleanup_test_sessions):
 
 def test_cron_history_button_in_panels_js(cleanup_test_sessions):
     src, _ = get_text("/static/panels.js")
-    assert "loadCronHistory" in src
-    assert "cron_all_runs" in src  # i18n key (was hardcoded 'All runs' before i18n hardening)
+    # After the main-view refactor, cron runs load inline into the detail card
+    # via _loadCronDetailRuns() instead of a separate "All runs" button.
+    assert "_loadCronDetailRuns" in src
+    assert "cron_last_output" in src  # i18n key used by the runs card
 
 def test_cron_output_snippet_helper(cleanup_test_sessions):
     src, _ = get_text("/static/panels.js")
     assert "_cronOutputSnippet" in src
+
+
+def test_cron_output_usage_metadata_parses_optional_fields(cleanup_test_sessions):
+    from api.routes import _cron_output_usage_metadata
+
+    content = "\n".join([
+        "# Cron Job: Nightly",
+        "**Model:** openai-codex/gpt-5.5",
+        "**Tokens:** 12,345 in / 678 out",
+        "**Estimated cost:** $0.0123 (estimated)",
+        "**Duration:** 42.5s",
+        "",
+        "## Response",
+        "Done",
+    ])
+
+    usage = _cron_output_usage_metadata(content)
+
+    assert usage["model"] == "openai-codex/gpt-5.5"
+    assert usage["input_tokens"] == 12345
+    assert usage["output_tokens"] == 678
+    assert usage["total_tokens"] == 13023
+    assert usage["estimated_cost_usd"] == 0.0123
+    assert usage["duration_seconds"] == 42.5
+
+
+def test_cron_output_usage_strip_render_hook(cleanup_test_sessions):
+    src, _ = get_text("/static/panels.js")
+    css, _ = get_text("/static/style.css")
+
+    assert "_formatCronRunUsageStrip(run.usage)" in src
+    assert "_formatCronRunUsageStrip(data.usage)" in src
+    assert "cron-run-usage-strip" in src
+    assert ".cron-run-usage-strip" in css
+
+
+def test_cron_output_window_preserves_response_after_large_prompt(cleanup_test_sessions):
+    """Large skill dumps before ## Response must not hide the useful output."""
+    from api.routes import _cron_output_content_window
+
+    content = (
+        "Job metadata\n"
+        "## Prompt\n"
+        + ("skill dump\n" * 1200)
+        + "user prompt\n"
+        "## Response\n"
+        "actual useful cron result\n"
+    )
+
+    window = _cron_output_content_window(content, limit=8000)
+
+    assert len(window) <= 8000
+    assert "## Response" in window
+    assert "actual useful cron result" in window
+    assert "Job metadata" in window
+
+
+def test_cron_output_window_without_response_uses_tail(cleanup_test_sessions):
+    """Without a response marker, keep the newest tail rather than old prompt text."""
+    from api.routes import _cron_output_content_window
+
+    content = "old prompt\n" + ("x" * 9000) + "tail result"
+
+    window = _cron_output_content_window(content, limit=8000)
+
+    assert len(window) == 8000
+    assert window.endswith("tail result")
+    assert "old prompt" not in window
 
 # ── Tool card polish ───────────────────────────────────────────────────────
 

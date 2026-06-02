@@ -18,9 +18,12 @@ def test_profile_switch_clears_previous_profile_env_vars(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("CUSTOM_TOKEN", raising=False)
 
-    sys.modules.pop("api.profiles", None)
-    profiles = importlib.import_module("api.profiles")
-    profiles = importlib.reload(profiles)
+    # Point the module's cached base-home at our temp base via monkeypatch
+    # (auto-restored at teardown) instead of deleting + re-importing api.profiles.
+    # The delitem+import_module approach swapped the module object and poisoned
+    # dependent modules' cached references, breaking later tests under sharding.
+    import api.profiles as profiles
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
 
     profiles.init_profile_state()
     profiles.switch_profile("p1")
@@ -52,9 +55,12 @@ def test_profile_switch_replaces_overlapping_keys(monkeypatch, tmp_path):
     monkeypatch.delenv("ONLY_P1", raising=False)
     monkeypatch.delenv("ONLY_P2", raising=False)
 
-    sys.modules.pop("api.profiles", None)
-    profiles = importlib.import_module("api.profiles")
-    profiles = importlib.reload(profiles)
+    # Point the module's cached base-home at our temp base via monkeypatch
+    # (auto-restored at teardown) instead of deleting + re-importing api.profiles.
+    # The delitem+import_module approach swapped the module object and poisoned
+    # dependent modules' cached references, breaking later tests under sharding.
+    import api.profiles as profiles
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
 
     profiles.init_profile_state()
     profiles.switch_profile("p1")

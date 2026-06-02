@@ -9,7 +9,9 @@ get_hermes_home_for_profile() resolves a HERMES_HOME path from a name without
 touching os.environ or module-level state.
 """
 
+import json
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -40,13 +42,18 @@ def test_get_hermes_home_for_profile_returns_profile_subdir(tmp_path, monkeypatc
     assert result == profile_dir
 
 
-def test_get_hermes_home_for_profile_falls_back_for_missing_profile(tmp_path, monkeypatch):
-    """R19c: Named profile that does not exist falls back to base home."""
+def test_get_hermes_home_for_profile_returns_profile_path_for_missing_profile(tmp_path, monkeypatch):
+    """R19c: Named profile that does not exist on disk now returns the
+    profile-scoped path (created on first use by the agent layer), NOT the
+    base home. Tightened in v0.50.251 / PR #1373 to fix #1195: the previous
+    is_dir() fallback caused new profiles to silently route every session
+    back to the default profile until the directory existed on disk.
+    Path traversal is still blocked by the _PROFILE_ID_RE regex (R19j)."""
     import api.profiles as p
 
     monkeypatch.setattr(p, '_DEFAULT_HERMES_HOME', tmp_path)
     result = p.get_hermes_home_for_profile('ghost')
-    assert result == tmp_path
+    assert result == tmp_path / 'profiles' / 'ghost'
 
 
 def test_get_hermes_home_for_profile_does_not_mutate_globals():
@@ -64,6 +71,96 @@ def test_get_hermes_home_for_profile_does_not_mutate_globals():
     assert os.environ.get('HERMES_HOME') == before_hermes_home, (
         "get_hermes_home_for_profile() must not mutate os.environ['HERMES_HOME']"
     )
+
+
+def _run_profile_resolution_probe(env):
+    script = r'''
+import json
+from pathlib import Path
+import api.profiles as p
+import api.models as m
+
+p.set_request_profile('foo')
+foo_home = p.get_active_hermes_home()
+explicit_foo_home = p.get_hermes_home_for_profile('foo')
+foo_runtime = p.get_profile_runtime_env(explicit_foo_home)
+model_home = m._get_profile_home('foo')
+explicit_bar_home = p.get_hermes_home_for_profile('bar')
+p.set_request_profile('bar')
+active_bar_home = p.get_active_hermes_home()
+print(json.dumps({
+    'default_home': str(p._DEFAULT_HERMES_HOME),
+    'foo_home': str(foo_home),
+    'explicit_foo_home': str(explicit_foo_home),
+    'foo_terminal_cwd': foo_runtime.get('TERMINAL_CWD'),
+    'model_home': str(model_home),
+    'explicit_bar_home': str(explicit_bar_home),
+    'active_bar_home': str(active_bar_home),
+}))
+'''
+    result = subprocess.run(
+        [sys.executable, '-c', script],
+        cwd=Path(__file__).parent.parent,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_hermes_base_home_named_profile_matches_cookie_without_doubling(tmp_path):
+    """R19k / #749: HERMES_BASE_HOME may point directly at a named profile home.
+
+    A single-profile WebUI deployment can start with both HERMES_BASE_HOME and
+    HERMES_HOME set to /base/profiles/foo while the browser still sends the
+    logical cookie hermes_profile=foo.  Both active-profile and explicit
+    per-request helpers must use /base/profiles/foo, not the doubled
+    /base/profiles/foo/profiles/foo path — even if that nested path already
+    exists from a prior bad write.
+    """
+    profile_home = tmp_path / 'profiles' / 'foo'
+    doubled_home = profile_home / 'profiles' / 'foo'
+    doubled_home.mkdir(parents=True)
+    profile_home.joinpath('config.yaml').write_text(
+        'terminal:\n  cwd: /expected/profile-home\n', encoding='utf-8'
+    )
+    doubled_home.joinpath('config.yaml').write_text(
+        'terminal:\n  cwd: /wrong/doubled-home\n', encoding='utf-8'
+    )
+
+    env = os.environ.copy()
+    env.update({
+        'HERMES_BASE_HOME': str(profile_home),
+        'HERMES_HOME': str(profile_home),
+    })
+    data = _run_profile_resolution_probe(env)
+
+    assert data['default_home'] == str(tmp_path)
+    assert data['foo_home'] == str(profile_home)
+    assert data['explicit_foo_home'] == str(profile_home)
+    assert data['foo_terminal_cwd'] == '/expected/profile-home'
+    assert data['model_home'] == str(profile_home)
+
+
+def test_hermes_base_home_named_profile_nonmatching_cookie_uses_sibling_profile_path(tmp_path):
+    """R19l / #749: non-matching cookies must not silently route to the pinned home.
+
+    When HERMES_BASE_HOME is supplied as /base/profiles/foo but the request asks
+    for logical profile bar, preserving base semantics means bar resolves to the
+    sibling /base/profiles/bar.  It must not fall back to foo, and it must not
+    append bar under foo/profiles/bar.
+    """
+    profile_home = tmp_path / 'profiles' / 'foo'
+    profile_home.mkdir(parents=True)
+
+    env = os.environ.copy()
+    env.update({'HERMES_BASE_HOME': str(profile_home)})
+    data = _run_profile_resolution_probe(env)
+
+    expected_bar_home = tmp_path / 'profiles' / 'bar'
+    assert data['explicit_bar_home'] == str(expected_bar_home)
+    assert data['active_bar_home'] == str(expected_bar_home)
 
 
 # ── R19e-h: new_session() profile isolation ───────────────────────────────────
@@ -133,18 +230,24 @@ def test_concurrent_new_sessions_get_correct_profiles():
     results = {}
     errors = []
 
+    # Patch Session.save ONCE around both threads — not once per thread.
+    # Per-thread `with patch.object(...)` nested across threads has a known
+    # concurrency bug in unittest.mock where one thread's __exit__ can capture
+    # the other thread's mock as the "original" and leave the class attribute
+    # permanently pointing at a MagicMock, breaking every later test that
+    # calls Session.save (any test writing a real session file).
     def make_session(profile_name, key):
         try:
-            with patch.object(m.Session, 'save', return_value=None):
-                s = m.new_session(profile=profile_name)
+            s = m.new_session(profile=profile_name)
             results[key] = s.profile
         except Exception as exc:
             errors.append(exc)
 
-    t1 = threading.Thread(target=make_session, args=('alice', 'alice'))
-    t2 = threading.Thread(target=make_session, args=('bob', 'bob'))
-    t1.start(); t2.start()
-    t1.join(timeout=5); t2.join(timeout=5)
+    with patch.object(m.Session, 'save', return_value=None):
+        t1 = threading.Thread(target=make_session, args=('alice', 'alice'))
+        t2 = threading.Thread(target=make_session, args=('bob', 'bob'))
+        t1.start(); t2.start()
+        t1.join(timeout=5); t2.join(timeout=5)
 
     assert not errors, f"Threads raised: {errors}"
     assert results.get('alice') == 'alice', f"alice session had profile {results.get('alice')!r}"
@@ -163,10 +266,54 @@ def test_sessions_js_sends_profile_in_new_session_post():
     )
 
 
+def test_new_session_uses_explicit_profile_default_model_and_provider(tmp_path, monkeypatch):
+    """New chats must inherit the selected profile's config default."""
+    import api.profiles as p
+    import api.models as m
+
+    monkeypatch.setattr(p, "_DEFAULT_HERMES_HOME", tmp_path)
+    profile_home = tmp_path / "profiles" / "pepper"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: pepper-profile-model\n  provider: pepper-provider\n",
+        encoding="utf-8",
+    )
+
+    with patch.object(m.Session, 'save', return_value=None):
+        s = m.new_session(workspace=str(tmp_path), profile="pepper")
+    try:
+        assert s.model == "pepper-profile-model"
+        assert s.model_provider == "pepper-provider"
+        assert s.profile == "pepper"
+    finally:
+        with m.LOCK:
+            m.SESSIONS.pop(s.session_id, None)
+
+
+def test_new_session_does_not_persist_display_personality(monkeypatch, tmp_path):
+    """display.personality is a UI/default hint, not durable per-session state."""
+    import api.config as c
+    import api.models as m
+
+    monkeypatch.setattr(c, "get_config", lambda: {"display": {"personality": "kawaii"}})
+    with patch.object(m.Session, 'save', return_value=None):
+        s = m.new_session(workspace=str(tmp_path), profile="default")
+    try:
+        assert s.personality is None, (
+            "new_session() must not stamp display.personality into the persistent "
+            "Session.personality field; only explicit /api/personality/set should."
+        )
+    finally:
+        with m.LOCK:
+            m.SESSIONS.pop(s.session_id, None)
+
+
 def test_get_hermes_home_for_profile_rejects_path_traversal():
     """R19j: get_hermes_home_for_profile() must reject names that don't match
-    _PROFILE_ID_RE (e.g. path traversal like '../../etc') and return the base home.
-    The regex guard is defence-in-depth on top of the is_dir() fallback."""
+    _PROFILE_ID_RE (e.g. path traversal like '../../etc') and return the base
+    home. After v0.50.251 / PR #1373 removed the is_dir() fallback, the regex
+    is the SOLE guard against path traversal — verify each known-bad shape
+    still returns the base home, not a traversed path."""
     import api.profiles as p
     base = p._DEFAULT_HERMES_HOME
     assert p.get_hermes_home_for_profile('../../etc') == base
@@ -174,7 +321,22 @@ def test_get_hermes_home_for_profile_rejects_path_traversal():
     assert p.get_hermes_home_for_profile('/absolute/path') == base
     assert p.get_hermes_home_for_profile('has spaces') == base
     assert p.get_hermes_home_for_profile('UPPERCASE') == base
-    # Valid names still work
-    assert p.get_hermes_home_for_profile('alice') == base   # nonexistent → fallback
-    assert p.get_hermes_home_for_profile('my-profile') == base
-    assert p.get_hermes_home_for_profile('profile_1') == base
+    # Valid names now route to the profile-scoped path (created on first use).
+    # Previously these returned `base` because no profile dir existed on disk.
+    assert p.get_hermes_home_for_profile('alice') == base / 'profiles' / 'alice'
+    assert p.get_hermes_home_for_profile('my-profile') == base / 'profiles' / 'my-profile'
+    assert p.get_hermes_home_for_profile('profile_1') == base / 'profiles' / 'profile_1'
+    # R19j coverage gaps closed in v0.50.251 per Opus pre-release review:
+    # - Trailing-newline names must be rejected (re.match would let them through;
+    #   re.fullmatch correctly anchors $). Catches the match-vs-fullmatch footgun.
+    assert p.get_hermes_home_for_profile('valid\n') == base
+    assert p.get_hermes_home_for_profile('a\n') == base
+    # - Length boundaries: 64 chars (max valid: 1 + 63 suffix) routes to profile path,
+    #   65 chars rejected.
+    assert p.get_hermes_home_for_profile('a' * 64) == base / 'profiles' / ('a' * 64)
+    assert p.get_hermes_home_for_profile('a' * 65) == base
+    # - Single-char name is the minimum valid form.
+    assert p.get_hermes_home_for_profile('a') == base / 'profiles' / 'a'
+    # - Non-ASCII / Unicode-trick names are rejected by the ASCII-only charset.
+    assert p.get_hermes_home_for_profile('voilà') == base
+    assert p.get_hermes_home_for_profile('名前') == base
