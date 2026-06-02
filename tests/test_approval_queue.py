@@ -23,8 +23,8 @@ INDEX_HTML = (REPO_ROOT / "static" / "index.html").read_text(encoding="utf-8")
 
 def test_submit_pending_appends_to_list():
     """submit_pending() must append to a list, not overwrite."""
-    # The new wrapper must contain queue.append
-    assert "queue.append(entry)" in ROUTES_SRC, \
+    # The new wrapper must contain a queue append (list mutation pattern)
+    assert "queue_list.append(entry)" in ROUTES_SRC or "queue.append(entry)" in ROUTES_SRC, \
         "submit_pending() must append entry to a list queue, not overwrite _pending[sid]"
 
 
@@ -99,9 +99,9 @@ def test_approval_current_id_tracked():
 
 
 def test_polling_passes_count_to_show():
-    """The poll loop must pass pending_count to showApprovalCard."""
-    assert "showApprovalCard(data.pending, data.pending_count" in MESSAGES_JS, \
-        "Poll loop must pass data.pending_count to showApprovalCard"
+    """The poll loop must pass pending_count to the owner-aware approval renderer."""
+    assert "showApprovalForSession(sid, data.pending, data.pending_count" in MESSAGES_JS, \
+        "Poll loop must pass data.pending_count through showApprovalForSession"
 
 
 # ---------------------------------------------------------------------------
@@ -184,5 +184,28 @@ def test_respond_by_approval_id_pops_correct_entry():
     assert remaining[0]["command"] == "cmd1", "The remaining entry should be cmd1"
 
     # Cleanup
+    with r._lock:
+        r._pending.pop(sid, None)
+
+
+def test_stale_explicit_approval_id_does_not_pop_oldest_entry():
+    """Duplicate/stale approval responses must not resolve a different command."""
+    from api import routes as r
+
+    sid = "test-stale-approval-id-sid"
+    with r._lock:
+        r._pending.pop(sid, None)
+
+    r.submit_pending(sid, {"command": "cmd1", "pattern_key": "p1", "pattern_keys": ["p1"], "description": "d1"})
+    r.submit_pending(sid, {"command": "cmd2", "pattern_key": "p2", "pattern_keys": ["p2"], "description": "d2"})
+
+    accepted = r._resolve_approval_legacy(sid, "missing-approval-id", "deny")
+
+    assert accepted is False
+    with r._lock:
+        queue = r._pending.get(sid, [])
+        commands = [entry["command"] for entry in queue]
+    assert commands == ["cmd1", "cmd2"]
+
     with r._lock:
         r._pending.pop(sid, None)

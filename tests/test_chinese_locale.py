@@ -79,18 +79,23 @@ def test_chinese_locale_block_exists():
 
 def test_chinese_locale_includes_representative_translations():
     src = read(REPO / "static" / "i18n.js")
-    expected = [
-        "settings_title: '\\u8bbe\\u7f6e'",
-        "login_title: '\\u767b\\u5f55'",
-        "approval_heading: '需要审批'",
-        "tab_tasks: '任务'",
-        "tab_profiles: '配置'",
-        "session_time_just_now: '刚刚'",
-        "onboarding_title: '欢迎使用 Hermes Web UI'",
-        "onboarding_complete: '引导完成'",
+    # Each tuple is a list of acceptable source forms for the same translation —
+    # either escape-encoded `\uXXXX` form or literal CJK characters. They produce
+    # the same runtime string; do not pin source encoding.
+    expected_alternatives = [
+        [r"settings_title: '\u8bbe\u7f6e'", "settings_title: '设置'"],
+        [r"login_title: '\u767b\u5f55'", "login_title: '登录'"],
+        ["approval_heading: '需要审批'"],
+        ["tab_tasks: '任务'"],
+        ["tab_profiles: '配置'"],
+        ["session_time_bucket_today: '今天'"],
+        ["onboarding_title: '欢迎使用 Hermes Web UI'"],
+        ["onboarding_complete: '引导完成'"],
     ]
-    for entry in expected:
-        assert entry in src
+    for alts in expected_alternatives:
+        assert any(alt in src for alt in alts), (
+            f"None of the expected forms found in i18n.js: {alts!r}"
+        )
 
 
 def test_chinese_locale_covers_english_keys():
@@ -109,3 +114,29 @@ def test_chinese_locale_has_no_duplicate_keys():
     keys = key_pattern.findall(extract_locale_block(src, "zh"))
     duplicates = sorted(k for k, count in Counter(keys).items() if count > 1)
     assert not duplicates, f"Chinese locale has duplicate keys: {duplicates}"
+
+
+def test_traditional_chinese_mcp_and_tree_labels_are_not_cyrillic():
+    """Regression for PR #1254/#1274 locale cross-paste fallout.
+
+    zh-Hant inherited Russian MCP/tree-view labels such as "MCP Серверы",
+    "Дерево", and "Исходный".  Those labels show up under JSON/YAML code
+    block tree toggles and Settings → System → MCP Servers for zh-TW users.
+    """
+    src = read(REPO / "static" / "i18n.js")
+    start = src.index("  'zh-Hant': {")
+    end = src.index("\n  pt:", start)
+    block = src[start:end]
+
+    expected = [
+        "tree_view: '樹狀'",
+        "raw_view: '原始'",
+        "parse_failed_note: '解析失敗'",
+        "mcp_servers_title: 'MCP 伺服器'",
+        "mcp_no_servers: '未設定 MCP 伺服器。'",
+        "mcp_add_server: '+ 新增伺服器'",
+    ]
+    for entry in expected:
+        assert entry in block
+
+    assert not re.search(r"[\u0400-\u04FF]", block), "zh-Hant locale contains Cyrillic text"

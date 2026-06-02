@@ -1,17 +1,106 @@
 # Hermes Web UI: Browser Testing Plan
 
 > This document is for manual browser testing by you or by a Claude browser agent.
-> It covers user-facing features of the UI through v0.50.21 and later releases.
+> It covers user-facing features of the UI across current releases.
 > Each section is written as a step-by-step test procedure with expected outcomes.
 > A browser agent (e.g. Claude with Chrome access) can execute this plan directly.
 >
 > Prerequisites: SSH tunnel is active on port 8787. Open http://localhost:8787 in browser.
 > Server health check: curl http://127.0.0.1:8787/health should return {"status":"ok"}.
 >
-> Automated coverage: 1777 tests collected via `pytest tests/ --collect-only -q`. Includes onboarding coverage for bootstrap/static wizard presence, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, and CSS regression coverage for smooth thinking/tool card disclosure animation.
+> Automated coverage: ~7,150 tests collected via `pytest tests/ --collect-only -q`. Tests run on every PR via GitHub Actions on Python 3.11, 3.12, and 3.13 (3 parallel shards each), alongside a ruff lint gate, a headless browser smoke test, and a Docker smoke test. The suite covers the bootstrap/static wizard, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, CSS regression coverage for thinking/tool card animation, streaming session persistence, mobile layout breakpoints, locale parity across 11 languages, and hundreds of issue/PR-pinned regression tests.
 > Run: `pytest tests/ -v --timeout=60`
 >
 > Local regression focus: verify that a previously closed workspace panel stays visually closed from first paint through boot completion on desktop refresh; there should be no brief open-then-close flash.
+
+---
+
+## Static JS runtime lint (brick-class regression guard)
+
+Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function
+actually runs in the browser — `node --check` (lazy syntax check), source-presence
+tests, and even executing the file all miss them. Issue **#3162** was exactly this:
+a `const` binding reassigned inside `_ensureMessagesLoaded` bricked "load conversation
+messages" on every mobile message (v0.51.161–166).
+
+The guard is a curated, zero-false-positive ESLint config (`eslint.runtime-guard.config.mjs`)
+that runs ONLY runtime-error rules (`no-const-assign`, `no-import-assign`) over
+`static/**/*.js`. It is NOT a style linter and has no formatting rules.
+
+```bash
+# one-time dev setup (ESLint is a dev-only tool; the app stays pure Python + vanilla JS):
+npm install --no-save --before=<a-date-≥48h-ago> eslint   # package-age guard
+# run the guard:
+npm run lint:runtime
+# or directly:
+npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js"
+```
+
+## Python lint gate (ruff) — forward-looking, new-code-only
+
+The Python twin of the ESLint runtime guard. A curated `ruff` ruleset
+(`[tool.ruff]` in `pyproject.toml`) catches latent-bug shapes — unused imports
+(F401), undefined/unused names (F841/F821), redefinitions (F811), mutable default
+args (B006), raise-without-from (B904), loop-variable capture in closures (B023) —
+**plus** real syntax/runtime errors (E9). It is **not** a style/formatting linter:
+the pure-style families (line-length, whitespace) are intentionally OFF so the gate
+never demands a reformat of existing code.
+
+The existing tree carries a cosmetic backlog (mostly unused-import F401) that is
+deliberately **not** reformatted. So the gate is enforced **only on the lines a
+change adds or modifies** (`scripts/ruff_lint.py --diff`), which keeps new code
+clean without touching the backlog. Cleaning the backlog is a separate,
+maintainer-run, safe-fixes-only decision (tracked in #3273).
+
+```bash
+# one-time dev setup (ruff is a dev-only tool):
+pip install ruff            # or: uv tool install ruff / uvx ruff ...
+# the gate (only flags violations on lines you added/changed vs origin/master):
+python3 scripts/ruff_lint.py --diff origin/master
+# whole-tree backlog report (informational — never blocks):
+python3 scripts/ruff_lint.py --all
+```
+
+`tests/test_ruff_forward_lint.py` holds the **whole tree** free of E9 (real
+syntax/runtime) findings and verifies the curated config shape; it runs in-suite
+when ruff is present and **skips gracefully** when it isn't — so environments
+without ruff aren't blocked, while CI (which installs ruff) enforces it. The
+diff-scoped gate runs as the `lint` job in `.github/workflows/tests.yml` and is
+also part of the maintainer pre-release pre-gate.
+
+## Automated browser smoke (runtime brick-class gate)
+
+The ESLint guard above catches `const`-reassign / import-assign statically. The
+**browser smoke** catches the same brick class *dynamically* — plus anything else
+that throws only when a real browser executes the page (e.g. a `function X(){}` /
+`window.X = {}` name collision like #2715/#2771, which ESLint can't see).
+
+`tests/browser_smoke.py` boots the real `server.py` (agent-free, on an ephemeral
+port, with an isolated temp state dir) and loads the key pages in headless
+Chromium, failing if **any** console error or uncaught JS exception fires on load.
+It runs in CI (`.github/workflows/browser-smoke.yml`) on every PR and push to
+master, and locally:
+
+```bash
+pip install playwright && python -m playwright install chromium
+python tests/browser_smoke.py
+```
+
+It is intentionally **credential-free**: it strips every `*_API_KEY` from the
+environment before launching the server, needs no secrets, and does not drive a
+real model (it verifies the app *loads and initializes* cleanly — the brick class
+that breaks the page for everyone). A full chat golden-path E2E (send → stream →
+render → switch → reload) lives in the maintainer's private QA harness, which has
+the agent + a mock LLM provider available.
+
+
+`tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
+and **skips gracefully** (clear message) when it isn't — so environments without the
+node toolchain aren't blocked, while the release gate (which installs eslint) enforces it.
+
+To widen the guard, fix the pre-existing intentional hits first (as of 2026-05-30:
+`no-dupe-keys` ×92 i18n locale-fallback, `no-func-assign` ×2 panel override,
+`no-redeclare` ×1) then promote the rule into the config.
 
 ---
 
@@ -240,6 +329,32 @@ EXPECT:
   - If it was the only file, tray collapses
 FAIL: File not removed, error.
 
+### T4.6: Inline Audio Attachment Editor with Variable Speed
+SETUP: Active session, an audio file ready locally (`.mp3`, `.wav`, `.m4a`, `.ogg`, or `.flac`).
+STEPS:
+  1. Attach the audio file with the paperclip or drag/drop
+  2. Confirm the tray shows an audio media chip, then send the message
+  3. In the sent user message, press Play on the inline audio player
+  4. Click 0.5×, 1.25×, 1.5×, and 2× speed buttons
+EXPECT:
+  - The audio renders inline in the chat instead of only as a download/file badge
+  - Native audio controls are visible and usable
+  - The clicked speed button becomes active and playback speed changes immediately
+  - Download/open behavior for non-media files is unchanged
+FAIL: Audio only downloads, no speed buttons appear, or speed buttons do not affect playback.
+
+### T4.7: Inline Video Attachment Editor with Variable Speed
+SETUP: Active session, a video file ready locally (`.mp4`, `.mov`, `.webm`, or `.m4v`).
+STEPS:
+  1. Attach and send the video file
+  2. In the sent user message, play the inline video
+  3. Switch among 0.75×, 1×, 1.5×, and 2× speed controls
+EXPECT:
+  - The video renders inline, contained within the message width
+  - Native video controls are visible and usable
+  - Speed selection updates the video `playbackRate` without reloading the media
+FAIL: Video only shows a generic badge, overflows the chat column, or speed controls fail.
+
 ---
 
 ## Section 5: Workspace File Browser
@@ -305,6 +420,33 @@ EXPECT:
   - Path bar shows "image" badge in blue
   - Image maintains aspect ratio
 FAIL: Raw binary text displayed, broken image icon, error message, or nothing happens.
+
+### T5.5b: Preview Audio/Video Files Inline
+SETUP: Workspace contains at least one audio file (`.mp3`, `.wav`, `.m4a`) and one video file (`.mp4`, `.mov`, `.webm`).
+STEPS:
+  1. Click the audio file in the workspace file tree
+  2. Play it and select 1.5× or 2× speed
+  3. Close preview, then click the video file
+  4. Play it and select 0.75× or 1.25× speed
+EXPECT:
+  - Audio/video open in the workspace preview panel instead of downloading immediately
+  - Path badge shows `audio` or `video`
+  - Native media controls and the variable-speed buttons are visible
+  - Video scales to the preview panel without overflowing
+FAIL: Browser downloads the media immediately, raw binary appears, or speed controls are missing/broken.
+
+### T5.5c: Preview PDF Files Inline
+SETUP: Workspace contains at least one `.pdf` file.
+STEPS:
+  1. Click the PDF file in the workspace file tree
+  2. Use the browser/PDF viewer scroll and zoom controls if available
+  3. Click "Open in browser" as a fallback
+EXPECT:
+  - PDF opens in the workspace preview panel instead of downloading immediately
+  - Path badge shows `pdf`
+  - PDF iframe fills the preview area
+  - "Open in browser" opens the same raw file endpoint in a new tab
+FAIL: Browser downloads the PDF immediately, raw binary appears, or the preview panel is blank without an open fallback.
 
 ### T5.6: Preview a Markdown File (Sprint 2)
 SETUP: Workspace has a .md file (or create one: upload a file named README.md with some markdown content).
@@ -480,7 +622,8 @@ FAIL: Sidebar causes layout overflow or blocks chat.
 ### T11.3: Structured Log Output
 SETUP: SSH access to the server.
 STEPS:
-  1. In a terminal: tail -f /tmp/webui-mvp.log
+  1. In a terminal: tail -f ~/.hermes/webui/bootstrap-8787.log
+     (or tail -f ~/.hermes/webui.log when launched through `ctl.sh`)
   2. In browser: perform any action (load page, send message, click file)
 EXPECT:
   - Log entries appear in terminal as JSON: {"ts":"...","method":"GET","path":"/health","status":200,"ms":0.1}
@@ -504,7 +647,7 @@ FAIL: Multiple messages sent while one is in flight.
 ### T12.2: Upload Failure Shows Status
 SETUP: Active session.
 STEPS:
-  1. Try to attach a file larger than 20MB (if available)
+  1. Try to attach a file larger than the configured upload limit (20MB by default; overridden by `HERMES_WEBUI_MAX_UPLOAD_MB` if set)
 EXPECT:
   - Status bar shows an error message about file size or the upload is rejected
   - The chat is not broken (can still send messages)
@@ -524,7 +667,7 @@ FAIL: Browser freezes, crash, or security issue.
 
 ## Automated Test Coverage Reference
 
-These behaviors are verified by pytest (run: venv/bin/python -m pytest webui-mvp/tests/ -v):
+These behaviors are verified by pytest (run: venv/bin/python -m pytest tests/ -v):
 
 Sprint 1 tests (test_sprint1.py):
   - Server health, session CRUD (create/load/update/delete/sort)
@@ -1782,8 +1925,8 @@ Bridged CLI sessions:
 
 ---
 
-*Last updated: v0.50.91, April 19, 2026*
-*Total automated tests collected: 1777*
+*Last updated: v0.51.192, May 31, 2026*
+*Total automated tests collected: ~7,150 (run `pytest tests/ --collect-only -q` for the exact current count)*
 *Regression gate: tests/test_regressions.py*
 *Run: pytest tests/ -v --timeout=60*
 *Source: <repo>/*

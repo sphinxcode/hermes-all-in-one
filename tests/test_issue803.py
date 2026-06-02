@@ -33,12 +33,11 @@ class TestProfileCookieHelpers:
         assert 'SameSite=Lax' in s
         assert 'Path=/' in s
 
-    def test_build_profile_cookie_default_clears(self):
+    def test_build_profile_cookie_default_persists(self):
         from api.helpers import build_profile_cookie
         s = build_profile_cookie('default')
-        assert 'Max-Age=0' in s
-        # Empty value indicates clear
-        assert 'hermes_profile=""' in s or 'hermes_profile=;' in s
+        assert 'hermes_profile=default' in s
+        assert 'Max-Age=0' not in s
 
     def test_get_profile_cookie_returns_none_when_absent(self):
         from api.helpers import get_profile_cookie
@@ -73,6 +72,38 @@ class TestProfileCookieHelpers:
         # Must not raise; returns None
         result = get_profile_cookie(handler)
         assert result is None
+
+    def test_profile_cookie_name_defaults_to_hermes_profile(self, monkeypatch):
+        from api.helpers import build_profile_cookie
+
+        monkeypatch.delenv('WEBUI_PROFILE_COOKIE_NAME', raising=False)
+
+        s = build_profile_cookie('alice')
+        assert 'hermes_profile=alice' in s
+
+    def test_profile_cookie_name_can_be_isolated_per_webui_instance(self, monkeypatch):
+        from api.helpers import build_profile_cookie, get_profile_cookie
+
+        monkeypatch.setenv('WEBUI_PROFILE_COOKIE_NAME', 'hermes_profile_social')
+
+        s = build_profile_cookie('writer')
+        assert 'hermes_profile_social=writer' in s
+        assert 'hermes_profile=writer' not in s
+
+        handler = MagicMock()
+        handler.headers.get = lambda k, d='': (
+            'hermes_profile=wrong; hermes_profile_social=writer' if k == 'Cookie' else d
+        )
+        assert get_profile_cookie(handler) == 'writer'
+
+    def test_configured_profile_cookie_ignores_default_cookie_name(self, monkeypatch):
+        from api.helpers import get_profile_cookie
+
+        monkeypatch.setenv('WEBUI_PROFILE_COOKIE_NAME', 'hermes_profile_main')
+
+        handler = MagicMock()
+        handler.headers.get = lambda k, d='': 'hermes_profile=social_profile' if k == 'Cookie' else d
+        assert get_profile_cookie(handler) is None
 
 
 # ── 2. Thread-local request context ──────────────────────────────────────────
