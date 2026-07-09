@@ -16,6 +16,73 @@ from typing import Any
 DEFAULT_SLOW_REQUEST_SECONDS = 5.0
 MAX_STACK_FRAMES_PER_THREAD = 40
 
+# Process-global watchdog: a single daemon thread scans all in-flight
+# RequestDiagnostics instances instead of each request spawning its own
+# threading.Timer. A Timer-per-request spawns one OS thread per request, held
+# alive until finish() cancels it; under sustained /api/sessions poll load that
+# exhausts the per-process thread cap ("RuntimeError: can't start new thread")
+# and the server stops accepting connections (#4973). One watchdog thread per
+# process caps the timeout-tracking cost regardless of request rate.
+_WATCHDOG_TICK_SECONDS = 1.0
+_watchdog_lock = threading.Lock()
+_watchdog_pending: "dict[str, tuple[float, RequestDiagnostics]]" = {}
+_watchdog_cv = threading.Condition(_watchdog_lock)
+_watchdog_thread: "threading.Thread | None" = None
+
+
+def _ensure_watchdog_running() -> None:
+    global _watchdog_thread
+    # Caller already holds _watchdog_lock.
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
+        return
+    t = threading.Thread(
+        target=_watchdog_loop,
+        name="request-diagnostics-watchdog",
+        daemon=True,
+    )
+    _watchdog_thread = t
+    t.start()
+
+
+def _watchdog_loop() -> None:
+    # The loop body cannot raise while holding _watchdog_cv (the scan is pure
+    # dict ops; _on_timeout is fired outside the lock inside a try/except), so
+    # the watchdog thread never dies with entries pending. _ensure_watchdog_running
+    # therefore only needs to (re)spawn lazily on register, not supervise a crash.
+    while True:
+        fired: list[RequestDiagnostics] = []
+        with _watchdog_cv:
+            # Sleep until the next tick, but wake early if work arrives/changes.
+            _watchdog_cv.wait(_WATCHDOG_TICK_SECONDS)
+            if _watchdog_pending:
+                now = time.monotonic()
+                expired = [
+                    rid for rid, (deadline, _diag) in _watchdog_pending.items()
+                    if now >= deadline
+                ]
+                for rid in expired:
+                    _deadline, diag = _watchdog_pending.pop(rid)
+                    fired.append(diag)
+        # Fire _on_timeout outside the watchdog lock so a slow logger / stack
+        # snapshot can't stall the scan or block registering new requests.
+        for diag in fired:
+            try:
+                diag._on_timeout()
+            except Exception:  # never let one bad record kill the watchdog
+                pass
+
+
+def _watchdog_register(request_id: str, deadline: float, diag: "RequestDiagnostics") -> None:
+    with _watchdog_cv:
+        _watchdog_pending[request_id] = (deadline, diag)
+        _ensure_watchdog_running()
+        _watchdog_cv.notify()
+
+
+def _watchdog_unregister(request_id: str) -> None:
+    with _watchdog_cv:
+        _watchdog_pending.pop(request_id, None)
+
 
 def _slow_request_seconds() -> float:
     raw = os.getenv("HERMES_WEBUI_SLOW_REQUEST_SECONDS", "").strip()
@@ -39,11 +106,22 @@ class RequestDiagnostics:
         logger: logging.Logger | None = None,
         timeout_seconds: float | None = None,
         auto_start: bool = True,
+        print_fn: "callable | None" = None,
     ) -> None:
         self.request_id = uuid.uuid4().hex[:10]
         self.method = str(method or "-")
         self.path = str(path or "-").split("?", 1)[0]
         self.logger = logger or logging.getLogger(__name__)
+        # perf(webui/session-load-latency) tier2c: when the WebUI process
+        # boots without configuring a root-logger handler, logger.warning
+        # calls are silently dropped (the [SLOW] / "Slow WebUI request"
+        # lines have been invisible in production for some time — only the
+        # per-request ms line, which goes through _safe_webui_print, kept
+        # working). Callers that need the structured log to actually land
+        # in the systemd journal can pass print_fn=handler._safe_webui_print.
+        # When provided, finish() and _on_timeout() route through it
+        # instead of self.logger.warning.
+        self._print_fn = print_fn
         self.timeout_seconds = _slow_request_seconds() if timeout_seconds is None else max(0.0, float(timeout_seconds))
         self.started_monotonic = time.monotonic()
         self.started_wall = time.time()
@@ -53,11 +131,12 @@ class RequestDiagnostics:
         self._current_stage_started = self.started_monotonic
         self._finished = False
         self._watchdog_logged = False
-        self._timer: threading.Timer | None = None
         if auto_start and self.timeout_seconds > 0:
-            self._timer = threading.Timer(self.timeout_seconds, self._on_timeout)
-            self._timer.daemon = True
-            self._timer.start()
+            _watchdog_register(
+                self.request_id,
+                self.started_monotonic + self.timeout_seconds,
+                self,
+            )
 
     @classmethod
     def maybe_start(
@@ -66,14 +145,28 @@ class RequestDiagnostics:
         path: str,
         *,
         logger: logging.Logger | None = None,
+        print_fn: "callable | None" = None,
     ) -> "RequestDiagnostics | None":
         clean_path = str(path or "").split("?", 1)[0]
         if (method.upper(), clean_path) not in {
             ("GET", "/api/sessions"),
             ("POST", "/api/chat/start"),
+            # perf(session-load-latency) Phase 0 instrumentation gaps.
+            # These endpoints fire on every session click and were the source
+            # of the multi-second waterfalls in the slow-request logs.
+            ("GET", "/api/profiles"),
+            ("GET", "/api/models"),
+            # perf(webui/session-load-latency) tier2c: /api/session is the
+            # chat-open hot path. The handler also calls maybe_start() and
+            # finish() at its _t0/_t6 boundaries, so adding this entry to
+            # the allowlist is NOT a dead-code addition (the Greptile P1
+            # trap for previous similar entries): without the handler call
+            # the watchdog entry would never register and the structured
+            # log would never fire.
+            ("GET", "/api/session"),
         }:
             return None
-        return cls(method, clean_path, logger=logger)
+        return cls(method, clean_path, logger=logger, print_fn=print_fn)
 
     def stage(self, name: str) -> None:
         now = time.monotonic()
@@ -90,22 +183,31 @@ class RequestDiagnostics:
             self._current_stage = clean
             self._current_stage_started = now
 
+    def _emit_slow(self, prefix: str, record: dict) -> None:
+        payload = json.dumps(record, sort_keys=True)
+        log_msg = f"{prefix} %s"
+        if self._print_fn is not None:
+            try:
+                self._print_fn(log_msg % payload)
+            except Exception:
+                # print_fn is best-effort; never break a request thread.
+                pass
+        else:
+            self.logger.warning(log_msg, payload)
+
     def finish(self) -> None:
-        timer = None
         record = None
         with self._lock:
             if self._finished:
                 return
             self._finished = True
-            timer = self._timer
             record = self._build_record_locked(include_stacks=False)
-        if timer is not None:
-            timer.cancel()
+        # Drop ourselves from the watchdog so the process-global scan never
+        # fires _on_timeout for a completed request (and the pending dict stays
+        # bounded by the number of in-flight requests).
+        _watchdog_unregister(self.request_id)
         if record and self.timeout_seconds > 0 and record["elapsed_ms"] >= self.timeout_seconds * 1000:
-            self.logger.warning(
-                "Slow WebUI request completed: %s",
-                json.dumps(record, sort_keys=True),
-            )
+            self._emit_slow("Slow WebUI request completed:", record)
 
     def _on_timeout(self) -> None:
         with self._lock:
@@ -113,10 +215,7 @@ class RequestDiagnostics:
                 return
             self._watchdog_logged = True
             record = self._build_record_locked(include_stacks=True)
-        self.logger.warning(
-            "Slow WebUI request still running: %s",
-            json.dumps(record, sort_keys=True),
-        )
+        self._emit_slow("Slow WebUI request still running:", record)
 
     def _build_record_locked(self, *, include_stacks: bool) -> dict[str, Any]:
         now = time.monotonic()

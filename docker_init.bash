@@ -19,7 +19,7 @@ ok_exit() {
 # Ignore list: variables to ignore when loading environment variables from user to user
 export ENV_IGNORELIST="HOME PWD USER SHLVL TERM OLDPWD SHELL _ SUDO_COMMAND HOSTNAME LOGNAME MAIL SUDO_GID SUDO_UID SUDO_USER CHECK_NV_CUDNN_VERSION VIRTUAL_ENV VIRTUAL_ENV_PROMPT ENV_IGNORELIST ENV_OBFUSCATE_PART"
 # Obfuscate part: part of the key to obfuscate when loading environment variables from user to user, ex: HF_TOKEN, ...
-export ENV_OBFUSCATE_PART="TOKEN API KEY"
+export ENV_OBFUSCATE_PART="TOKEN API KEY PASSWORD SECRET CREDENTIAL COOKIE SESSION"
 
 # Check for ENV_IGNORELIST and ENV_OBFUSCATE_PART
 if [ -z "${ENV_IGNORELIST+x}" ]; then error_exit "ENV_IGNORELIST not set"; fi
@@ -264,6 +264,29 @@ if [ "A${whoami}" == "Aroot" ]; then
   chmod 600 "$ENV_FILE" || error_exit "Failed to secure $ENV_FILE"
   export _HW_ROOT_ENV_PATH="$ENV_FILE"
 
+  # Preserve Docker --group-add supplemental groups (for example render/video
+  # for /dev/dri GPU access) when dropping privileges. `su` rebuilds the target
+  # user's groups from /etc/group, so host-passed numeric groups must be made
+  # visible to hermeswebui before re-entering as the runtime user.
+  for gid in $(id -G); do
+    if [ "$gid" = "0" ] || [ "$gid" = "$WANTED_GID" ]; then
+      continue
+    fi
+    group_name="$(getent group "$gid" | cut -d: -f1 || true)"
+    if [ -z "$group_name" ]; then
+      group_name="hostgpu${gid}"
+      groupadd -g "$gid" "$group_name" 2>/dev/null || true
+      group_name="$(getent group "$gid" | cut -d: -f1 || true)"
+    fi
+    if [ -z "$group_name" ]; then
+      echo "!! WARNING: Could not create supplemental group for GID $gid; GPU device access may be unavailable"
+      continue
+    fi
+    if [ -n "$group_name" ]; then
+      usermod -a -G "$group_name" hermeswebui 2>/dev/null || echo "!! WARNING: Could not add hermeswebui to supplemental group $group_name ($gid)"
+    fi
+  done
+
   # restart the script as hermeswebui set with the correct UID/GID this time
   echo "-- Restarting as hermeswebui user with UID ${WANTED_UID} GID ${WANTED_GID}"
   exec su -s /bin/bash -c "exec \"${script_fullname}\"" hermeswebui || error_exit "subscript failed"
@@ -415,6 +438,13 @@ else
     # and `--reflink=auto` makes the copy near-free on overlay2/btrfs where
     # supported. We rebuild on every container start (the agent source can
     # change across volume re-init); cost is one rsync of ~10MB of Python source.
+    #
+    # NB: `rsync -a` / `cp -a` preserve the source tree's mode bits, so a `:ro`
+    # source mounted mode 555 leaves the staged copy also mode 555. setuptools
+    # then can't create `hermes_agent.egg-info/` next to the package — it dies
+    # with "Permission denied" even though `_stage_src` itself was created
+    # writable by hermeswebui. Re-add owner-write on the staged tree after the
+    # copy so the build dir is genuinely writable, not just owned by us.
     _stage_src="/tmp/hermes-agent-build"
     rm -rf "$_stage_src"
     mkdir -p "$_stage_src"
@@ -422,6 +452,7 @@ else
       rsync -a \
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
+        --exclude='.playwright' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
@@ -430,8 +461,11 @@ else
       cp -a "$_agent_src"/. "$_stage_src"/ \
         || error_exit "Failed to copy hermes-agent source to writable build dir"
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
+      rm -rf "$_stage_src"/.playwright 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
+    chmod -R u+w "$_stage_src" \
+      || error_exit "Failed to make staged hermes-agent source writable (rsync/cp preserved :ro mount perms)"
     uv pip install "$_stage_src[all]" --trusted-host pypi.org --trusted-host files.pythonhosted.org \
       || error_exit "Failed to install hermes-agent's requirements"
     rm -rf "$_stage_src"

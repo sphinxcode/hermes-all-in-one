@@ -25,7 +25,9 @@ def test_load_session_inflight_reattach_merges_pending_user_message_before_rende
     block = _load_session_inflight_branch()
 
     merge_pos = block.find("_mergePendingSessionMessage")
-    render_pos = block.find("renderMessages();")
+    # #3326 added an optional {preserveScroll} arg to the INFLIGHT-branch render
+    # call; match the call form rather than the bare `renderMessages();`.
+    render_pos = block.find("renderMessages(")
 
     assert merge_pos != -1, (
         "loadSession's INFLIGHT reattach branch must merge pending_user_message "
@@ -62,7 +64,14 @@ def test_pending_user_message_dedup_checks_current_message_array():
         "Pending-message dedup must inspect the current S.messages/INFLIGHT "
         "array, not only session.messages from the metadata response"
     )
-    assert "lastText===text" in helper, (
-        "Pending-message merge must suppress duplicates when the last user row "
-        "already matches pending_user_message"
+    assert "_pendingCurrentTailUserMessage(messages)" in helper, (
+        "Pending-message dedup must inspect only the current tail user row, "
+        "not a historical same-text row"
+    )
+    assert "sameCurrentTurn" in helper and "return null;" in helper, (
+        "Pending-message merge must still suppress duplicates when the current "
+        "tail user row already matches pending_user_message"
+    )
+    assert "[...messages].reverse().find" not in helper, (
+        "Pending-message dedup must not reverse-scan historical user rows"
     )

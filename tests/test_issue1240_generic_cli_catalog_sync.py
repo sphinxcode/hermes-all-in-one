@@ -11,6 +11,7 @@ import sys
 import types
 
 import api.config as config
+import api.profiles as profiles
 
 
 _PROVIDER_ENV_VARS = (
@@ -80,6 +81,9 @@ def _install_fake_hermes_cli(monkeypatch, *, provider_id: str, live_ids, raise_o
 
 
 def _configure(monkeypatch, tmp_path, *, provider: str, default: str = ""):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: hermes_home)
     monkeypatch.setattr(config, "_get_config_path", lambda: tmp_path / "missing-config.yaml")
     monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
     monkeypatch.setattr(
@@ -92,6 +96,7 @@ def _configure(monkeypatch, tmp_path, *, provider: str, default: str = ""):
         },
     )
     monkeypatch.setattr(config, "_cfg_mtime", 0.0)
+    monkeypatch.setattr(config, "_cfg_path", config._get_config_path(), raising=False)
     config.invalidate_models_cache()
 
 

@@ -10,6 +10,7 @@ STREAMING_PY = (REPO / "api" / "streaming.py").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
 ROUTES_PY = (REPO / "api" / "routes.py").read_text(encoding="utf-8")
 UI_JS = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+I18N_JS = (REPO / "static" / "i18n.js").read_text(encoding="utf-8")
 CSS = (REPO / "static" / "style.css").read_text(encoding="utf-8")
 
 
@@ -53,10 +54,14 @@ def test_ui_formats_and_renders_turn_duration_in_footer_and_activity_summary():
         "Compact tool activity summary should have a dedicated duration span at the end of the line."
     )
     assert "data-turn-duration" in UI_JS, (
-        "Activity groups need a stable data-turn-duration hook so settled duration can update the summary."
+        "The spec Activity summary needs a stable data-turn-duration hook so settled duration can update its summary."
     )
-    assert "compactActivityForMessage" in UI_JS, (
-        "When compact activity is present, duration should live on the Activity row "
+    assert "turnDuration:includeTurnDuration?_turnDurationForAnchor(anchorRow):undefined" in UI_JS, (
+        "Settled compact activity should put turn duration on the first spec Activity row, "
+        "not resurrect the legacy top Run Activity."
+    )
+    assert "compactWorklogForMessage" in UI_JS, (
+        "When folded Worklog detail is present, duration should live on the Worklog row "
         "instead of being duplicated in the assistant footer."
     )
     assert ".msg-duration-inline" in CSS and ".tool-call-group-duration" in CSS, (
@@ -73,18 +78,63 @@ def test_active_compact_activity_elapsed_timer_uses_persisted_start_time():
         "send() should copy chat-start pending_started_at into S.session before "
         "attaching the live stream."
     )
-    assert "function _formatActiveElapsedTimer" in UI_JS and "padStart(2,'0')" in UI_JS, (
-        "ui.js should format the running timer in MM:SS form."
+    assert "showLiveRunStatus(activeSid,{startedAt:_startedAt});" in MESSAGES_JS, (
+        "The first chat-start path should show the bottom live footer timer as soon "
+        "as stream_id and pending_started_at are known; reconnect should not be the "
+        "only path that restores it."
+    )
+    assert "function _processedElapsedLabel" in UI_JS and "t('processed_elapsed',text)" in UI_JS, (
+        "Compact Worklog should present the running timer as the stable processed-time anchor."
     )
     assert "data-turn-started-at" in UI_JS and "data-active-turn-elapsed" in UI_JS, (
         "Live compact Activity groups need stable start-time and active-elapsed "
         "hooks for browser QA and reconnect/rerender safety."
     )
-    assert "Working " in UI_JS, (
-        "The in-progress Activity summary should distinguish the live counter "
-        "from the settled 'Done in …' duration."
+    assert "_activityProcessedElapsedLabel(group)" in UI_JS, (
+        "The in-progress Activity summary should own the live elapsed label "
+        "instead of relying on the bottom live footer."
     )
     assert "setInterval" in UI_JS and "_clearActivityElapsedTimer" in UI_JS, (
         "The active elapsed label should tick while running and clear its interval "
         "on terminal/error/session-switch cleanup paths."
     )
+
+
+def test_live_footer_timer_is_re_synced_after_message_rerender():
+    assert "function _syncLiveRunStatusAfterRender()" in UI_JS, (
+        "renderMessages() needs a dedicated helper so the live footer timer "
+        "can be restored after DOM rebuilds."
+    )
+    assert "_syncLiveRunStatusAfterRender();" in UI_JS, (
+        "renderMessages() should call the live-status sync helper after it "
+        "rebuilds msgInner."
+    )
+    assert "showLiveRunStatus(sid,{startedAt,tokens:_liveRunStatusTokens});" in UI_JS, (
+        "If the timer node was torn down during a rerender, the helper should "
+        "recreate it for the active session."
+    )
+
+
+def test_compact_worklog_hides_bottom_live_footer_timer():
+    show = UI_JS.split("function showLiveRunStatus", 1)[1].split("function _renderLiveRunStatusContent", 1)[0]
+    sync = UI_JS.split("function _syncLiveRunStatusAfterRender", 1)[1].split("function hideLiveRunStatus", 1)[0]
+
+    assert "isCompactWorklogMode" in show
+    assert "if(el){el.hidden=true;el.innerHTML='';}" in show
+    assert "isCompactWorklogMode" in sync
+    assert "if(el){el.hidden=true;el.innerHTML='';}" in sync
+
+
+def test_processed_elapsed_anchor_is_i18n_driven():
+    assert "function _i18nProcessedElapsed(prefix, duration)" in I18N_JS
+    assert "function _i18nProcessedElapsedEn(duration)" in I18N_JS
+    assert "return _i18nProcessedElapsed('Processed', duration);" in I18N_JS
+    assert "function _i18nProcessedElapsedZh(duration)" in I18N_JS
+    assert "return _i18nProcessedElapsed('已处理', duration);" in I18N_JS
+    assert "function _i18nProcessedElapsedZhHant(duration)" in I18N_JS
+    assert "return _i18nProcessedElapsed('已處理', duration);" in I18N_JS
+    assert "processed_elapsed: _i18nProcessedElapsedEn" in I18N_JS
+    assert "processed_elapsed: _i18nProcessedElapsedZh" in I18N_JS
+    assert "processed_elapsed: _i18nProcessedElapsedZhHant" in I18N_JS
+    assert "t('processed_elapsed','')" in UI_JS
+    assert "`已处理 ${" not in UI_JS

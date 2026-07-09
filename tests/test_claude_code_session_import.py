@@ -164,15 +164,15 @@ def test_get_cli_sessions_cache_invalidates_when_sqlite_wal_changes(monkeypatch,
     Path(f"{db_path}-wal").write_text("new wal contents", encoding="utf-8")
     second = models.get_cli_sessions()
 
-    # Two calls to get_cli_sessions() × 2 invocations each (first pass +
-    # second cron-only pass) = 4 total calls to the mock.
-    assert calls == 4
+    # Two calls to get_cli_sessions() × 3 invocations each (first pass +
+    # cron-only pass + webhook-only pass) = 6 total calls to the mock.
+    assert calls == 6
     # First pass of first call returned message_count=1 (calls was 1).
     assert first[0]["message_count"] == 1
-    # First pass of second call returned message_count=3 (calls was 3;
-    # the second pass incremented calls to 2 and 4 but cron-only filter
-    # excluded the cli-source session from both second passes).
-    assert second[0]["message_count"] == 3
+    # First pass of second call returned message_count=4 (calls was 4;
+    # source-specific passes incremented calls to 2, 3, 5, and 6 but excluded
+    # the cli-source session from those pass results).
+    assert second[0]["message_count"] == 4
 
 
 def test_session_import_cli_returns_read_only_claude_code_payload(monkeypatch, tmp_path):
@@ -198,8 +198,8 @@ def test_session_import_cli_returns_read_only_claude_code_payload(monkeypatch, t
     monkeypatch.setattr(routes, "require", lambda body, *keys: None)
     monkeypatch.setattr(routes, "bad", lambda _handler, msg, status=400: {"ok": False, "error": msg, "status": status})
     monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200, extra_headers=None: payload)
-    monkeypatch.setattr(routes, "get_cli_session_messages", lambda _sid: messages if _sid == sid else [])
-    monkeypatch.setattr(routes, "get_cli_sessions", lambda: [meta])
+    monkeypatch.setattr(routes, "get_cli_session_messages", lambda _sid, profile=None: messages if _sid == sid else [])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda source_filter=None, all_profiles=False: [meta])
     monkeypatch.setattr(routes, "get_last_workspace", lambda: tmp_path / "workspace")
     monkeypatch.setattr(routes, "import_cli_session", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("read-only import must not persist")))
 
@@ -217,6 +217,79 @@ def test_session_import_cli_returns_read_only_claude_code_payload(monkeypatch, t
     assert session["session_source"] == "external_agent"
     assert session["source_label"] == "Claude Code"
     assert session["is_cli_session"] is True
+
+
+def test_session_import_cli_queues_generated_title_for_writable_default_cli_title(monkeypatch):
+    import api.routes as routes
+
+    sid = "cli_writable_default_title"
+    messages = [{"role": "user", "content": "Need a better imported title"}]
+    cli_meta = {
+        "session_id": sid,
+        "title": "CLI Session",
+        "model": "claude-code",
+        "created_at": 10.0,
+        "updated_at": 20.0,
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "external_agent",
+        "source_label": "CLI",
+        "is_cli_session": True,
+        "read_only": False,
+    }
+    persisted = {}
+    queued = []
+    published = []
+
+    class FakeImportedSession:
+        def __init__(self):
+            self.session_id = sid
+            self.title = "CLI Session"
+            self.messages = list(messages)
+            self.profile = "default"
+            self.model = "claude-code"
+            self.read_only = False
+            self.is_cli_session = True
+
+        def save(self, touch_updated_at=False):
+            persisted["saved"] = touch_updated_at
+
+        def compact(self):
+            return {"session_id": sid, "title": self.title}
+
+    imported = FakeImportedSession()
+
+    monkeypatch.setattr(routes.Session, "load", classmethod(lambda _cls, _sid: None))
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(routes, "bad", lambda _handler, msg, status=400: {"ok": False, "error": msg, "status": status})
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200, extra_headers=None: payload)
+    monkeypatch.setattr(
+        routes,
+        "get_cli_session_messages",
+        lambda _sid, profile=None: messages if _sid == sid else [],
+    )
+    monkeypatch.setattr(
+        routes,
+        "get_cli_sessions",
+        lambda source_filter=None, all_profiles=False: [cli_meta],
+    )
+    monkeypatch.setattr(routes, "import_cli_session", lambda *args, **kwargs: imported)
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda reason, profile=None: published.append((reason, profile)))
+    monkeypatch.setattr(routes, "_queue_generated_title_for_imported_session", lambda session, meta: queued.append((session, meta.copy())))
+
+    response = routes._handle_session_import_cli(object(), {"session_id": sid})
+
+    assert response["imported"] is True
+    assert persisted["saved"] is False
+    assert published == [("session_import_cli", "default")]
+    assert queued == [(imported, {
+        "title": "CLI Session",
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "external_agent",
+        "source_label": "CLI",
+        "read_only": False,
+    })]
 
 
 def test_read_only_source_badge_ui_guards_are_present():
@@ -238,6 +311,61 @@ def test_read_only_source_badge_ui_guards_are_present():
     assert "topbar-source-badge" in panels_js
     assert "S.session.read_only || S.session.is_read_only" in panels_js
     assert 'data-source-key="claude_code"' in style_css
-    assert ".session-item.cli-session.read-only-session:hover::after" in style_css
+    assert ".session-item.read-only-session:hover .session-source-chip" in style_css
     assert "Read-only imported sessions cannot be deleted" in routes_py
     assert "Read-only imported sessions cannot be archived" in routes_py
+
+
+def test_messaging_source_badge_not_gated_on_is_cli_session():
+    # Messaging sessions (Telegram, WeChat, Discord) populate source_label/source_tag/raw_source
+    # but reach the chat pane with is_cli_session=false, so the topbar badge must not be gated on
+    # is_cli_session or it never renders for them (#3338).
+    ui_js = (REPO_ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+    panels_js = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+
+    assert "S.session.is_cli_session&&(S.session.source_label" not in ui_js
+    assert "if (S.session.is_cli_session) sourceLabel" not in panels_js
+    assert "S.session.source_label||S.session.source_tag||S.session.raw_source" in ui_js
+    assert "S.session.source_label || S.session.source_tag || S.session.raw_source" in panels_js
+    # The native WebUI self-source must be suppressed so recovered sidecars
+    # (source_label 'WebUI' from api/session_recovery.py) don't badge the chat pane (#3338).
+    assert "/^webui$/i.test(sourceLabel)" in ui_js
+    assert "/^webui$/i.test(sourceLabel)" in panels_js
+
+
+def test_messaging_source_badge_in_sidebar_not_gated_on_is_cli_session():
+    sessions_js = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    style_css = (REPO_ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    assert "function _isMessagingSession" in sessions_js
+    assert sessions_js.count("if(s.is_cli_session||_isMessagingSession(s)){") == 2
+    assert "if(s.is_cli_session&&sourceLabel) metaBits.push(sourceLabel);" not in sessions_js
+    assert (
+        "if(sourceLabel&&(s.is_cli_session||_isMessagingSession(s))) metaBits.push(sourceLabel);"
+        in sessions_js
+    )
+    assert "session-source-chip" in sessions_js
+    assert ".session-source-chip" in style_css
+    assert '.session-source-chip[data-source-key="telegram"]' in style_css
+    assert '.session-source-chip[data-source-key="discord"]' in style_css
+    assert '.session-item.cli-session[data-source-key="telegram"]' in style_css
+
+
+def test_compression_queue_discoverability_ux():
+    ui_js = (REPO_ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+    i18n_js = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+
+    # Old misleading tooltip key must be gone from the compression branch
+    assert "composer_disabled_compression','Waiting for compression to finish'" not in ui_js
+
+    # New will-queue key must be present in ui.js (tooltip and placeholder)
+    assert "composer_compression_will_queue" in ui_js
+
+    # getComposerPrimaryAction must return 'queue' for compressionRunning+no-content
+    assert "if(compressionRunning) return 'queue';" in ui_js
+
+    # clearCompressionUi must restore the placeholder
+    assert "_compressionPlaceholderSaved" in ui_js
+
+    # New i18n key must appear in all 11 locales (count occurrences)
+    assert i18n_js.count("composer_compression_will_queue") >= 11

@@ -8,17 +8,21 @@ recursion.  Covers:
 - External symlink dirs (e.g. ln -s /some/path ~/workspace/link)
 - Self-referencing symlink (ln -s . ~/workspace/loop)
 - Ancestor symlink (ln -s .. ~/workspace/up)
-- Symlink entries carry correct type / is_dir / target fields
-- Browsing into a symlink directory via workspace-relative path works
+- Internal symlink entries carry correct type / is_dir / target fields
+- External symlink directories are emitted as display-only rows (target_outside_workspace=True)
+  and cannot be traversed
 """
 import json
 import os
 import pathlib
+import urllib.parse
 import urllib.request
 import urllib.error
 import tempfile
+import pytest
 
 from tests._pytest_port import BASE
+import api.workspace as w
 
 
 def get(path):
@@ -30,8 +34,12 @@ def get(path):
 def post(path, body=None):
     url = BASE + path
     data = json.dumps(body or {}).encode()
+    headers = {"Content-Type": "application/json"}
+    if path == "/api/escape/authorize":
+        parsed = urllib.parse.urlparse(BASE)
+        headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
     req = urllib.request.Request(url, data=data,
-          headers={"Content-Type": "application/json"})
+          headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read()), r.status
@@ -57,8 +65,8 @@ def make_session(created_list, ws=None):
 class TestSymlinkCycleDetection:
     """Symlink cycle detection in list_dir / safe_resolve_ws."""
 
-    def test_external_symlink_listed_as_symlink(self, cleanup_test_sessions, tmp_path_factory):
-        """External symlink dir should appear with type='symlink', is_dir=True."""
+    def test_external_symlink_emitted_as_display_only(self, cleanup_test_sessions, tmp_path_factory):
+        """External symlink dirs are emitted with target_outside_workspace=True (display-only)."""
         ws = tmp_path_factory.mktemp("ws")
         target = tmp_path_factory.mktemp("target")
         (target / "file.txt").write_text("hello")
@@ -67,28 +75,70 @@ class TestSymlinkCycleDetection:
 
         sid, _ = make_session(cleanup_test_sessions, ws)
         listing = get(f"/api/list?session_id={sid}&path=.")
-        entries = listing["entries"]
-        ext = [e for e in entries if e["name"] == "ext"]
-        assert len(ext) == 1
-        assert ext[0]["type"] == "symlink"
-        assert ext[0]["is_dir"] is True
-        assert ext[0]["target"] == str(target)
+        entries = {e["name"]: e for e in listing["entries"]}
+        assert "ext" in entries
+        assert entries["ext"]["type"] == "symlink"
+        assert entries["ext"]["target_outside_workspace"] is True
+        # #4581 hardening: display-only escape rows don't disclose target-derived
+        # metadata (is_dir/target), so an external dir symlink reports is_dir=False.
+        assert entries["ext"]["is_dir"] is False
+        assert "target" not in entries["ext"]
 
-    def test_external_symlink_browsable(self, cleanup_test_sessions, tmp_path_factory):
-        """Listing inside an external symlink dir returns its contents."""
+    def test_internal_symlink_listed_as_symlink(self, cleanup_test_sessions, tmp_path_factory):
+        """Internal symlink dirs should appear with type='symlink', is_dir=True."""
+        if not w._DIR_FD_OK:
+            pytest.skip("internal symlink listing is platform-dependent without dir_fd")
+        ws = tmp_path_factory.mktemp("ws")
+        target = ws / "target"
+        target.mkdir()
+        (target / "file.txt").write_text("hello")
+        link = ws / "internal"
+        link.symlink_to(target)
+
+        sid, _ = make_session(cleanup_test_sessions, ws)
+        listing = get(f"/api/list?session_id={sid}&path=.")
+        entries = listing["entries"]
+        internal = [e for e in entries if e["name"] == "internal"]
+        assert len(internal) == 1
+        assert internal[0]["type"] == "symlink"
+        assert internal[0]["is_dir"] is True
+        assert internal[0]["target"] == str(target)
+
+    def test_external_symlink_not_browsable(self, cleanup_test_sessions, tmp_path_factory):
+        """Listing inside an external symlink dir is blocked at the workspace boundary."""
         ws = tmp_path_factory.mktemp("ws")
         target = tmp_path_factory.mktemp("target")
         (target / "inner.txt").write_text("data")
         (ws / "ext").symlink_to(target)
 
         sid, _ = make_session(cleanup_test_sessions, ws)
-        listing = get(f"/api/list?session_id={sid}&path=ext")
-        entries = listing["entries"]
-        names = [e["name"] for e in entries]
-        assert "inner.txt" in names
+        try:
+            get(f"/api/list?session_id={sid}&path=ext")
+            assert False, "External symlink traversal should be blocked"
+        except urllib.error.HTTPError as e:
+            assert e.code in (400, 404, 500)
+
+    def test_escape_authorized_listing_virtualizes_paths(self, cleanup_test_sessions, tmp_path_factory):
+        ws = tmp_path_factory.mktemp("ws")
+        target = tmp_path_factory.mktemp("target")
+        (target / "child.txt").write_text("data", encoding="utf-8")
+        (ws / "ext").symlink_to(target)
+
+        sid, _ = make_session(cleanup_test_sessions, ws)
+        auth, status = post("/api/escape/authorize", {"session_id": sid, "path": "ext"})
+        assert status == 200, auth
+        listed = get(f"/api/escape/list?session_id={sid}&token={auth['token']}&path=ext")
+        entries = {entry["name"]: entry for entry in listed["entries"]}
+        assert listed["path"] == "ext"
+        assert listed["read_only"] is True
+        assert entries["child.txt"]["path"] == "ext/child.txt"
+        assert entries["child.txt"]["escape_read_only"] is True
+        assert str(target) not in json.dumps(listed)
 
     def test_self_referencing_symlink_filtered(self, cleanup_test_sessions, tmp_path_factory):
         """Symlink pointing to the workspace root itself must be filtered out."""
+        if not w._DIR_FD_OK:
+            pytest.skip("cycle filtering is platform-dependent without dir_fd")
         ws = tmp_path_factory.mktemp("ws")
         (ws / "file.txt").write_text("data")
         (ws / "loop").symlink_to(ws)
@@ -100,6 +150,8 @@ class TestSymlinkCycleDetection:
 
     def test_ancestor_symlink_filtered(self, cleanup_test_sessions, tmp_path_factory):
         """Symlink pointing to a parent of the workspace must be filtered out."""
+        if not w._DIR_FD_OK:
+            pytest.skip("cycle filtering is platform-dependent without dir_fd")
         parent = tmp_path_factory.mktemp("parent")
         ws = parent / "workspace"
         ws.mkdir()
@@ -112,8 +164,20 @@ class TestSymlinkCycleDetection:
         names = [e["name"] for e in listing["entries"]]
         assert "up" not in names, "Ancestor symlink should be filtered"
 
+    def test_mutual_symlink_loop_filtered(self, cleanup_test_sessions, tmp_path_factory):
+        """Mutually recursive symlinks should be skipped instead of raising RuntimeError."""
+        ws = tmp_path_factory.mktemp("ws")
+        (ws / "a").symlink_to(ws / "b")
+        (ws / "b").symlink_to(ws / "a")
+
+        sid, _ = make_session(cleanup_test_sessions, ws)
+        listing = get(f"/api/list?session_id={sid}&path=.")
+        names = [e["name"] for e in listing["entries"]]
+        assert "a" not in names
+        assert "b" not in names
+
     def test_symlink_cycle_in_subdir(self, cleanup_test_sessions, tmp_path_factory):
-        """Symlink cycle inside a symlink target's subtree must not recurse."""
+        """External symlink subpaths must be blocked instead of traversed."""
         ws = tmp_path_factory.mktemp("ws")
         target = tmp_path_factory.mktemp("target")
         (target / "subdir").mkdir()
@@ -122,20 +186,26 @@ class TestSymlinkCycleDetection:
         (ws / "ext").symlink_to(target)
 
         sid, _ = make_session(cleanup_test_sessions, ws)
-        # List root — should show ext but not recurse
+        # List root — external symlink is emitted as display-only, not traversed.
         listing = get(f"/api/list?session_id={sid}&path=.")
-        names = [e["name"] for e in listing["entries"]]
-        assert "ext" in names
+        entries = {e["name"]: e for e in listing["entries"]}
+        assert "ext" in entries
+        assert entries["ext"]["target_outside_workspace"] is True
 
-        # List inside ext/subdir — 'back' should be filtered
-        listing2 = get(f"/api/list?session_id={sid}&path=ext/subdir")
-        names2 = [e["name"] for e in listing2["entries"]]
-        assert "back" not in names2, "Cycle symlink inside external target should be filtered"
+        # Traversing into ext/subdir crosses the workspace boundary and is blocked.
+        try:
+            get(f"/api/list?session_id={sid}&path=ext/subdir")
+            assert False, "External symlink subpath traversal should be blocked"
+        except urllib.error.HTTPError as e:
+            assert e.code in (400, 404, 500)
 
-    def test_symlink_file_entry(self, cleanup_test_sessions, tmp_path_factory):
-        """Symlink to a file should have is_dir=False and include size."""
+    def test_internal_symlink_file_entry(self, cleanup_test_sessions, tmp_path_factory):
+        """Internal symlink to a file should have is_dir=False and include size."""
+        if not w._DIR_FD_OK:
+            pytest.skip("internal symlink metadata is platform-dependent without dir_fd")
         ws = tmp_path_factory.mktemp("ws")
-        real = tmp_path_factory.mktemp("real")
+        real = ws / "real"
+        real.mkdir()
         (real / "data.txt").write_text("hello world")
         (ws / "link.txt").symlink_to(real / "data.txt")
 
@@ -146,6 +216,21 @@ class TestSymlinkCycleDetection:
         assert link[0]["type"] == "symlink"
         assert link[0]["is_dir"] is False
         assert link[0]["size"] == 11  # len("hello world")
+
+    def test_external_symlink_file_emitted_as_display_only(self, cleanup_test_sessions, tmp_path_factory):
+        """External symlink files are emitted with target_outside_workspace=True (display-only)."""
+        ws = tmp_path_factory.mktemp("ws")
+        real = tmp_path_factory.mktemp("real")
+        (real / "data.txt").write_text("hello world")
+        (ws / "link.txt").symlink_to(real / "data.txt")
+
+        sid, _ = make_session(cleanup_test_sessions, ws)
+        listing = get(f"/api/list?session_id={sid}&path=.")
+        entries = {e["name"]: e for e in listing["entries"]}
+        assert "link.txt" in entries
+        assert entries["link.txt"]["type"] == "symlink"
+        assert entries["link.txt"]["target_outside_workspace"] is True
+        assert entries["link.txt"]["is_dir"] is False
 
     def test_path_traversal_still_blocked(self, cleanup_test_sessions, tmp_path_factory):
         """Raw .. traversal must still be blocked even with symlink support."""

@@ -53,7 +53,7 @@ def _run_session_search_helper(cases):
         [NODE, "-e", driver, json.dumps(cases)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -98,7 +98,10 @@ def test_read_only_sessions_can_still_open_actions_for_copy_link():
     open_menu_block = SESSIONS_JS[start:end]
     assert "Read-only imported sessions cannot be modified" not in open_menu_block
     assert "const isReadOnly = _isReadOnlySession(session);" in open_menu_block
-    assert "if(isReadOnly){\n    _mountSessionActionMenu(menu, session, anchorEl);\n    return;\n  }" in open_menu_block
+    # Read-only sessions still get a usable menu: Copy link + Export as HTML
+    # (both non-mutating) are offered, then the menu mounts and returns early
+    # before any mutating action is appended.
+    assert "if(isReadOnly){\n    _appendSessionExportHtmlAction(menu, session);\n    _mountSessionActionMenu(menu, session, anchorEl);\n    return;\n  }" in open_menu_block
 
 
 def test_copy_link_i18n_keys_have_english_and_german_labels():
@@ -183,7 +186,9 @@ def test_conversation_filter_merges_direct_title_and_content_matches_without_dro
 def test_conversation_filter_keeps_content_search_results_when_query_is_session_id():
     assert "function _sessionSearchMergeMatches" in SESSIONS_JS
     assert "function _sessionSearchDirectAndTitleMatches" in SESSIONS_JS
-    assert "const allMatched=_sessionSearchMergeMatches(_allSessions,searchQueryRaw,_contentSearchResults);" in SESSIONS_JS
+    assert "const sidebarRows=_sessionRowsWithActiveEphemeralSession(_allSessions);" in SESSIONS_JS
+    assert "const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);" in SESSIONS_JS
+    assert "const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);" in SESSIONS_JS
     assert "const directAndTitleMatches=_sessionSearchDirectAndTitleMatches(_allSessions,currentQ);" in SESSIONS_JS
     assert "const directOrTitleIds=new Set(directAndTitleMatches.map(s=>s.session_id));" in SESSIONS_JS
     assert "!directOrTitleIds.has(s.session_id)" in SESSIONS_JS

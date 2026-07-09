@@ -4,10 +4,73 @@ function _markSessionViewed(sid, messageCount) {
   _setSessionViewedCount(sid, next);
 }
 
+function _apiUrl(path) {
+  return new URL(path, document.baseURI || location.href).href;
+}
+
+// Module-scope dedupe ring buffer for bg_task_complete events. Shared between
+// the in-turn STREAMS path (per-turn EventSource inside the chat-stream wirer)
+// and the persistent session-scoped path (/api/session/stream), so the
+// frontend never double-fires a toast or ack for the same (session_id,
+// event_id) regardless of which channel delivered it first. (Option X)
+//
+// Keyed by `${session_id}|${event_id}` → expiry timestamp (ms since epoch).
+// Bounded by a 60-second TTL plus a 256-entry soft cap with insertion-order
+// eviction on overflow. Events without `event_id` are ignored by the caller
+// (the server contract guarantees `event_id` on every completion emit).
+const _BG_TASK_COMPLETE_TTL_MS = 60000;
+const _BG_TASK_COMPLETE_CAP = 256;
+const _bgTaskCompleteSeenIds = new Map();
+
+function _bgTaskCompleteRingBufferAdd(sid, evt_id) {
+  // Missing key → treat as "seen/skip" (return true). The sole caller already
+  // guards with `if (!evt_id) return;` before invoking this, so this branch is
+  // defensive: returning true (skip) rather than false (proceed) means a
+  // future call site that forgets that guard drops the un-keyable event
+  // instead of processing a completion with no dedupe key.
+  if (!sid || !evt_id) return true;
+  const key = sid + '|' + evt_id;
+  const now = Date.now();
+  // Lazy purge: walk insertion-order; drop any entry whose expiry has passed.
+  // Map iteration is insertion-order so this also surfaces the oldest entries
+  // first when we need to evict for the soft cap below.
+  for (const [k, exp] of _bgTaskCompleteSeenIds) {
+    if (exp <= now) {
+      _bgTaskCompleteSeenIds.delete(k);
+    }
+  }
+  if (_bgTaskCompleteSeenIds.has(key)) return true;  // duplicate
+  _bgTaskCompleteSeenIds.set(key, now + _BG_TASK_COMPLETE_TTL_MS);
+  // Soft cap: insertion-order eviction.
+  while (_bgTaskCompleteSeenIds.size > _BG_TASK_COMPLETE_CAP) {
+    const firstKey = _bgTaskCompleteSeenIds.keys().next().value;
+    if (firstKey === undefined) break;
+    _bgTaskCompleteSeenIds.delete(firstKey);
+  }
+  return false;
+}
+
 function _isDocumentVisibleAndFocused() {
   if(typeof document!=='undefined' && document.visibilityState && document.visibilityState!=='visible') return false;
   if(typeof document!=='undefined' && typeof document.hasFocus==='function' && !document.hasFocus()) return false;
   return true;
+}
+
+let _desktopBackgroundedForNotifications=false;
+// Desktop shells can background a visible document; keep that signal notification-only.
+if(typeof window!=='undefined'){
+  window.__hermesSetBackgrounded=(value)=>{
+    _desktopBackgroundedForNotifications=!!value;
+    if(_desktopBackgroundedForNotifications){
+      for(const k in _STREAM_NOTIFICATION_BACKGROUND){
+        const e=_STREAM_NOTIFICATION_BACKGROUND[k];
+        if(e) e.wasBackgrounded=true;
+      }
+    }
+  };
+}
+function _isBackgroundedForBrowserNotification(){
+  return !!(typeof document!=='undefined'&&document.hidden)||_desktopBackgroundedForNotifications;
 }
 
 function _isSessionCurrentPane(sid) {
@@ -66,6 +129,37 @@ function _deferStreamErrorIfOffline(){
 
 document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);
 window.addEventListener('focus', _markActiveSessionViewedOnReturn);
+
+// Delegated click handler for the interim-progress-note collapse toggle (#2403).
+// Delegation (not a per-element listener) is required because the live turn's
+// DOM is snapshotted/restored via outerHTML/innerHTML on session switch
+// (snapshotLiveTurnHtmlForSession / restoreLiveTurnHtmlForSession in ui.js),
+// which strips element listeners. A document-level handler survives the
+// restore so a restored toggle stays interactive and collapsed notes never
+// become permanently unreachable. State lives in the DOM (presence of
+// .interim-collapsed + data-threshold on the toggle), so the handler is
+// stateless and works on freshly-created and restored toggles alike.
+function _interimCollapseDelegatedClick(e){
+  const toggle=e.target&&e.target.closest?e.target.closest('.interim-collapse-toggle'):null;
+  if(!toggle) return;
+  const blocks=toggle.parentElement;
+  if(!blocks) return;
+  const threshold=parseInt(toggle.dataset.threshold,10)||3;
+  const hidden=blocks.querySelectorAll('.interim-collapsed');
+  if(hidden.length){
+    hidden.forEach(el=>el.classList.remove('interim-collapsed'));
+    toggle.dataset.expanded='1';
+    toggle.textContent='Collapse';
+  } else {
+    const all=Array.from(blocks.querySelectorAll('[data-interim="1"]'));
+    const rehide=all.slice(0,all.length-threshold);
+    rehide.forEach(el=>el.classList.add('interim-collapsed'));
+    toggle.dataset.expanded='';
+    toggle.textContent='Show '+rehide.length+' earlier update'+(rehide.length===1?'':'s');
+  }
+}
+document.addEventListener('click', _interimCollapseDelegatedClick);
+
 // TTS: pause speech synthesis when user focuses the composer (#499)
 const _msgEl=document.getElementById('msg');
 if(_msgEl) _msgEl.addEventListener('focus', ()=>{ if('speechSynthesis' in window && speechSynthesis.speaking) speechSynthesis.pause(); });
@@ -73,7 +167,591 @@ if(_msgEl) _msgEl.addEventListener('blur', ()=>{ if('speechSynthesis' in window 
 
 let _selectedTextReplyBtn=null;
 let _selectedTextReplyText='';
+let _pendingSelections=[];  // [{id, name, text}] — named context blocks
+let _selectionIdCounter=0;
+// #4380: expose a pending-selection predicate so the composer's primary-action
+// content check (_composerHasContent in ui.js) treats selection-only replies as
+// sendable content even though they no longer live in the textarea.
+if(typeof window!=='undefined'){
+  window._hasPendingSelections=function(){return _pendingSelections.length>0;};
+}
 let _selectedTextReplyRaf=0;
+const _persistentStateToastSeen=new Set();
+const _thinkPairs=[
+  {open:'<think>',close:'</think>'},
+  {open:'<|channel>thought\n',close:'<channel|>'},
+  {open:'<|turn|>thinking\n',close:'<turn|>'}
+];
+
+function _thinkingFenceMarkerAt(text, index){
+  // A fenced code block opener may be indented up to 3 spaces in Markdown
+  // (4+ spaces is an indented code block, handled separately). Only treat the
+  // marker as a fence when it sits at a line start after optional 1-3 spaces.
+  if(index>0&&text[index-1]!=='\n'){
+    let back=index-1, spaces=0;
+    while(back>=0&&text[back]===' '&&spaces<3){back--;spaces++;}
+    if(!(back<0||text[back]==='\n')) return '';
+  }
+  if(text.startsWith('```',index)) return '```';
+  if(text.startsWith('~~~',index)) return '~~~';
+  return '';
+}
+
+function _nextThinkingOpener(text, start){
+  // Index of the earliest complete thinking opener at/after `start`, or -1.
+  // Cheap indexOf per opener — lets the scanner bulk-skip plain trailing content
+  // instead of walking it char-by-char (#3633 Codex per-token perf catch).
+  let best=-1;
+  for(const p of _thinkPairs){
+    const i=text.indexOf(p.open,start);
+    if(i!==-1&&(best===-1||i<best)) best=i;
+  }
+  return best;
+}
+
+function _textTailIsPartialOpener(text){
+  // True when the END of text is a non-empty proper prefix of some opener
+  // (e.g. "<thi" for "<think>"). Decides whether a streaming tail might be a
+  // forming block worth code-aware handling.
+  for(const p of _thinkPairs){
+    const m=Math.min(p.open.length-1,text.length);
+    for(let n=m;n>0;n--){ if(p.open.startsWith(text.slice(text.length-n))) return true; }
+  }
+  return false;
+}
+
+function _lineIsIndentedCode(text, lineStart){
+  // True when the line beginning at lineStart is a markdown indented code block
+  // line (>=4 leading spaces or a leading tab, and not blank). lineStart must be
+  // the first char of the line. Only inspects the line's leading chars, not the
+  // whole document (the per-character variant was O(n^2) on long no-newline
+  // content — #3633 Codex perf catch).
+  if(lineStart>=text.length) return false;
+  if(text[lineStart]==='\t'||text.startsWith('    ',lineStart)){
+    let nl=text.indexOf('\n',lineStart);
+    if(nl===-1) nl=text.length;
+    return text.slice(lineStart,nl).trim()!=='';
+  }
+  return false;
+}
+
+function _mergeInlineThinkingReasoning(existingReasoning, extractedParts){
+  let out=String(existingReasoning||'').trim();
+  (Array.isArray(extractedParts)?extractedParts:[]).forEach(function(part){
+    const item=String(part||'').trim();
+    if(!item) return;
+    if(!out){out=item;return;}
+    if(out===item||out.split('\n\n').some(function(existing){return existing.trim()===item;})) return;
+    out += '\n\n' + item;
+  });
+  return out;
+}
+
+function _extractInlineThinkingFromContent(rawContent, existingReasoning, options){
+  // Code-aware extraction (must mirror api/streaming.py
+  // _extract_inline_thinking_from_content): thinking tags inside a triple-fence,
+  // an inline single-backtick code span, or an indented code block are LEFT
+  // VISIBLE. options.streaming gates partial/unclosed handling — only during a
+  // live stream does an unmatched open tag mean "still thinking"; on the
+  // reload/render path an unclosed tag stays visible content (#3633 Codex catch).
+  const streaming=!!(options&&options.streaming);
+  const text=String(rawContent||'');
+  if(!text){
+    const reasoning=String(existingReasoning||'').trim();
+    return {reasoning,content:text,thinkingText:reasoning,displayText:text,inThinking:false};
+  }
+  // Fast path (#3633 Codex perf catch — _parseStreamState / syncInflightAssistantMessage
+  // call this on the FULL accumulator on every streamed token, so the common no-tag
+  // case must not do the O(length) char walk per call). If no complete opener is
+  // present AND — when streaming — the tail is not a prefix of an opener, there is
+  // nothing to extract: return the text unchanged (two cheap substring scans).
+  if(!_thinkPairs.some(p=>text.indexOf(p.open)!==-1)){
+    let tailIsPartialOpener=false;
+    if(streaming){
+      for(const p of _thinkPairs){
+        const maxPrefix=Math.min(p.open.length-1,text.length);
+        for(let n=maxPrefix;n>0;n--){
+          if(p.open.startsWith(text.slice(text.length-n))){tailIsPartialOpener=true;break;}
+        }
+        if(tailIsPartialOpener) break;
+      }
+    }
+    if(!tailIsPartialOpener){
+      const reasoning=String(existingReasoning||'').trim();
+      return {reasoning,content:text,thinkingText:reasoning,displayText:text,inThinking:false};
+    }
+  }
+  const visible=[];
+  const extracted=[];
+  let cursor=0;
+  let index=0;
+  let fence='';
+  let inBacktick=false;
+  let inThinking=false;
+  // Incremental O(1)-per-iteration line state + seen-nonspace flag (the previous
+  // per-character line scan + slice(0,index).trim() were O(n^2) on long
+  // no-newline content — #3633 Codex perf catch).
+  let lineIsIndentedCode=_lineIsIndentedCode(text,0);
+  let seenNonspace=false;
+  // Only lstrip the final content when a LEADING thinking block/prefix was
+  // removed — a reply that legitimately starts with indented code / whitespace
+  // and has no leading thinking wrapper keeps its leading whitespace (#3633
+  // Codex catch).
+  let leadingRemoved=false;
+  // Index of the next complete opener at/after `index` — lets the scanner bulk-skip
+  // plain trailing content instead of walking it char-by-char every streamed token
+  // (#3633 Codex per-token perf catch).
+  let nextOpener=_nextThinkingOpener(text,0);
+  while(index<text.length){
+    if(nextOpener===-1||index>nextOpener) nextOpener=_nextThinkingOpener(text,index);
+    if(nextOpener===-1){
+      // No further COMPLETE opener ahead — remaining tail is plain and is
+      // appended in one slice, EXCEPT during streaming when the tail is a prefix
+      // of an opener ("...<thi"): it may be a forming block and must be
+      // suppressed, but ONLY if outside code context (a partial opener inside
+      // inline-backtick / fenced / indented code stays visible — master parity).
+      // Code state needs the char walk, so fall through in that case (bounded —
+      // a partial tail is a transient single token) instead of bulk-skipping.
+      if(streaming&&_textTailIsPartialOpener(text)){
+        // fall through to the code-aware char walk for the tail
+      } else {
+        break;
+      }
+    }
+    const ch=text[index];
+    if(index>0&&text[index-1]==='\n') lineIsIndentedCode=_lineIsIndentedCode(text,index);
+    const marker=_thinkingFenceMarkerAt(text,index);
+    if(marker) fence=(fence===marker)?'':(fence||marker);
+    if(!fence&&!marker&&ch==='`') inBacktick=!inBacktick;
+    const inCode=!!fence||inBacktick||lineIsIndentedCode;
+    if(!inCode){
+      let pair=null;
+      for(const candidate of _thinkPairs){
+        if(text.startsWith(candidate.open,index)){pair=candidate;break;}
+      }
+      if(pair){
+        const closeIndex=text.indexOf(pair.close,index+pair.open.length);
+        if(closeIndex===-1){
+          // Unclosed open tag. A LEADING unclosed block (nothing visible before
+          // it) is a genuine thinking trace cut off mid-thought → reasoning
+          // (master #3455 leading-only intent + live "still thinking"). An
+          // unclosed tag AFTER visible content on the reload/render path is
+          // almost always a literal typed tag — leave it (and following prose)
+          // visible so nothing is silently truncated (#3633 Codex catch).
+          const leading=!seenNonspace;
+          if(!streaming&&!leading) break;
+          if(leading) leadingRemoved=true;
+          visible.push(text.slice(cursor,index));
+          const partial=text.slice(index+pair.open.length);
+          if(partial) extracted.push(partial);
+          inThinking=true;
+          cursor=text.length;
+          index=text.length;
+          break;
+        }
+        visible.push(text.slice(cursor,index));
+        extracted.push(text.slice(index+pair.open.length,closeIndex));
+        if(!seenNonspace) leadingRemoved=true;
+        seenNonspace=true;
+        index=closeIndex+pair.close.length;
+        cursor=index;
+        continue;
+      }
+      if(streaming){
+        let matchedPartial=false;
+        for(const candidate of _thinkPairs){
+          const rest=text.slice(index);
+          if(rest.length<candidate.open.length&&candidate.open.startsWith(rest)){
+            if(!seenNonspace) leadingRemoved=true;
+            visible.push(text.slice(cursor,index));
+            inThinking=true;
+            cursor=text.length;
+            index=text.length;
+            matchedPartial=true;
+            break;
+          }
+        }
+        if(matchedPartial||index>=text.length) break;
+      }
+    }
+    if(ch.trim()!=='') seenNonspace=true;
+    index++;
+  }
+  if(cursor<text.length) visible.push(text.slice(cursor));
+  const content=leadingRemoved?visible.join('').replace(/^\s+/,''):visible.join('');
+  const reasoning=_mergeInlineThinkingReasoning(existingReasoning,extracted);
+  return {reasoning,content,thinkingText:reasoning,displayText:content,inThinking};
+}
+
+if(typeof window!=='undefined'){
+  window._extractInlineThinkingFromContentForRender=function(rawContent, existingReasoning){
+    return _extractInlineThinkingFromContent(rawContent, existingReasoning, {streaming:false});
+  };
+}
+
+function enhanceMarkdownTables(root){
+  if(!root||!root.querySelectorAll) return;
+  const scope=root;
+  const tables=scope.querySelectorAll('.msg-body table:not([data-markdown-table-enhanced])');
+  const sortLabel=typeof t==='function'?t('markdown_table_sort_column'):'Sort column';
+  const filterLabel=typeof t==='function'?t('markdown_table_filter'):'Filter table';
+  tables.forEach((table)=>{
+    if(table.closest('.csv-table-wrap')) return;
+    const headRows=table.tHead?Array.from(table.tHead.rows):[];
+    const body=table.tBodies&&table.tBodies.length?table.tBodies[0]:table;
+    const bodyRows=Array.from(body.rows||[]).filter((row)=>row.parentElement===body);
+    const headerRow=headRows[0]||table.querySelector('tr');
+    if(!headerRow||!bodyRows.length) return;
+    table.setAttribute('data-markdown-table-enhanced','1');
+    bodyRows.forEach((row,idx)=>{ row.dataset.markdownTableOriginalIndex=String(idx); });
+
+    if(bodyRows.length>=4&&table.parentElement){
+      const filter=document.createElement('input');
+      filter.type='search';
+      filter.className='markdown-table-filter';
+      filter.placeholder=filterLabel;
+      filter.setAttribute('aria-label',filterLabel);
+      filter.autocomplete='off';
+      filter.spellcheck=false;
+      filter.addEventListener('input',()=>{
+        const query=_markdownTableText(filter.value).toLowerCase();
+        bodyRows.forEach((row)=>{
+          row.hidden=!!query&&!_markdownTableText(row.textContent).toLowerCase().includes(query);
+        });
+      });
+      table.parentElement.insertBefore(filter,table);
+    }
+
+    Array.from(headerRow.cells||[]).forEach((cell,colIdx)=>{
+      const button=document.createElement('button');
+      button.type='button';
+      button.className='markdown-table-sort';
+      const columnName=_markdownTableText(cell.textContent)||String(colIdx+1);
+      const columnSortLabel=`${sortLabel}: ${columnName}`;
+      button.setAttribute('aria-label',columnSortLabel);
+      button.title=columnSortLabel;
+      cell.setAttribute('aria-sort','none');
+      const label=document.createElement('span');
+      label.className='markdown-table-sort-label';
+      while(cell.firstChild) label.appendChild(cell.firstChild);
+      const indicator=document.createElement('span');
+      indicator.className='markdown-table-sort-indicator';
+      indicator.setAttribute('aria-hidden','true');
+      button.appendChild(label);
+      button.appendChild(indicator);
+      button.addEventListener('click',()=>{
+        const nextDir=table.dataset.markdownTableSortCol===String(colIdx)&&table.dataset.markdownTableSortDir==='asc'?'desc':'asc';
+        table.dataset.markdownTableSortCol=String(colIdx);
+        table.dataset.markdownTableSortDir=nextDir;
+        Array.from(headerRow.cells||[]).forEach((other)=>{
+          other.setAttribute('aria-sort','none');
+        });
+        cell.setAttribute('aria-sort',nextDir==='asc'?'ascending':'descending');
+        const rows=Array.from(body.rows||[]).filter((row)=>row.parentElement===body);
+        rows.sort((a,b)=>{
+          const av=_markdownTableCellText(a.cells[colIdx]);
+          const bv=_markdownTableCellText(b.cells[colIdx]);
+          const cmp=av.localeCompare(bv,undefined,{numeric:true,sensitivity:'base'});
+          if(cmp!==0) return nextDir==='asc'?cmp:-cmp;
+          const ai=Number(a.dataset.markdownTableOriginalIndex||0);
+          const bi=Number(b.dataset.markdownTableOriginalIndex||0);
+          return ai-bi;
+        });
+        rows.forEach((row)=>body.appendChild(row));
+      });
+      cell.appendChild(button);
+    });
+  });
+}
+
+function _sanitizeMarkdownTableCellText(cell){
+  if(!cell) return '';
+  const sortButton=cell.querySelector?cell.querySelector('.markdown-table-sort'):null;
+  if(sortButton){
+    const sortLabel=sortButton.querySelector?sortButton.querySelector('.markdown-table-sort-label'):null;
+    if(sortLabel) return _markdownTableCellText(sortLabel);
+    return _markdownTableCellText(sortButton);
+  }
+  return _markdownTableCellText(cell);
+}
+
+function _markdownTableCopyHtmlEscape(value){
+  return String(value||'')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+function _markdownTableCopyPayloadForTable(table){
+  if(!table||!table.rows) return null;
+  const rows=Array.from(table.rows||[]);
+  if(!rows.length) return null;
+  let headerRowCount=0;
+  while(headerRowCount<rows.length){
+    const cells=Array.from(rows[headerRowCount].cells||[]);
+    if(!cells.length||!cells.every((cell)=>cell&&cell.tagName==='TH')) break;
+    headerRowCount++;
+  }
+
+  const renderRows=(rowSet)=>rowSet.map((row)=>{
+    const cellTag=(cell)=>String(cell&&cell.tagName?cell.tagName.toLowerCase():'td');
+    const cells=Array.from(row.cells||[])
+      .filter((cell)=>cell&&cell.nodeType===1)
+      .map((cell)=>{
+        const tag=cellTag(cell);
+        const text=_sanitizeMarkdownTableCellText(cell);
+        return `<${tag}>${_markdownTableCopyHtmlEscape(text)}</${tag}>`;
+      })
+      .join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+  const headerRows=headerRowCount?renderRows(rows.slice(0, headerRowCount)):'';
+  const bodyRows=renderRows(rows.slice(headerRowCount));
+  const tableSections=[
+    headerRows?`<thead>${headerRows}</thead>`:'',
+    bodyRows?`<tbody>${bodyRows}</tbody>`:'',
+  ].join('');
+
+  const plainRows=rows.map((row)=>{
+    return Array.from(row.cells||[])
+      .map(_sanitizeMarkdownTableCellText)
+      .join('\t');
+  }).join('\n');
+
+  return {html:`<table>${tableSections}</table>`, plain:plainRows};
+}
+
+function _findEnhancedMarkdownTable(node){
+  let current=node&&node.nodeType===3?node.parentElement:node;
+  while(current){
+    if(current.matches&&current.matches('table[data-markdown-table-enhanced]')) return current;
+    current=current.parentElement||current.parentNode;
+  }
+  return null;
+}
+
+function _findMarkdownTableCell(node){
+  let current=node&&node.nodeType===3?node.parentElement:node;
+  while(current){
+    if(current.matches&&current.matches('th,td')) return current;
+    current=current.parentElement||current.parentNode;
+  }
+  return null;
+}
+
+function _markdownTableNodeChildren(node){
+  if(!node) return [];
+  if(node.childNodes&&typeof node.childNodes.length==='number') return Array.from(node.childNodes);
+  if(node.children&&typeof node.children.length==='number') return Array.from(node.children);
+  return [];
+}
+
+function _markdownTableNodeBoundaryLength(node){
+  if(!node) return 0;
+  if(node.nodeType===3) return String(node.textContent||'').length;
+  return _markdownTableNodeChildren(node).length;
+}
+
+function _markdownTableBoundaryWithinCell(container, offset, cell, edge){
+  if(!container||!cell||typeof offset!=='number') return false;
+  const atStart=edge==='start';
+  let current=container;
+  let currentOffset=offset;
+  while(current){
+    const boundaryLength=_markdownTableNodeBoundaryLength(current);
+    if(atStart){
+      if(currentOffset!==0) return false;
+    }else if(currentOffset!==boundaryLength){
+      return false;
+    }
+    if(current===cell) return true;
+    const parent=current.parentElement||current.parentNode;
+    if(!parent) return false;
+    const siblings=_markdownTableNodeChildren(parent);
+    const index=siblings.indexOf(current);
+    if(index===-1) return false;
+    currentOffset=atStart?index:index+1;
+    current=parent;
+  }
+  return false;
+}
+
+function _markdownTableEdgeCell(table, edge){
+  const rows=Array.from(table&&table.rows||[]);
+  if(!rows.length) return null;
+  const row=edge==='start'?rows[0]:rows[rows.length-1];
+  const cells=Array.from(row&&row.cells||[]);
+  if(!cells.length) return null;
+  return edge==='start'?cells[0]:cells[cells.length-1];
+}
+
+function _isFullEnhancedMarkdownTableSelection(range, table){
+  if(!range||!table) return false;
+  const firstCell=_markdownTableEdgeCell(table,'start');
+  const lastCell=_markdownTableEdgeCell(table,'end');
+  if(!firstCell||!lastCell) return false;
+  const startCell=_findMarkdownTableCell(range.startContainer);
+  const endCell=_findMarkdownTableCell(range.endContainer);
+  if(startCell!==firstCell||endCell!==lastCell) return false;
+  return _markdownTableBoundaryWithinCell(range.startContainer, range.startOffset, firstCell, 'start')
+    && _markdownTableBoundaryWithinCell(range.endContainer, range.endOffset, lastCell, 'end');
+}
+
+function _findEnhancedMarkdownTableFromRange(range){
+  if(!range) return null;
+  const found=_findEnhancedMarkdownTable(range.startContainer)
+    || _findEnhancedMarkdownTable(range.endContainer)
+    || _findEnhancedMarkdownTable(range.commonAncestorContainer);
+  if(found) return found;
+  const container=range.commonAncestorContainer&&range.commonAncestorContainer.nodeType===3
+    ? range.commonAncestorContainer.parentElement
+    : range.commonAncestorContainer;
+  if(!container||!container.querySelectorAll||typeof range.intersectsNode!=='function') return null;
+  for(const table of container.querySelectorAll('table[data-markdown-table-enhanced]')){
+    try{
+      if(range.intersectsNode(table)) return table;
+    }catch(_){}
+  }
+  return null;
+}
+
+function _handleMarkdownTableCopy(event){
+  if(!event) return;
+  if(!window.getSelection)return;
+  const selection=window.getSelection();
+  if(!selection||selection.isCollapsed||!selection.rangeCount) return;
+  const range=selection.getRangeAt(0);
+  if(!range) return;
+  const startCell=_findMarkdownTableCell(range.startContainer);
+  const endCell=_findMarkdownTableCell(range.endContainer);
+  if(startCell&&endCell&&startCell===endCell) return;
+  const table=_findEnhancedMarkdownTableFromRange(range);
+  if(!table||!table.matches||!table.matches('table[data-markdown-table-enhanced]')) return;
+  if(!_isFullEnhancedMarkdownTableSelection(range, table)) return;
+  const payload=_markdownTableCopyPayloadForTable(table);
+  if(!payload) return;
+  const clipboardData=event.clipboardData||event.originalEvent&&event.originalEvent.clipboardData;
+  if(!clipboardData||typeof clipboardData.setData!=='function') return;
+  if(typeof event.preventDefault==='function') event.preventDefault();
+  clipboardData.setData('text/html', payload.html);
+  clipboardData.setData('text/plain', payload.plain);
+}
+
+function _wireMarkdownTableCopyHandler(root){
+  if(!root||!root.addEventListener||root.__markdownTableCopyHandlerInstalled) return;
+  root.addEventListener('copy', _handleMarkdownTableCopy);
+  root.__markdownTableCopyHandlerInstalled=true;
+}
+
+function _markdownTableText(value){
+  return String(value||'').replace(/\s+/g,' ').trim();
+}
+
+function _markdownTableCellText(cell){
+  return _markdownTableText(cell?cell.textContent:'');
+}
+
+window.enhanceMarkdownTables=enhanceMarkdownTables;
+
+(function _wireMarkdownTableEnhancer(){
+  if(typeof window==='undefined'||typeof window.renderMessages!=='function'||window.renderMessages._markdownTablesEnhanced) return;
+  const baseRenderMessages=window.renderMessages;
+  window.renderMessages=function(...args){
+    const result=baseRenderMessages.apply(this,args);
+    const inner=typeof $==='function'?$('msgInner'):document.getElementById('msgInner');
+    enhanceMarkdownTables(inner);
+    _wireMarkdownTableCopyHandler(inner);
+    return result;
+  };
+  window.renderMessages._markdownTablesEnhanced=true;
+})();
+
+function _persistentToastText(value){
+  if(value===null||value===undefined)return '';
+  if(typeof value==='string')return value;
+  try{return JSON.stringify(value);}catch(_){return String(value||'');}
+}
+
+function _persistentToastToolName(tool){
+  return String(tool&&tool.name||'').trim();
+}
+
+function _persistentToastArgs(tool){
+  const args=tool&&tool.args;
+  return args&&typeof args==='object'?args:{};
+}
+
+function _persistentToastPreview(tool){
+  return [
+    _persistentToastText(tool&&tool.preview),
+    _persistentToastText(tool&&tool.snippet),
+  ].filter(Boolean).join('\n');
+}
+
+function _persistentToastHasWriteIntent(name, text){
+  const nameWords=String(name||'').replace(/_/g,' ');
+  const haystack=`${nameWords}\n${text}`.toLowerCase();
+  if(/\b(read|list|view|search|lookup|get|fetch|load|usage|toggle|delete|remove)\b/.test(nameWords))return false;
+  if(/\b(no|not|nothing)\s+(?:was\s+)?(?:saved|updated|created|written|stored|changed)\b/.test(haystack))return false;
+  if(/\b(?:unchanged|skipped|dry[- ]run|failed|error)\b/.test(haystack))return false;
+  return /\b(save|saved|write|wrote|written|update|updated|create|created|store|stored|persist|persisted|remember|remembered)\b/.test(haystack);
+}
+
+function _persistentToastSkillName(tool){
+  const args=_persistentToastArgs(tool);
+  const raw=args.name||args.skill_name||args.skill||args.title||'';
+  const direct=String(raw||'').trim();
+  if(direct)return direct;
+  const text=_persistentToastPreview(tool);
+  const match=text.match(/\bskill(?:\s+updated|\s+created|\s+saved)?\s*[:=]\s*["'`]?([A-Za-z0-9_.-]{2,80})/i);
+  return match?match[1]:'';
+}
+
+function _maybeNotifyPersistentStateSaved(tool){
+  if(!tool||tool.is_error||typeof showToast!=='function')return;
+  const name=_persistentToastToolName(tool);
+  if(!name)return;
+  const nameKey=name.toLowerCase().replace(/[^a-z0-9]+/g,'_');
+  const preview=_persistentToastPreview(tool);
+  const argsText=_persistentToastText(_persistentToastArgs(tool));
+  const text=`${preview}\n${argsText}`;
+  if(!_persistentToastHasWriteIntent(nameKey, text))return;
+
+  const nameWords=nameKey.replace(/_/g,' ');
+  const isSkill=/\bskills?\b/.test(nameWords);
+  const isMemory=/\b(memory|memories|remember|profile)\b/.test(nameWords);
+  if(!isSkill&&!isMemory)return;
+  const skillName=isSkill?_persistentToastSkillName(tool):'';
+  if(isSkill&&!skillName)return;
+  _showPersistentStateToast(isSkill?'skill':'memory', skillName, {
+    created: isSkill&&/\b(create|created|new)\b/.test(`${nameKey}\n${preview}`.toLowerCase()),
+  });
+}
+
+function _showPersistentStateToast(kind, name, options){
+  if(typeof showToast!=='function')return;
+  const normalizedKind=String(kind||'').toLowerCase();
+  if(normalizedKind!=='skill'&&normalizedKind!=='memory')return;
+  const itemName=String(name||'').trim();
+  const dedupeKey=[
+    S&&S.session&&S.session.session_id||'',
+    normalizedKind,
+    itemName||'memory',
+  ].join(':');
+  if(_persistentStateToastSeen.has(dedupeKey))return;
+  _persistentStateToastSeen.add(dedupeKey);
+  if(_persistentStateToastSeen.size>200){
+    const first=_persistentStateToastSeen.values().next().value;
+    _persistentStateToastSeen.delete(first);
+  }
+
+  if(normalizedKind==='skill'){
+    const base=options&&options.created?t('skill_created'):t('skill_updated');
+    showToast(itemName?`${base}: ${itemName}`:base,4200,'success');
+    return;
+  }
+  showToast(t('memory_saved'),3600,'success');
+}
 
 function _selectedTextReplyT(key, fallback){
   try{
@@ -113,22 +791,262 @@ function _selectedTextReplySelection(){
 function _formatSelectedTextReplyQuote(text){
   const normalized=String(text||'').replace(/\r\n?/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
   if(!normalized)return '';
-  return normalized.split('\n').map(line=>`> ${line}`).join('\n');
+  return `<!-- hermes-selected-context -->\n${normalized.split('\n').map(line=>`> ${line}`).join('\n')}`;
 }
 
-function _appendSelectedTextReplyToComposer(text){
+function insertSavedPromptIntoComposer(text){
   const composer=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
-  if(!composer)return false;
-  const quote=_formatSelectedTextReplyQuote(text);
-  if(!quote)return false;
+  if(!composer||!text)return;
   const current=String(composer.value||'');
-  composer.value=current.trim()?`${current.replace(/\s+$/,'')}\n\n${quote}\n\n`:`${quote}\n\n`;
+  composer.value=current.trim()?`${current.replace(/\s+$/,'')}\n\n${text}\n\n`:`${text}\n\n`;
   composer.focus();
-  try{ composer.setSelectionRange(composer.value.length, composer.value.length); }catch(_err){}
-  composer.dispatchEvent(new Event('input', {bubbles:true}));
+  try{composer.setSelectionRange(composer.value.length, composer.value.length);}catch(_e){}
+  composer.dispatchEvent(new Event('input',{bubbles:true}));
   if(typeof autoResize==='function') autoResize();
-  if(typeof showToast==='function') showToast(_selectedTextReplyT('selected_text_reply_appended', 'Selected text added to composer'), 1600);
+}
+
+let _savedPromptsCache=null;
+
+async function _loadSavedPrompts(){
+  try{
+    const data=await api('/api/prompts');
+    _savedPromptsCache=Array.isArray(data&&data.prompts)?data.prompts:[];
+  }catch(_e){_savedPromptsCache=[];}
+  return _savedPromptsCache;
+}
+
+async function toggleSavedPromptsPopup(){
+  const popup=(typeof $==='function'&&$('savedPromptsPopup'))||document.getElementById('savedPromptsPopup');
+  const btn=(typeof $==='function'&&$('btnSavedPrompts'))||document.getElementById('btnSavedPrompts');
+  if(!popup)return;
+  if(popup.style.display!=='none'){
+    popup.style.display='none';
+    if(btn)btn.setAttribute('aria-expanded','false');
+    return;
+  }
+  popup.innerHTML='<div class="saved-prompts-loading">Loading…</div>';
+  popup.style.display='flex';
+  if(btn)btn.setAttribute('aria-expanded','true');
+  const prompts=await _loadSavedPrompts();
+  popup.innerHTML='';
+  if(!prompts.length){
+    const empty=document.createElement('div');
+    empty.className='saved-prompts-empty';
+    empty.textContent=(typeof t==='function'&&t('saved_prompts_empty'))||'No saved prompts yet.';
+    popup.appendChild(empty);
+  }else{
+    for(const p of prompts){
+      const row=document.createElement('div');
+      row.className='saved-prompt-row';
+      row.setAttribute('role','menuitem');
+      const label=document.createElement('span');
+      label.className='saved-prompt-label';
+      label.textContent=p.label||p.text;
+      label.title=p.text;
+      row.onclick=()=>{
+        insertSavedPromptIntoComposer(p.text);
+        popup.style.display='none';
+        if(btn)btn.setAttribute('aria-expanded','false');
+      };
+      const del=document.createElement('button');
+      del.className='saved-prompt-delete';
+      del.type='button';
+      del.title=(typeof t==='function'&&t('saved_prompts_delete'))||'Delete';
+      del.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      del.onclick=async(e)=>{
+        e.stopPropagation();
+        try{await api('/api/prompts',{method:'DELETE',body:JSON.stringify({id:p.id})});}catch(_e){}
+        _savedPromptsCache=null;
+        await toggleSavedPromptsPopup();
+        await toggleSavedPromptsPopup();
+      };
+      row.appendChild(label);
+      row.appendChild(del);
+      popup.appendChild(row);
+    }
+  }
+  const addRow=document.createElement('div');
+  addRow.className='saved-prompt-add-row';
+  const saveBtn=document.createElement('button');
+  saveBtn.type='button';
+  saveBtn.className='saved-prompt-save-btn';
+  saveBtn.textContent=(typeof t==='function'&&t('saved_prompts_save_current'))||'Save current input';
+  saveBtn.onclick=async()=>{
+    const msgEl=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
+    const text=(msgEl&&msgEl.value||'').trim();
+    if(!text){
+      if(typeof showToast==='function') showToast((typeof t==='function'&&t('saved_prompts_empty_input'))||'Type a prompt first',2000,'error');
+      return;
+    }
+    try{await api('/api/prompts',{method:'POST',body:JSON.stringify({text})});}catch(_e){
+      if(typeof showToast==='function') showToast(_e&&_e.message||'Failed to save prompt',2000,'error');
+      return;
+    }
+    _savedPromptsCache=null;
+    popup.style.display='none';
+    if(btn)btn.setAttribute('aria-expanded','false');
+    if(typeof showToast==='function') showToast((typeof t==='function'&&t('saved_prompts_saved'))||'Prompt saved',1600);
+  };
+  addRow.appendChild(saveBtn);
+  popup.appendChild(addRow);
+}
+
+document.addEventListener('click',(e)=>{
+  const popup=(typeof $==='function'&&$('savedPromptsPopup'))||document.getElementById('savedPromptsPopup');
+  const btn=(typeof $==='function'&&$('btnSavedPrompts'))||document.getElementById('btnSavedPrompts');
+  if(!popup||popup.style.display==='none')return;
+  if(!popup.contains(e.target)&&e.target!==btn&&!(btn&&btn.contains(e.target))){
+    popup.style.display='none';
+    if(btn)btn.setAttribute('aria-expanded','false');
+  }
+},{capture:false});
+function _addNamedContextBlock(text){
+  const id='ctx-'+(++_selectionIdCounter);
+  const name=(_selectedTextReplyT('context_block_name_default','Context'))+' '+_selectionIdCounter;
+  _pendingSelections.push({id, name, text});
+  _renderSelectionChips();
+  return id;
+}
+
+function _removeNamedContextBlock(id){
+  _pendingSelections=_pendingSelections.filter(s=>s.id!==id);
+  _renderSelectionChips();
+}
+
+function _clearPendingSelections(){
+  if(!_pendingSelections.length)return false;
+  _pendingSelections=[];
+  _renderSelectionChips();
   return true;
+}
+if(typeof window!=='undefined') window._clearPendingSelections=_clearPendingSelections;
+
+function _selectedContextPreview(text){
+  const normalized=String(text||'').replace(/\r\n?/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+  if(!normalized)return '';
+  const max=360;
+  return normalized.length>max?normalized.slice(0,max).trimEnd()+'…':normalized;
+}
+
+function _renderSelectionChips(){
+  const wrap=document.getElementById('composerSelectionChips');
+  if(!wrap)return;
+  wrap.innerHTML='';
+  wrap.hidden=!_pendingSelections.length;
+  _pendingSelections.forEach(s=>{
+    const card=document.createElement('article');
+    card.className='selection-context-card';
+    card.dataset.selectionId=s.id;
+    card.setAttribute('aria-label', s.name);
+
+    const accent=document.createElement('div');
+    accent.className='selection-context-accent';
+    accent.setAttribute('aria-hidden','true');
+
+    const body=document.createElement('div');
+    body.className='selection-context-body';
+
+    const header=document.createElement('div');
+    header.className='selection-context-header';
+
+    const name=document.createElement('button');
+    name.type='button';
+    name.className='selection-context-name selection-chip-name';
+    name.textContent=s.name;
+    name.title=_selectedTextReplyT('context_block_rename_hint','Click or press Enter to rename');
+    name.setAttribute('aria-label', `${_selectedTextReplyT('context_block_rename_aria','Rename context block')}: ${s.name}`);
+    name.addEventListener('click',()=>_editSelectionChipName(s.id,card));
+    name.addEventListener('dblclick',()=>_editSelectionChipName(s.id,card));
+    name.addEventListener('keydown',e=>{
+      if(e.key==='Enter'||e.key===' '||e.key==='F2'){
+        e.preventDefault();
+        _editSelectionChipName(s.id,card);
+      }
+    });
+
+    const remove=document.createElement('button');
+    remove.type='button';
+    remove.className='selection-context-remove selection-chip-remove';
+    remove.setAttribute('aria-label', `${_selectedTextReplyT('context_block_remove','Remove context block')}: ${s.name}`);
+    remove.innerHTML='&#x2715;';
+    remove.addEventListener('click',()=>_removeNamedContextBlock(s.id));
+
+    const quote=document.createElement('blockquote');
+    quote.className='selection-context-quote';
+    quote.textContent=_selectedContextPreview(s.text);
+    quote.title=String(s.text||'');
+
+    header.appendChild(name);
+    header.appendChild(remove);
+    body.appendChild(header);
+    body.appendChild(quote);
+    card.appendChild(accent);
+    card.appendChild(body);
+    wrap.appendChild(card);
+  });
+  // #4380: pending selection cards are content the primary Send button must
+  // recognize (they were moved out of the textarea into _pendingSelections),
+  // so refresh the button's enabled/disabled state whenever the set changes —
+  // otherwise a selection-only reply can't be sent via click/tap/mobile.
+  if(typeof updateSendBtn==='function') updateSendBtn();
+}
+
+function _editSelectionChipName(id,chip){
+  const s=_pendingSelections.find(x=>x.id===id);
+  if(!s)return;
+  const nameEl=chip.querySelector('.selection-chip-name');
+  if(!nameEl)return;
+  if(chip.querySelector('.selection-chip-edit'))return;
+  const inp=document.createElement('input');
+  inp.type='text';inp.value=s.name;inp.className='selection-chip-edit';
+  inp.maxLength=120;
+  inp.setAttribute('aria-label', `${_selectedTextReplyT('context_block_rename_aria','Rename context block')}: ${s.name}`);
+  inp.title=_selectedTextReplyT('context_block_rename_hint','Click or press Enter to rename');
+  nameEl.replaceWith(inp);
+  inp.focus();inp.select();
+  let done=false;
+  const restoreFocus=()=>{
+    window.requestAnimationFrame(()=>{
+      const safeId=window.CSS&&CSS.escape?CSS.escape(id):String(id).replace(/"/g,'\\"');
+      const next=document.querySelector(`[data-selection-id="${safeId}"] .selection-chip-name`);
+      if(next&&typeof next.focus==='function')next.focus({preventScroll:true});
+    });
+  };
+  const commit=()=>{ if(done)return; done=true; s.name=(inp.value.trim()||s.name).slice(0,120); _renderSelectionChips(); restoreFocus(); };
+  const cancel=()=>{ if(done)return; done=true; _renderSelectionChips(); restoreFocus(); };
+  inp.addEventListener('blur',commit);
+  inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){e.preventDefault();commit();} if(e.key==='Escape'){cancel();} });
+}
+
+function _composerTextWithPendingSelections(){
+  const composer=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
+  const current=String(composer&&composer.value||'');
+  if(!_pendingSelections.length)return current;
+  const blocks=_pendingSelections.map(s=>`**${s.name}:**\n${_formatSelectedTextReplyQuote(s.text)}`).join('\n\n');
+  return current.trim()?`${current.replace(/\s+$/,'')}\n\n${blocks}\n\n`:`${blocks}\n\n`;
+}
+
+function _clearComposerAfterQueuedSelectionSend(){
+  const sid=arguments.length?arguments[0]:(S.session&&S.session.session_id);
+  const composer=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
+  const draftText=composer?String(composer.value||''):'';
+  const draftFiles=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+  if(composer)composer.value='';
+  if(sid&&typeof _clearComposerDraft==='function') _clearComposerDraft(sid,draftText,draftFiles);
+  _clearPendingSelections();
+  if(typeof autoResize==='function') autoResize();
+}
+
+function _flushSelectionBlocksToComposer(){
+  if(!_pendingSelections.length)return;
+  const composer=(typeof $==='function'&&$('msg'))||document.getElementById('msg');
+  if(!composer)return;
+  composer.value=_composerTextWithPendingSelections();
+  _clearPendingSelections();
+  composer.focus();
+  try{ composer.setSelectionRange(composer.value.length, composer.value.length); }catch(_e){}
+  composer.dispatchEvent(new Event('input',{bubbles:true}));
+  if(typeof autoResize==='function') autoResize();
 }
 
 function _selectedTextReplyButton(){
@@ -146,7 +1064,8 @@ function _selectedTextReplyButton(){
   btn.addEventListener('mousedown', e=>e.preventDefault());
   btn.addEventListener('click', e=>{
     e.preventDefault();
-    if(_appendSelectedTextReplyToComposer(_selectedTextReplyText)){
+    if(_selectedTextReplyText){
+      _addNamedContextBlock(_selectedTextReplyText);
       _hideSelectedTextReplyButton();
       const selection=window.getSelection&&window.getSelection();
       if(selection&&selection.removeAllRanges)selection.removeAllRanges();
@@ -208,6 +1127,11 @@ if(typeof document!=='undefined'){
 let _sendInProgress = false;
 let _sendInProgressSid = null;  // session_id of the in-flight send
 const _sessionTitleProvisionalBySid = new Map();
+// Agent commands that are safe to execute directly in the WebUI even though
+// their canonical command is registered on the backend (for example
+// /reload-mcp). Keep this intentionally narrow and include underscore variants
+// observed by users so typing either form still routes through executeAgentCommand.
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -241,6 +1165,16 @@ function _runOptionalPreStartUiStep(label, fn){
   }catch(e){
     const message=e&&e.message?e.message:String(e||'unknown error');
     try{console.warn('[webui] optional pre-start UI step failed', label, message);}catch(_){ }
+    return undefined;
+  }
+}
+
+function _runOptionalPostStartUiStep(label, fn){
+  try{
+    return typeof fn==='function'?fn():undefined;
+  }catch(e){
+    const message=e&&e.message?e.message:String(e||'unknown error');
+    try{console.warn('[webui] optional post-start UI step failed', label, message);}catch(_){ }
     return undefined;
   }
 }
@@ -286,19 +1220,97 @@ function applySessionTitleUpdate(sid, titleText, options={}){
   return true;
 }
 
+// #5472: when a provider/background error aborts a send, send() has already
+// cleared the composer (`$('msg').value=''`), the persisted draft
+// (`_clearComposerDraft`), and the staged files (uploadPendingFiles() sets
+// `S.pendingFiles=[]`) before the turn was durably accepted server-side. On a
+// start-time throw the turn is never persisted, so the user loses the entire
+// typed message + attachments and must retype. Restore the ORIGINAL captured
+// draft text + staged files so the user can re-send with one key press.
+// Mirrors the draft-restore idiom already used by _trySteer (commands.js) and
+// _stashClarifyDraft.
+//
+// `draftText` and `filesSnapshot` are immutable snapshots captured in send()
+// BEFORE slash rewrites (/moa, bundles) mutate the payload and BEFORE
+// uploadPendingFiles() drains S.pendingFiles — so we restore what the user
+// actually typed, not the transformed send payload.
+function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, clearPromise){
+  const restore=String(draftText||'');
+  const files=Array.isArray(filesSnapshot)?filesSnapshot.filter(Boolean):[];
+  if(!restore&&!files.length) return false;
+
+  // Only mutate the VISIBLE composer / staged tray when the failed send belongs
+  // to the session the user is currently looking at — otherwise a background
+  // send failure would pollute another session's composer. (Codex #5484 catch.)
+  const visibleSid=(S.session&&S.session.session_id)||null;
+  const belongsToVisible=!(sid&&visibleSid&&sid!==visibleSid);
+  let restoredVisible=false;
+  if(belongsToVisible){
+    const inp=$('msg');
+    // Do not clobber a new message the user began typing during the async window.
+    if(inp && !String(inp.value||'').trim()){
+      inp.value=restore;
+      if(typeof autoResize==='function') autoResize();
+      if(typeof updateSendBtn==='function') updateSendBtn();
+      // Re-stage the originally attached files so a one-key resend keeps them.
+      if(files.length){
+        S.pendingFiles=files;
+        if(typeof renderTray==='function') renderTray();
+      }
+      restoredVisible=true;
+    }
+  }
+
+  // Persist the failed session's draft so it survives a reload, ordered AFTER the
+  // send-time _clearComposerDraft POST (text:'') resolves — otherwise the two
+  // same-origin writes can be reordered under HTTP/2 multiplexing and leave the
+  // server draft empty. (Opus #5484 NIT.) Because the persist is deferred, it
+  // must be STALE-AWARE at fire time (Codex #5488 catch): if the failed session
+  // is still visible, re-read the LIVE composer so a post-restore edit is
+  // captured rather than clobbered by the original snapshot; if we restored the
+  // visible session but the user has since switched away, skip entirely (the
+  // session-switch save path already persisted this session's composer).
+  if(sid&&typeof _saveComposerDraftNow==='function'){
+    const _persist=()=>{
+      try{
+        const stillVisible=(S.session&&S.session.session_id)===sid;
+        if(stillVisible){
+          const inp=$('msg');
+          const liveText=inp?String(inp.value||''):restore;
+          _saveComposerDraftNow(sid, liveText, S.pendingFiles?[...S.pendingFiles]:[]);
+        } else if(!restoredVisible){
+          // Background failure (sid was never the visible session): no live
+          // composer to read, so persist the captured snapshot — it's the only copy.
+          _saveComposerDraftNow(sid, restore, []);
+        }
+        // else: restored the visible composer, then the user switched away — the
+        // session-switch save path already saved sid's composer; skip stale write.
+      }catch(_){ }
+    };
+    if(clearPromise&&typeof clearPromise.then==='function') clearPromise.then(_persist,_persist);
+    else _persist();
+  }
+
+  return restoredVisible;
+}
+
 async function send(){
+  // Static guards expect _defaultMessageMode to stay near send() while the actual
+  // read remains in the S.busy branch below.
+  // _defaultMessageMode
   // Reject concurrent invocations early — before any await yields control.
   // If a send is already in-flight (e.g. queue drain), re-queue the message
   // instead of silently dropping it.
   if (_sendInProgress) {
-    const _text=$('msg').value.trim();
+    const _text=_composerTextWithPendingSelections().trim();
     // Use the in-flight session's sid, not the currently viewed session,
     // so the queued message goes to the chat that owns the active stream.
     const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
     if(_text && _targetSid){
       const _modelState=_chatPayloadModelState();
       queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
-      $('msg').value='';autoResize();
+      _clearComposerAfterQueuedSelectionSend();
+      if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
       S.pendingFiles=[];renderTray();
       updateQueueBadge(_targetSid);
       showToast(`Queued: "${_text.slice(0,40)}${_text.length>40?'…':''}"`,2000);
@@ -307,10 +1319,29 @@ async function send(){
   }
   _sendInProgress = true;
   try{
-  const text=$('msg').value.trim();
-  if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  const options=arguments[0]||{};
+  const literalSlash=!!(options&&options.literalSlash);
+  let text=$('msg').value.trim();
+  if(!text&&!S.pendingFiles.length&&!_pendingSelections.length){_sendInProgress=false;_sendInProgressSid=null;return;}
   // Don't send while an inline message edit is active
   if(document.querySelector('.msg-edit-area')){_sendInProgress=false;_sendInProgressSid=null;return;}
+  _flushSelectionBlocksToComposer();
+  text=$('msg').value.trim();
+  if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
+    if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
+    _sendInProgress=false;_sendInProgressSid=null;
+    return;
+  }
+
+  // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
+  // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
+  // clears S.pendingFiles. If /api/chat/start throws (turn never durably
+  // started), _restoreComposerDraftAfterFailedSend() puts this exact text +
+  // staged files back so the user can re-send without retyping. Captured as an
+  // immutable snapshot so later reassignments to `text` don't leak into it.
+  const _failedSendDraftText=text;
+  const _failedSendFilesSnapshot=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
 
   // Dismiss handoff hint when user sends a message (resets seen_at).
   if(S.session&&S.session.session_id&&typeof _dismissHandoffHint==='function'){
@@ -319,19 +1350,20 @@ async function send(){
 
   const compressionRunning=typeof isCompressionUiRunning==='function'&&isCompressionUiRunning();
   _clearStaleBusyStateBeforeSend({compressionRunning});
-  // If busy or a manual compression is still running, handle based on busy_input_mode
+  // If busy or a manual compression is still running, handle based on default_message_mode
   if(S.busy||compressionRunning){
-    if(text){
+    if(text||S.pendingFiles.length){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
-      // busyMode routing block, so the user can always type /steer, /interrupt,
-      // or /queue while the agent is running and have them execute immediately.
+      // defaultMessageMode routing block, so the user can always type /steer, /interrupt,
+      // /queue, /terminal, /goal, or /yolo while the agent is running and have
+      // them execute immediately.
       // Without this intercept they fall through to the queue and execute after
       // the current turn ends — by which point there is no active stream and
       // cmdSteer / cmdInterrupt say "No active task to stop."
-      if(text.startsWith('/')){
+      if(text.startsWith('/')&&!literalSlash){
         const _pc=typeof parseCommand==='function'&&parseCommand(text);
-        if(_pc&&['steer','interrupt','queue','terminal','goal'].includes(_pc.name)){
+        if(_pc&&['steer','interrupt','queue','terminal','goal','yolo'].includes(_pc.name)){
           const _bc=COMMANDS.find(c=>c.name===_pc.name);
           if(_bc){
             $('msg').value='';autoResize();
@@ -340,30 +1372,29 @@ async function send(){
           }
         }
       }
-      const busyMode=window._busyInputMode||'queue';
-      if(busyMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
+    const defaultMessageMode=window._defaultMessageMode||'steer';
+      if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
         // Real steer: clear the input first so the user gets immediate
         // feedback, then ship the steer payload via /api/chat/steer.
-        // _trySteer falls back to queue+cancel internally if the agent
-        // isn't running / cached / steer-capable.
+        // _trySteer captures the owner session/files before awaiting uploads,
+        // restores/persists the draft on failure, and clears the owner draft
+        // only after /api/chat/steer accepts.
         $('msg').value='';autoResize();
-        // Do NOT clear pendingFiles yet — _trySteer may fall back to
-        // interrupt+queue and needs the files for queueSessionMessage.
-        // _trySteer clears pendingFiles itself in the fallback path, and
-        // the server returns accepted:true (no files sent) on success.
+        // Do NOT clear pendingFiles yet — _trySteer uploads with clearPending=false,
+        // and a failed steer must keep staged files available for the user's next explicit action.
         await _trySteer(text, /*explicitSteer=*/false);
-        // After _trySteer: clear any remaining files (success path).
-        S.pendingFiles=[];renderTray();
-      } else if(busyMode==='interrupt'){
+        // _trySteer clears staged files only after /api/chat/steer accepts, and
+        // only when the visible session still matches the captured owner sid.
+      } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
         queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
         updateQueueBadge(S.session.session_id);
-        $('msg').value='';autoResize();
+        _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
         if(S.activeStreamId&&typeof cancelStream==='function'){
           showToast(t('busy_interrupt_confirm'),2000);
-          await cancelStream();
+          await cancelStream('busy-interrupt');
         } else {
           showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
         }
@@ -372,7 +1403,7 @@ async function send(){
         // 'steer' mode when no stream is active or _trySteer is unavailable.
         const _modelState=_chatPayloadModelState();
         queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
-        $('msg').value='';autoResize();
+        _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
         updateQueueBadge(S.session.session_id);
         showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
@@ -384,13 +1415,15 @@ async function send(){
     if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000);
     return;
   }
+  let _slashDisplayTextOverride=null;
+  let _pendingMoaConfig=null;
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy
   // commands so chat order is correct: some handlers (e.g. cmdHelp) push
   // their assistant response synchronously.  If we pushed AFTER, S.messages
   // would be [assistant, user] and the chat would show the response above
   // the user's own input — reverse chronological order (#840 ordering bug).
-  if(text.startsWith('/')&&!S.pendingFiles.length){
+  if(text.startsWith('/')&&!S.pendingFiles.length&&!literalSlash){
     const _parsedCmd=parseCommand(text);
     const _cmd=_parsedCmd?COMMANDS.find(c=>c.name===_parsedCmd.name):null;
     if(_cmd){
@@ -413,6 +1446,23 @@ async function send(){
       }
     }
     if(_parsedCmd&&!_cmd){
+      if(_parsedCmd.name==='pet'){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _petOutput=null;
+        try{
+          _petOutput=typeof handlePetSlashCommand==='function'
+            ? await handlePetSlashCommand(text,{name:'pet'})
+            : {handled:false,message:'Desktop Companion is unavailable in WebUI.'};
+        }catch(e){
+          _petOutput={handled:false,message:`Desktop Companion command error: ${e&&e.message||e}`};
+        }
+        if(_petOutput&&_petOutput.message){
+          S.messages.push({role:'assistant',content:String(_petOutput.message),_ts:Date.now()/1000});
+        }
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
       const _agentCmd=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
@@ -420,6 +1470,22 @@ async function send(){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
+      const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
+      if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        let _agentOutput='(no output)';
+        try{
+          _agentOutput=typeof executeAgentCommand==='function'
+            ? await executeAgentCommand(text,_agentCmd||{name:_agentCmdName})
+            : 'Agent command runtime unavailable in WebUI.';
+        }catch(e){
+          _agentOutput=`Agent command error: ${e&&e.message||e}`;
+        }
+        S.messages.push({role:'assistant',content:String(_agentOutput||'(no output)'),_ts:Date.now()/1000});
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
@@ -437,6 +1503,47 @@ async function send(){
         S.messages.push({role:'assistant',content:String(_pluginOutput||'(no output)'),_ts:Date.now()/1000});
         renderMessages();
         $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
+      if(_agentCmdName==='moa'){
+        const _moaArgs=(text.split(/\s+/).slice(1).join(' ')||'').trim();
+        if(!S.session){await newSession();await renderSessionList();}
+        if(!_moaArgs){
+          let _moaUsage='/moa <prompt>';
+          try{const _moaCfgU=await api('/api/commands/moa/resolve');_moaUsage=_moaCfgU.usage||_moaUsage;}catch(_eu){}
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:_moaUsage,_ts:Date.now()/1000});
+          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
+        }
+        try{
+          await api('/api/commands/moa/resolve');
+          _slashDisplayTextOverride=text;
+          text=_moaArgs;
+          _pendingMoaConfig=true;
+        }catch(_e){
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:'MoA unavailable: '+(_e&&_e.message||_e),_ts:Date.now()/1000});
+          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
+        }
+      }
+      const _bundleCmd=!_agentCmd&&typeof getBundleCommandMetadata==='function'
+        ? await getBundleCommandMetadata(_parsedCmd.name)
+        : null;
+      if(_bundleCmd){
+        try{
+          const _bundleResolved=typeof resolveBundleCommand==='function'
+            ? await resolveBundleCommand(text,_bundleCmd)
+            : null;
+          const _bundleMessage=String(_bundleResolved&&_bundleResolved.message||'').trim();
+          if(!_bundleMessage) throw new Error('Bundle command runtime returned no invocation text.');
+          _slashDisplayTextOverride=text;
+          text=_bundleMessage;
+        }catch(e){
+          if(!S.session){await newSession();await renderSessionList();}
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:`Bundle command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
+          renderMessages();
+          $('msg').value='';autoResize();hideCmdDropdown();return;
+        }
       }
     }
   }
@@ -459,18 +1566,49 @@ async function send(){
   let msgText=text;
   if(uploaded.length&&!msgText)msgText=`I've uploaded ${uploaded.length} file(s): ${uploadedPaths.join(', ')}`;
   else if(uploaded.length)msgText=`${text}\n\n[Attached files: ${uploadedPaths.join(', ')}]`;
+  if(_forcedSkillDirectivePending){
+    const _pending=_forcedSkillDirectivePending;
+    if(!_pending.sessionId||_pending.sessionId===activeSid){
+      const _directivePayload = await _pending.promise;
+      if(_forcedSkillDirectivePending===_pending)_forcedSkillDirectivePending = null;
+      if(_directivePayload){
+        const _directive = typeof _directivePayload==='string'
+          ? _directivePayload
+          : String(_directivePayload.directive||'').trim();
+        const _forcedSkillName = typeof _directivePayload==='string'
+          ? ''
+          : String(_directivePayload.name||'').trim();
+        const _forcedSkillContent = typeof _directivePayload==='string'
+          ? ''
+          : String(_directivePayload.content||'').trim();
+        const _forcedSkillBlock = _forcedSkillName&&_forcedSkillContent
+          ? `[FORCED SKILL CONTEXT: ${_forcedSkillName}]\n${_forcedSkillContent}\n[/FORCED SKILL CONTEXT]`
+          : '';
+        msgText=`${_directive}${_forcedSkillBlock?`\n\n${_forcedSkillBlock}`:''}\n\n${msgText||''}`.trim();
+      }
+    }
+  }
   if(!msgText){setComposerStatus('Nothing to send');return;}
-
+  const _submittedDraftTextForClear=$('msg').value||'';
+  const _submittedDraftFilesForClear=Array.isArray(_failedSendFilesSnapshot)?[..._failedSendFilesSnapshot]:[];
   $('msg').value='';autoResize();
-  // Clear persisted composer draft since message was sent.
-  if (activeSid && typeof _clearComposerDraft === 'function') _clearComposerDraft(activeSid);
-  const displayText=text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
+  // Clear persisted composer draft since message was sent. Capture the promise
+  // so the #5472 failed-send restore can chain its re-persist AFTER this clear
+  // resolves — otherwise the two same-origin POSTs (clear text:'' then restore
+  // text:<draft>) can be reordered under HTTP/2 multiplexing and leave the
+  // server draft empty after a reload. (Opus #5484 NIT.)
+  let _composerDraftClearPromise=null;
+  if (activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
+  const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
   const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000};
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   let optimisticMessages;
   try{
-    S.messages.push(userMsg);renderMessages();appendThinking('',{pending:true});setBusy(true);
+    S.messages.push(userMsg);renderMessages();setBusy(true);
+    if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;
+    if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
+    else appendThinking('',{pending:true});
     // First optimistic pass: make the local user turn visible before /api/chat/start
     // can save pending state on the server.
     _runOptionalPreStartUiStep('upsertActiveSessionForLocalTurn.initial', ()=>{
@@ -529,13 +1667,47 @@ async function send(){
     optimisticMessages=[...S.messages];
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
     try{setBusy(true);}catch(_){S.busy=true;}
+    if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;
     S.activeStreamId=null;
+    if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   }
 
   // Start the agent via POST, get a stream_id back
   let streamId;
+  let postStartData;
+  let modelStateForPostStart;
+  let explicitPickForPostStart;
   try{
     const _modelState=_chatPayloadModelState();
+    modelStateForPostStart=_modelState;
+    const _pendingPick=(typeof _readPendingSessionModel==='function')
+      ? _readPendingSessionModel(activeSid)
+      : null;
+    const _pendingPickMatch=_pendingPick
+      && _pendingPick.model===_modelState.model
+      && String(_pendingPick.model_provider||'')===String(_modelState.model_provider||'');
+    // ── Persisted cross-provider pick (#3737 follow-up) ──
+    // The onchange marker is consumed after the first send, so subsequent sends
+    // lose explicit_model_pick and the server "repairs" the model back to the
+    // profile default.  When the session has a non-default model from a different
+    // provider than the profile's active provider, treat every send as explicit
+    // so the server honors the user's choice across the entire conversation.
+    const _defaultModel=(typeof window!=='undefined' && window._defaultModel)||'';
+    const _activeProvider=(typeof window!=='undefined' && window._activeProvider)||null;
+    const _isCrossProviderPick = _modelState.model
+      && _modelState.model_provider
+      && _defaultModel
+      && _activeProvider
+      && _modelState.model !== _defaultModel
+      && String(_modelState.model_provider||'') !== String(_activeProvider||'');
+    const _explicitPick = _pendingPickMatch || _isCrossProviderPick;
+    // Consume the pending explicit-pick marker for THIS send only. The marker is
+    // recorded on modelSelect.onchange and intentionally kept (not cleared on
+    // session-update) so it survives the normal pick→update→send flow; clear it here
+    // once read so a later send of an unchanged dropdown isn't treated as an explicit
+    // pick. (#3739/#3737, Codex catch)
+    if(_pendingPickMatch && typeof _clearPendingSessionModel==='function') _clearPendingSessionModel(activeSid);
+    explicitPickForPostStart=_explicitPick;
     const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
       session_id:activeSid,message:msgText,
       // S.session.model remains authoritative; the helper only resolves a
@@ -543,57 +1715,41 @@ async function send(){
       model:_modelState.model,workspace:S.session.workspace,
       model_provider:_modelState.model_provider,
       profile:S.activeProfile||S.session.profile||'default',
-      attachments:uploaded.length?uploaded:undefined
+      explicit_model_pick:_explicitPick||undefined,
+      attachments:uploaded.length?uploaded:undefined,
+      moa_config:_pendingMoaConfig?true:undefined
     })});
-
-    if(startData.title) applySessionTitleUpdate(activeSid, startData.title, {provisionalText:displayText.slice(0,64), rememberProvisional:true});
-
-    if(startData.effective_model && S.session){
-      S.session.model=startData.effective_model;
-      S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
-      localStorage.setItem('hermes-webui-model', startData.effective_model);
-      if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
-      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
-      if(typeof syncTopbar==='function') syncTopbar();
-    }else if(startData.effective_model_provider && S.session){
-      S.session.model_provider=startData.effective_model_provider;
-      if(typeof _writePersistedModelState==='function') _writePersistedModelState(S.session.model||'',S.session.model_provider||null);
-      if($('modelSelect')&&typeof _applyModelToDropdown==='function') _applyModelToDropdown(S.session.model||'', $('modelSelect'), S.session.model_provider||null);
-      if(typeof syncModelChip==='function') syncModelChip();
-      if(typeof syncTopbar==='function') syncTopbar();
-    }
-    streamId=startData.stream_id;
-    S.activeStreamId = streamId;
-    if(typeof appendThinking==='function') appendThinking('',{pending:true});
-    // setBusy(true) already ran with activeStreamId=null; refresh now that we
-    // have a stream id so the primary button can switch to Stop (see getComposerPrimaryAction).
-    if(typeof updateSendBtn==='function') updateSendBtn();
-    if(S.session&&typeof startData.pending_started_at==='number'){
-      S.session.pending_started_at=startData.pending_started_at;
-    }
-    if(S.session&&S.session.session_id===activeSid){
-      S.session.active_stream_id = streamId;
-    }
-    if(typeof upsertActiveSessionForLocalTurn==='function'){
-      // Third optimistic pass: stream_id is now known, so the row can reconcile
-      // against real active-stream metadata before the background refresh lands.
-      upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
-    }
-    if(!INFLIGHT[activeSid]){
-      INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
-    }
-    const currentInflight=INFLIGHT[activeSid];
-    markInflight(activeSid, streamId);
-    if(typeof saveInflightState==='function'){
-      saveInflightState(activeSid,{streamId,messages:currentInflight.messages||optimisticMessages,uploaded:uploadedNames,toolCalls:currentInflight.toolCalls||[]});
-    }
-    // Refresh session list so background streaming indicators appear immediately for the
-    // session that was just started and any others that may already be running.
-    if(typeof renderSessionList === 'function') {
-      void renderSessionList();
-    }
+    _pendingMoaConfig=null;
+    postStartData = startData;
   }catch(e){
     const errMsg=String((e&&e.message)||'');
+    // If /api/chat/start returns 404, the session was deleted server-side
+    // (its sidecar is gone) while GET kept returning a CLI stub (#2782). Strip
+    // the stale /session/<id> URL and clear localStorage so a reload does not
+    // re-inject the dead id via _sessionIdFromLocation(), then reset to the
+    // empty state instead of pushing a confusing error bubble into the chat.
+    if(e&&e.status===404){
+      try{ localStorage.removeItem('hermes-webui-session'); }catch(_){ }
+      try{
+        if(typeof _appRootPath==='function') history.replaceState(null,'',_appRootPath());
+        else history.replaceState(null,'',window.location.pathname.replace(/\/session\/[^/]+/,'')+window.location.search);
+      }catch(_){ }
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      stopApprovalPolling();
+      stopClarifyPolling();
+      if(!_approvalSessionId || _approvalSessionId===activeSid) hideApprovalCard(true);
+      if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
+      removeThinking();
+      S.session=null;S.messages=[];
+      setBusy(false);setComposerStatus('');
+      if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
+      if(typeof renderMessages==='function') renderMessages();
+      if($('emptyState')) $('emptyState').style.display='';
+      if($('msgInner')) $('msgInner').innerHTML='';
+      if(typeof renderSessionList==='function') void renderSessionList();
+      return;
+    }
     const conflictActiveStream=/session already has an active stream/i.test(errMsg);
     if(conflictActiveStream){
       delete INFLIGHT[activeSid];
@@ -622,11 +1778,85 @@ async function send(){
     if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true, 'terminal');
     S.messages.push({role:'assistant',content:`**Error:** ${errMsg}`});
     _queueDrainSid=activeSid;renderMessages();setBusy(false);setComposerStatus(`Error: ${errMsg}`);
+    // #5472: the send was rejected before the turn was durably started, so the
+    // composer text + attachments (cleared at send time) would otherwise be
+    // lost. Put back the ORIGINAL captured draft (not the mutated /moa/bundle
+    // payload) and re-stage files so the user can re-send without retyping.
+    _restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise);
     if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
     // Reconcile with server truth after immediately clearing the optimistic spinner.
     if(typeof renderSessionList==='function') void renderSessionList();
     return;
   }
+
+  const startData = postStartData || {};
+  streamId = postStartData ? postStartData.stream_id : null;
+  S.activeStreamId = streamId;
+  // setBusy(true) already ran with activeStreamId=null; refresh now that we
+  // have a stream id so the primary button can switch to Stop (see
+  // getComposerPrimaryAction).
+  if(typeof updateSendBtn==='function') updateSendBtn();
+  _runOptionalPostStartUiStep('post-start ui/bookkeeping', ()=>{
+    const _modelState=modelStateForPostStart || _chatPayloadModelState();
+    const _explicitPick=explicitPickForPostStart;
+    if(startData&&startData.title) applySessionTitleUpdate(activeSid, startData.title, {provisionalText:displayText.slice(0,64), rememberProvisional:true});
+
+    if(startData&&startData.effective_model && S.session){
+      const _sentModel=_modelState&&_modelState.model;
+      if(_explicitPick && _sentModel && startData.effective_model!==_sentModel && typeof showToast==='function'){
+        showToast('Model '+_sentModel+' changed to '+startData.effective_model+' — profile provider mismatch', 5000);
+      }
+      S.session.model=startData.effective_model;
+      S.session.model_provider=startData.effective_model_provider||S.session.model_provider||null;
+      localStorage.setItem('hermes-webui-model', startData.effective_model);
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(startData.effective_model,S.session.model_provider||null);
+      if($('modelSelect')) _applyModelToDropdown(startData.effective_model, $('modelSelect'),S.session.model_provider||null);
+      if(typeof syncTopbar==='function') syncTopbar();
+    }else if(startData&&startData.effective_model_provider && S.session){
+      S.session.model_provider=startData.effective_model_provider;
+      if(typeof _writePersistedModelState==='function') _writePersistedModelState(S.session.model||'',S.session.model_provider||null);
+      if($('modelSelect')&&typeof _applyModelToDropdown==='function') _applyModelToDropdown(S.session.model||'', $('modelSelect'), S.session.model_provider||null);
+      if(typeof syncModelChip==='function') syncModelChip();
+      if(typeof syncTopbar==='function') syncTopbar();
+    }
+
+    if(S.session&&typeof startData.pending_started_at==='number'){
+      S.session.pending_started_at=startData.pending_started_at;
+    }
+    if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
+    else if(typeof appendThinking==='function') appendThinking('',{pending:true});
+    // setBusy(true) already ran with activeStreamId=null; refresh now that we
+    // have a stream id so the primary button can switch to Stop (see
+    // getComposerPrimaryAction).
+    if(typeof updateSendBtn==='function') updateSendBtn();
+    if(S.session&&S.session.session_id===activeSid){
+      S.session.active_stream_id = streamId;
+    }
+    if(S.session&&S.session.session_id===activeSid&&typeof showLiveRunStatus==='function'){
+      const _startedAt=typeof startData?.pending_started_at==='number'
+        ? startData.pending_started_at
+        : (S.session.pending_started_at||Date.now()/1000);
+      showLiveRunStatus(activeSid,{startedAt:_startedAt});
+    }
+    if(typeof upsertActiveSessionForLocalTurn==='function'){
+      // Third optimistic pass: stream_id is now known, so the row can reconcile
+      // against real active-stream metadata before the background refresh lands.
+      upsertActiveSessionForLocalTurn({title:S.session&&S.session.title||displayText.slice(0,64),messageCount:S.messages.length,timestampMs:Date.now()});
+    }
+    if(!INFLIGHT[activeSid]){
+      INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
+    }
+    const currentInflight=INFLIGHT[activeSid];
+    markInflight(activeSid, streamId);
+    if(typeof saveInflightState==='function'){
+      saveInflightState(activeSid,{streamId,messages:currentInflight.messages||optimisticMessages,uploaded:uploadedNames,toolCalls:currentInflight.toolCalls||[]});
+    }
+    // Refresh session list so background streaming indicators appear immediately for the
+    // session that was just started and any others that may already be running.
+    if(typeof renderSessionList === 'function') {
+      void renderSessionList();
+    }
+  });
 
   // Open SSE stream and render tokens live
   attachLiveStream(activeSid, streamId, uploadedNames);
@@ -635,14 +1865,74 @@ async function send(){
 }
 
 const LIVE_STREAMS={};
+const _STREAM_NOTIFICATION_BACKGROUND={};
+
+// #4416: track whether the tab was hidden at ANY point during a live stream, so
+// the response-complete notification fires for a backgrounded tab even when
+// Chromium throttles the background-tab SSE and delivers the `done` event LATE
+// (after the user returns, when document.hidden already reads false). Each entry
+// is STREAM-OWNED ({streamId, wasHidden}) so a stale entry left by a non-`done`
+// terminal path (apperror/cancel/stream-error/reconnect-no-active) can never be
+// mis-attributed to a later stream for the same session id — a reconnect only
+// keeps the prior state when the streamId matches. One idempotent
+// visibilitychange listener (never leaks) flips wasHidden on all active entries.
+const _STREAM_WAS_HIDDEN={};
+let _streamHiddenTrackerBound=false;
+function _bindStreamHiddenTracker(){
+  if(_streamHiddenTrackerBound||typeof document==='undefined'||typeof document.addEventListener!=='function') return;
+  _streamHiddenTrackerBound=true;
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden){ for(const k in _STREAM_WAS_HIDDEN){ const e=_STREAM_WAS_HIDDEN[k]; if(e) e.wasHidden=true; } }
+  });
+}
+function _clearStreamHidden(sid, streamId){
+  // Clear only when we own the current stream's entry (or unconditionally when
+  // streamId is omitted). Prevents a terminal path for an old stream from wiping
+  // a newer stream's tracker.
+  if(!sid) return;
+  const e=_STREAM_WAS_HIDDEN[sid];
+  if(!e) return;
+  if(streamId&&e.streamId&&e.streamId!==streamId) return;
+  delete _STREAM_WAS_HIDDEN[sid];
+}
+function _clearStreamNotificationBackground(sid, streamId){
+  if(!sid) return;
+  const e=_STREAM_NOTIFICATION_BACKGROUND[sid];
+  if(!e) return;
+  if(streamId&&e.streamId&&e.streamId!==streamId) return;
+  delete _STREAM_NOTIFICATION_BACKGROUND[sid];
+}
+function _shouldForceCompletionNotification(sid, streamId){
+  const hiddenEntry=_STREAM_WAS_HIDDEN[sid];
+  const backgroundEntry=_STREAM_NOTIFICATION_BACKGROUND[sid];
+  const wasHidden=!!(hiddenEntry&&hiddenEntry.wasHidden);
+  const wasBackgrounded=!!(backgroundEntry&&backgroundEntry.wasBackgrounded);
+  _clearStreamHidden(sid, streamId);
+  _clearStreamNotificationBackground(sid, streamId);
+  return wasHidden||wasBackgrounded;
+}
 
 function closeLiveStream(sessionId, streamId, source){
   const live=LIVE_STREAMS[sessionId];
   if(!live) return;
   if(streamId&&live.streamId!==streamId) return;
   if(source&&live.source!==source) return;
-  try{live.source.close();}catch(_){ }
+  // Snapshot the current live-turn DOM BEFORE tearing the stream down. The
+  // per-event snapshot (snapshotLiveTurn) only fires on content/tool_complete
+  // SSE events, so switching away during a quiet window (mid tool-exec, silent
+  // thinking) would leave a stale-or-absent snapshot — on switch-back
+  // restoreLiveTurnHtmlForSession() then fails and loadSession()'s fallback
+  // rebuilds with an EMPTY appendThinking(), permanently losing the streamed
+  // thinking/tool content (only the elapsed clock survives). Capturing here
+  // guarantees switch-back restores the exact state shown at switch-away. (#3668)
+  if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(sessionId);
+  // Stop the live footer timer/status for the pane that is being detached; the
+  // reattach path will rebuild it from INFLIGHT/server state if the user returns.
+  if(typeof _clearLiveRunStatusTimer==='function') _clearLiveRunStatusTimer(sessionId);
+  if(typeof hideLiveRunStatus==='function') hideLiveRunStatus(sessionId);
+  try{if(live.source&&live.source.readyState!==2)live.source.close();}catch(_){ }
   delete LIVE_STREAMS[sessionId];
+  _resumeSessionStreamAfterLiveChat(sessionId);
   // closeLiveStream() is called during session-switch teardown for any session
   // the user is no longer viewing. The stream is still active on the server,
   // so mark the in-memory INFLIGHT entry for reattach — otherwise
@@ -652,7 +1942,28 @@ function closeLiveStream(sessionId, streamId, source){
   // finishes and a metadata refresh swaps in the final reply.
   // If the stream is terminating cleanly, _clearOwnerInflightState() has
   // already deleted INFLIGHT[sessionId], so this is a safe no-op.
-  if(INFLIGHT[sessionId]) INFLIGHT[sessionId].reattach=true;
+  if(INFLIGHT[sessionId]){
+    INFLIGHT[sessionId].reattach=true;
+    // The browser-side INFLIGHT snapshot is only a compact tail cache. After a
+    // session switch it cannot be treated as the full live turn; rebuild from
+    // the durable run journal instead so earlier prose/tool rows are not lost.
+    INFLIGHT[sessionId].journalReplayFromStart=true;
+    if(typeof saveInflightState==='function'){
+      saveInflightState(sessionId,{
+        streamId:live.streamId||streamId||null,
+        messages:INFLIGHT[sessionId].messages||[],
+        uploaded:INFLIGHT[sessionId].uploaded||[],
+        toolCalls:INFLIGHT[sessionId].toolCalls||[],
+        lastAssistantText:INFLIGHT[sessionId].lastAssistantText||'',
+        lastReasoningText:INFLIGHT[sessionId].lastReasoningText||'',
+        lastRunJournalSeq:INFLIGHT[sessionId].lastRunJournalSeq||0,
+        journalReplayFromStart:true,
+        currentActivityBurstId:INFLIGHT[sessionId].currentActivityBurstId||0,
+        currentLiveSegmentSeq:INFLIGHT[sessionId].currentLiveSegmentSeq||0,
+        activityBurstAnchors:Array.isArray(INFLIGHT[sessionId].activityBurstAnchors)?INFLIGHT[sessionId].activityBurstAnchors:[],
+      });
+    }
+  }
 }
 
 function closeOtherLiveStreams(activeSid){
@@ -668,42 +1979,121 @@ function closeOtherLiveStreams(activeSid){
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
+  // #4416: start (or, on reconnect for the SAME stream, keep) tracking whether
+  // the tab was hidden during this stream so the done-notification fires for a
+  // backgrounded tab. A reconnect with a different streamId re-seeds (the old
+  // entry belonged to a prior stream).
+  _bindStreamHiddenTracker();
+  {
+    const _prev=_STREAM_WAS_HIDDEN[activeSid];
+    const _keep=reconnecting&&_prev&&_prev.streamId===streamId;
+    if(!_keep){
+      _STREAM_WAS_HIDDEN[activeSid]={streamId,wasHidden:(typeof document!=='undefined'&&!!document.hidden)};
+    }
+    const _prevBackground=_STREAM_NOTIFICATION_BACKGROUND[activeSid];
+    const _keepBackground=reconnecting&&_prevBackground&&_prevBackground.streamId===streamId;
+    if(!_keepBackground){
+      _STREAM_NOTIFICATION_BACKGROUND[activeSid]={streamId,wasBackgrounded:_desktopBackgroundedForNotifications};
+    }
+  }
   if(!INFLIGHT[activeSid]) INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[...uploaded],toolCalls:[]};
   else {
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
+  if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
+  if(INFLIGHT[activeSid].currentLiveSegmentSeq===undefined) INFLIGHT[activeSid].currentLiveSegmentSeq=0;
+  let assistantText='';
+  let reasoningText='';
+  if(S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   const existingLive=LIVE_STREAMS[activeSid];
   if(
     existingLive&&existingLive.streamId===streamId&&existingLive.source&&
-    // A same-stream transport can be reused unless the browser has already
-    // marked it closed; closed streams must still fall through to reopen.
-    (typeof EventSource==='undefined'||existingLive.source.readyState!==EventSource.CLOSED)
+    // During explicit reconnects, only reuse a proven-open transport. A stale
+    // CONNECTING EventSource can survive in page state while the server has no
+    // subscriber, which leaves the live pane blank forever.
+    (typeof EventSource==='undefined'||
+      existingLive.source.readyState===EventSource.OPEN||
+      (!reconnecting&&existingLive.source.readyState===EventSource.CONNECTING))
   ){
+    // Phase D: restore bottom run status on reattach after the Worklog shell
+    // exists. There is no stale transport teardown in this branch.
+    if(reconnecting && S.activeStreamId && typeof showLiveRunStatus==='function'){
+      const _startedAt=(S.session&&S.session.pending_started_at)||Date.now()/1000;
+      showLiveRunStatus(activeSid,{startedAt:_startedAt});
+    }
     return;
   }
   closeOtherLiveStreams(activeSid);
   closeLiveStream(activeSid);
   if(!reconnecting&&typeof resetTurnWorkspaceMutations==='function') resetTurnWorkspaceMutations();
   if(!reconnecting&&typeof _resetStreamScrollFollow==='function') _resetStreamScrollFollow();
+  // Phase D: restore bottom run status after closeLiveStream(); that helper
+  // hides the status while tearing down stale EventSource ownership.
+  if(reconnecting && S.activeStreamId && typeof showLiveRunStatus==='function'){
+    const _startedAt=(S.session&&S.session.pending_started_at)||Date.now()/1000;
+    showLiveRunStatus(activeSid,{startedAt:_startedAt});
+  }
+  _suspendSessionStreamForLiveChat(activeSid);
 
   // On reconnect, restore accumulated text from INFLIGHT so we don't lose
   // progress made before the session switch. Without this the closure starts
   // empty and tokens arriving on the new SSE connection append to nothing —
   // the already-rendered content vanishes.
-  const _lastLiveAssistant = reconnecting
-    ? INFLIGHT[activeSid]?.messages?.findLast?.(m => m.role === 'assistant' && m._live)
+  const _liveInflightAssistantMessages = reconnecting
+    ? ((INFLIGHT[activeSid]&&Array.isArray(INFLIGHT[activeSid].messages))
+      ? INFLIGHT[activeSid].messages.filter(m=>m&&m.role==='assistant'&&m._live)
+      : [])
+    : [];
+  const _liveInflightAssistant = _liveInflightAssistantMessages.length===1
+    ? _liveInflightAssistantMessages[0]
     : null;
-  let assistantText = _lastLiveAssistant ? (_lastLiveAssistant.content || '') : '';
-  let reasoningText = _lastLiveAssistant ? (_lastLiveAssistant.reasoning || '') : '';
+  const _fullInflightAssistant = (INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastAssistantText) || '';
+  const _joinedInflightSegments = _liveInflightAssistantMessages.length>1
+    ? _liveInflightAssistantMessages.map(m=>m&&m.content?String(m.content).trim():'').filter(Boolean).join('\n\n')
+    : '';
+  const _lastLiveAssistant = reconnecting
+    ? (_liveInflightAssistantMessages.length>1
+      ? (_fullInflightAssistant || _joinedInflightSegments)
+      : (_liveInflightAssistant
+        ? (_fullInflightAssistant || _liveInflightAssistant.content || '')
+        : _fullInflightAssistant))
+    : '';
+  const _lastLiveReasoning = reconnecting
+    ? (_liveInflightAssistant&&_liveInflightAssistant.reasoning)
+      || (INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastReasoningText)
+      || ''
+    : '';
+  assistantText = _lastLiveAssistant ? _lastLiveAssistant : '';
+  reasoningText=_lastLiveReasoning ? _lastLiveReasoning : '';
   let liveReasoningText = reasoningText;
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
   let _pendingGoalContinuation=null;
   let assistantRow=null;
   let assistantBody=null;
-  let segmentStart=0;      // char offset in assistantText where current segment begins
-  let _freshSegment=false; // true after a tool call — forces a new DOM segment
+  // On reconnect with recorded burst anchors, the rendered DOM has multiple
+  // live assistant segments — one per anchor plus a tail. New tokens belong to
+  // the TAIL segment only.
+  let segmentStart=(()=>{
+    if(!reconnecting) return 0;
+    const inflight=INFLIGHT[activeSid];
+    if(!inflight) return 0;
+    const anchors=Array.isArray(inflight.activityBurstAnchors)?inflight.activityBurstAnchors:[];
+    const textLen=String(assistantText||'').length;
+    let lastEnd=0;
+    for(const a of anchors){
+      const end=Number(a&&a.textEnd);
+      if(Number.isFinite(end)&&end>lastEnd&&end<=textLen) lastEnd=end;
+    }
+    return lastEnd;
+  })();
+  // If reconnect resumes exactly at the last recorded boundary, there is no
+  // projected tail segment yet. The next token must create a fresh segment
+  // after the last Activity group instead of rewriting the previous burst's
+  // text segment.
+  let _freshSegment=reconnecting&&segmentStart>0&&segmentStart>=String(assistantText||'').length;
   // streaming-markdown state: incremental DOM-building parser per segment
   let _smdParser=null;     // current smd parser instance (null until first content)
   let _smdWrittenLen=0;    // how many chars of displayText have been fed to smd parser
@@ -712,15 +2102,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // On reconnect, the assistantBody already has partial smd-rendered content.
   // We clear it on first new token and restart the parser from the reconnect point.
   let _smdReconnect=reconnecting;
-  // Thinking tag patterns for streaming display
-  const _thinkPairs=[
-    {open:'<think>',close:'</think>'},
-    {open:'<|channel>thought\n',close:'<channel|>'},
-    {open:'<|turn|>thinking\n',close:'<turn|>'}  // Gemma 4
-  ];
-
   function _isActiveSession(){
     return !!(S.session&&S.session.session_id===activeSid);
+  }
+  function _ownsActiveStreamOrBackground(){
+    return !_isActiveSession() || S.activeStreamId===streamId;
+  }
+  function _bailOutOfTerminalEventsFromStaleStream(source){
+    if(_ownsActiveStreamOrBackground()) return false;
+    // This stale stream no longer owns the session — schedule cleanup of ITS own
+    // anchor registry (identity-guarded, so it can't clobber the newer stream's
+    // registry for the same session) before closing. (Codex leak catch.)
+    _scheduleAnchorRegistryCleanup(120000);
+    _closeSource(source);
+    return true;
   }
   function _clearActivePaneInflightIfOwner(){
     if(_isActiveSession()) clearInflight();
@@ -744,9 +2139,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     hideClarifyCard(true, reason||'terminal');
   }
   function _clearOwnerInflightState(){
+    if(_isActiveSession() && S.activeStreamId!==streamId) return;
     delete INFLIGHT[activeSid];
     clearInflightState(activeSid);
     _clearActivePaneInflightIfOwner();
+    _resumeSessionStreamAfterLiveChat(activeSid);
   }
   function _isMarkerOnlyAssistantMessage(m){
     if(!m||m.role!=='assistant') return false;
@@ -758,8 +2155,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const normalized=String(text||'').replace(/\s+/g,' ').trim();
     if(!normalized) return false;
     const systemRecovery=/^\[System:/i.test(normalized)
-      && /previous response was cut off by a network error/i.test(normalized)
-      && /continue exactly where you left off/i.test(normalized);
+      && (/continue exactly where you left off/i.test(normalized)
+        || /do not retry the same tool call/i.test(normalized));
     const backendRecovery=/^the live worker stopped before this run finished\.?$/i.test(normalized);
     return !!(systemRecovery || backendRecovery);
   }
@@ -787,6 +2184,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     msg.provider_details='The only assistant text returned for this turn was the internal preserved-task-list compression marker, so the WebUI replaced it with an explicit error instead of rendering the marker as a model response.';
     return true;
   }
+  function _isTerminalStreamErrorMarkerMessage(message){
+    return message&&message.role==='assistant'&&typeof message.content==='string'&&
+      message.content.startsWith('**Connection interrupted:** The browser lost the live SSE connection before the response finished.');
+  }
+  function _ensureSingleTerminalStreamErrorMarker(messages){
+    if(!Array.isArray(messages)) return;
+    while(messages.length && _isTerminalStreamErrorMarkerMessage(messages[messages.length-1])){
+      messages.pop();
+    }
+    messages.push({
+      role:'assistant',
+      content:'**Connection interrupted:** The browser lost the live SSE connection before the response finished. If the worker completed, reopening this session should restore the settled transcript.',
+    });
+  }
   function _setActivePaneIdleIfOwner(){
     if(_isActiveSession()||!S.session||!INFLIGHT[S.session.session_id]){
       setBusy(false);
@@ -802,10 +2213,34 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       messages:inflight.messages||[],
       uploaded:inflight.uploaded||[...uploaded],
       toolCalls:inflight.toolCalls||[],
+      lastAssistantText:inflight.lastAssistantText||'',
+      lastReasoningText:inflight.lastReasoningText||'',
+      lastRunJournalSeq:inflight.lastRunJournalSeq||0,
+      journalReplayFromStart:!!inflight.journalReplayFromStart,
+      anchorActivityScene:inflight.anchorActivityScene||null,
+      currentActivityBurstId:inflight.currentActivityBurstId||0,
+      currentLiveSegmentSeq:inflight.currentLiveSegmentSeq||0,
+      activityBurstAnchors:Array.isArray(inflight.activityBurstAnchors)?inflight.activityBurstAnchors:[],
+      todos:Array.isArray(inflight.todos)?inflight.todos:S.todos,
+      todoStateMeta:inflight.todoStateMeta||S.todoStateMeta||null,
     });
   }
   function snapshotLiveTurn(){
     if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(activeSid);
+  }
+  // Throttled per-frame variant. snapshotLiveTurnHtmlForSession serializes the
+  // whole (growing) live turn via turn.outerHTML — O(n)/frame -> O(n^2) over a
+  // long answer, and a real GC-pressure source. The snapshot only backs
+  // mid-stream session-switch restore, and the switch path (sessions.js) plus
+  // the stream event boundaries (tool/done) already capture synchronously, so a
+  // coarse trailing snapshot during streaming is sufficient. (#5455 WS2.2)
+  let _snapshotLiveTurnTimer=null;
+  function _throttledSnapshotLiveTurn(){
+    if(_snapshotLiveTurnTimer) return;
+    _snapshotLiveTurnTimer=setTimeout(()=>{_snapshotLiveTurnTimer=null;snapshotLiveTurn();},700);
+  }
+  function _cancelThrottledSnapshotTimer(){
+    if(_snapshotLiveTurnTimer){clearTimeout(_snapshotLiveTurnTimer);_snapshotLiveTurnTimer=null;}
   }
   // Throttled variant for token-by-token updates. persistInflightState()
   // calls saveInflightState() which does JSON.parse + JSON.stringify + write
@@ -822,6 +2257,78 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _closeSource(source){
     closeLiveStream(activeSid, streamId, source);
   }
+  function _clearStreamEndRecovery(){
+    if(_streamEndRecoveryTimer){
+      clearTimeout(_streamEndRecoveryTimer);
+      _streamEndRecoveryTimer=null;
+    }
+    _pendingStreamEndRecovery=false;
+    _streamEndRecoveryAttempts=0;
+  }
+  function _liveStreamEndScenePresent(){
+    if(assistantText||assistantRow) return true;
+    if(String(liveReasoningText||reasoningText||'').trim()) return true;
+    const inflight=INFLIGHT[activeSid];
+    if(inflight&&Array.isArray(inflight.toolCalls)&&inflight.toolCalls.length) return true;
+    if(!_isActiveSession()||typeof document==='undefined') return false;
+    const turn=$('liveAssistantTurn');
+    return !!(turn&&turn.querySelector(
+      '[data-live-assistant="1"],'+
+      '.live-worklog[data-live-worklog-shell="1"],'+
+      '.tool-card-row[data-live-tid],'+
+      '.agent-activity-thinking[data-thinking-active="1"]'
+    ));
+  }
+  function _scheduleStreamEndRecovery(source, delay=180){
+    if(_streamEndRecoveryTimer) clearTimeout(_streamEndRecoveryTimer);
+    _pendingStreamEndRecovery=true;
+    _streamEndRecoveryTimer=setTimeout(()=>{void _runStreamEndRecovery(source);},delay);
+  }
+  function _finalizeStreamEndFallback(source){
+    _clearStreamEndRecovery();
+    if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _cancelThrottledSnapshotTimer();
+    _terminalStateReached=true;
+    _streamFinalized=true;
+    _cancelAnimationFramePendingStreamRender();
+    _streamFadeCleanupReduceMotionListener();
+    _smdEndParser();
+    if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
+    _clearOwnerInflightState();
+    _clearStreamHidden(activeSid, streamId);  // #4416: terminal path, drop hidden tracker
+    _clearStreamNotificationBackground(activeSid, streamId);
+    _flushReasoningToAnchor();
+    _scheduleAnchorRegistryCleanup();
+    _clearAnchorProseIncrementalNode();
+    _clearApprovalForOwner();
+    _clearClarifyForOwner('terminal');
+    if(_isActiveSession()){
+      S.activeStreamId=null;
+      clearLiveToolCards();if(!assistantText)removeThinking();
+      renderMessages({preserveScroll:true});
+    }
+    renderSessionList();
+    _setActivePaneIdleIfOwner();
+    _closeSource(source);
+  }
+  async function _runStreamEndRecovery(source){
+    if(_streamFinalized || _terminalStateReached || !_pendingStreamEndRecovery){
+      _clearStreamEndRecovery();
+      return;
+    }
+    _streamEndRecoveryTimer=null;
+    const status=await _restoreSettledSession(source,{status:true});
+    if(status==='restored'){
+      _clearStreamEndRecovery();
+      return;
+    }
+    if(status==='active'&&_streamEndRecoveryAttempts<10){
+      _streamEndRecoveryAttempts+=1;
+      _scheduleStreamEndRecovery(source,200);
+      return;
+    }
+    _finalizeStreamEndFallback(source);
+  }
   function _stripLiveVisibleAssistantEchoFromThinking(text, snippets){
     let out=String(text||'');
     (Array.isArray(snippets)?snippets:[]).forEach(snippet=>{
@@ -832,12 +2339,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return out.trim();
   }
   function _liveThinkingText(){
-    const clean=_stripLiveVisibleAssistantEchoFromThinking(liveReasoningText, visibleInterimSnippets);
-    return clean || 'Thinking…';
+    return String(liveReasoningText||'').trim() || 'Thinking…';
+  }
+  function _liveThinkingPlacement(){
+    const activeSeq=Number(_assistantSegmentSeq||0);
+    const nextSeq=Number(_currentLiveSegmentSeq||0)+1;
+    const segmentSeq=(!assistantRow||_freshSegment||!activeSeq)?nextSeq:activeSeq;
+    return {
+      activityKey:S.activeStreamId?'live:'+S.activeStreamId:null,
+      segmentSeq,
+      burstId:_currentActivityBurstId,
+    };
+  }
+  function _updateLiveThinkingCard(text){
+    const opts=_liveThinkingPlacement();
+    if(typeof updateThinking==='function') updateThinking(text, opts);
+    else appendThinking(text, opts);
+  }
+  // Split a content string into {reasoning, content} by extracting any <think>...
+  // blocks (or other known reasoning-tag pairs). If reasoning is already
+  // populated on the message (e.g. from a separate on_reasoning stream), the
+  // inline blocks are stripped but the existing reasoning field is preserved.
+  // Provider-bug workaround: M3 (and similar reasoning models) emit the
+  // thinking inline in the OpenAI-compat content stream instead of a separate
+  // reasoning channel, which would otherwise bloat the persisted session
+  // message by 30-50% and miss the m.reasoning field used by the thinking card.
+  function _splitThinkFromContent(rawContent, existingReasoning){
+    return _extractInlineThinkingFromContent(rawContent, existingReasoning, {streaming:false});
   }
   function syncInflightAssistantMessage(){
     const inflight=INFLIGHT[activeSid];
     if(!inflight) return;
+    inflight.lastAssistantText=assistantText;
+    inflight.lastReasoningText=reasoningText;
     if(!Array.isArray(inflight.messages)) inflight.messages=[];
     let assistantIdx=-1;
     for(let i=inflight.messages.length-1;i>=0;i--){
@@ -845,15 +2379,45 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(msg&&msg.role==='assistant'&&msg._live){assistantIdx=i;break;}
     }
     const ts=Date.now()/1000;
+    // Split inline <think> blocks into m.reasoning so the persisted inflight
+    // state stays compact and the thinking card has a proper source field.
+    const split=_splitThinkFromContent(assistantText, reasoningText);
     if(assistantIdx>=0){
-      inflight.messages[assistantIdx].content=assistantText;
-      inflight.messages[assistantIdx].reasoning=reasoningText||undefined;
+      inflight.messages[assistantIdx].content=split.content;
+      inflight.messages[assistantIdx].reasoning=split.reasoning||undefined;
       inflight.messages[assistantIdx]._ts=inflight.messages[assistantIdx]._ts||ts;
       _throttledPersist();
       return;
     }
-    inflight.messages.push({role:'assistant',content:assistantText,reasoning:reasoningText||undefined,_live:true,_ts:ts});
+    inflight.messages.push({role:'assistant',content:split.content,reasoning:split.reasoning||undefined,_live:true,_ts:ts});
     _throttledPersist();
+  }
+  function recordActivityBoundary(){
+    const inflight=INFLIGHT[activeSid];
+    if(!inflight) return;
+    if(!Array.isArray(inflight.activityBurstAnchors)) inflight.activityBurstAnchors=[];
+    if(!assistantRow||!assistantRow.isConnected){
+      assistantRow=null;
+      assistantBody=null;
+    }
+    const textEnd=String(assistantText||'').length;
+    const lastTextEnd=inflight.activityBurstAnchors.reduce((max,a)=>{
+      const n=Number(a&&a.textEnd);
+      return Number.isFinite(n)?Math.max(max,n):max;
+    },0);
+    if(textEnd<=lastTextEnd){
+      inflight.currentActivityBurstId=_currentActivityBurstId;
+      if(assistantRow) assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId));
+      persistInflightState();
+      return;
+    }
+    _currentActivityBurstId+=1;
+    inflight.currentActivityBurstId=_currentActivityBurstId;
+    const existing=inflight.activityBurstAnchors.find(a=>Number(a&&a.id)===_currentActivityBurstId);
+    if(existing) existing.textEnd=textEnd;
+    else inflight.activityBurstAnchors.push({id:_currentActivityBurstId,textEnd});
+    if(assistantRow) assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId));
+    persistInflightState();
   }
   function ensureAssistantRow(force=false){
     if(!_isActiveSession()) return;
@@ -870,19 +2434,25 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const blocks=(typeof _assistantTurnBlocks==='function')?_assistantTurnBlocks(turn):null;
     if(!blocks) return;
     if(!assistantRow){
-      // Only reuse an existing segment on the very first creation (e.g. reconnect).
       // After a tool call _freshSegment=true, so we always create a new segment
       // below the tool card rather than re-attaching to the old one above it.
       if(!_freshSegment){
-        const existing=blocks.querySelector('[data-live-assistant="1"]');
+        const liveSegments=blocks.querySelectorAll('[data-live-assistant="1"]');
+        const existing=liveSegments.length?liveSegments[liveSegments.length-1]:null;
         if(existing){
           assistantRow=existing;
           assistantBody=existing.querySelector('.msg-body');
+          const existingSeq=Number(existing.getAttribute('data-live-segment-seq')||'');
+          if(Number.isFinite(existingSeq)&&existingSeq>0){
+            _assistantSegmentSeq=existingSeq;
+            if(_assistantSegmentSeq>_currentLiveSegmentSeq) _currentLiveSegmentSeq=_assistantSegmentSeq;
+          }
         }
       }
     }
     if(assistantRow){
       if(typeof placeLiveToolCardsHost==='function') placeLiveToolCardsHost();
+      if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
       return;
     }
 
@@ -890,10 +2460,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     $('emptyState').style.display='none';
     assistantRow=document.createElement('div');
     assistantRow.className='assistant-segment';
+    _currentLiveSegmentSeq+=1;
+    _assistantSegmentSeq=_currentLiveSegmentSeq;
     assistantRow.setAttribute('data-live-assistant','1');
+    assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId));
+    assistantRow.setAttribute('data-live-segment-seq',String(_assistantSegmentSeq));
     assistantBody=document.createElement('div');assistantBody.className='msg-body';
     assistantRow.appendChild(assistantBody);
     blocks.appendChild(assistantRow);
+    if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
+    if(INFLIGHT[activeSid]){
+      INFLIGHT[activeSid].currentLiveSegmentSeq=_currentLiveSegmentSeq;
+    }
     _freshSegment=false; // consumed — next reuse check is normal again
   }
 
@@ -901,6 +2479,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _reconnectAttempted=false;
   let _terminalStateReached=false;
   let _deferredStreamRecoveryBound=false;
+  let _pendingStreamEndRecovery=false;
+  let _streamEndRecoveryTimer=null;
+  let _streamEndRecoveryAttempts=0;
 
   function _pageHiddenForStreamError(){
     return (typeof document!=='undefined'&&document.visibilityState==='hidden')||
@@ -916,15 +2497,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
           if(st.active){
             setComposerStatus('Reconnected');
-            _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
+            _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
             return;
           }
         }
       }catch(_){
         if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
       }
-      if(await _restoreSettledSession(source)) return;
+      if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
       if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup(120000);
       _handleStreamError(source);
     })();
   }
@@ -965,21 +2548,1394 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _streamFadeLastArrivalMs=0;
   let _streamFadeArrivalWps=0;
   let _streamFadeLatestAnimationEndAt=0;
-  let _streamFadeAppendOffset=0;
   let _streamFadeVisibleWords=0;
   let _streamFadeHoldUntilMs=0;
-  let _streamFadeCurrentMs=200;
+  let _streamFadeCurrentMs=620;
+  let _streamFadeDomText='';
   let _streamFadeReduceMotionMql=null;
   let _streamFadeReduceMotion=false;
   let _streamFadeReduceMotionOnChange=null;
-  let _lastRunJournalSeq=0;
+  let _currentActivityBurstId=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentActivityBurstId)||0)||0;
+  let _currentLiveSegmentSeq=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentLiveSegmentSeq)||0)||0;
+  let _assistantSegmentSeq=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].currentLiveSegmentSeq)||0)||0;
+  let _lastRunJournalSeq=reconnecting
+    ? Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalSeq)||0)
+    : 0;
   let _lastRunJournalEventId='';
-  const _STREAM_FADE_MS=200;
-  const _STREAM_FADE_MAX_MS=350;
-  const _STREAM_FADE_STAGGER_MS=16;
-  const _STREAM_FADE_DONE_MAX_MS=320;
-  const _STREAM_FADE_DONE_DRAIN_MAX_MS=900;
-  const _streamFadeEnabledForStream=window._fadeTextEffect===true;
+  const _STREAM_FADE_MS=620;
+  const _STREAM_FADE_MAX_MS=900;
+  const _STREAM_FADE_DONE_MAX_MS=1000;
+  const _STREAM_FADE_DONE_DRAIN_MAX_MS=1400;
+  const _anchorApi=(typeof window!=='undefined'&&window.HermesAssistantTurnAnchors)
+    ? window.HermesAssistantTurnAnchors
+    : null;
+  const _anchorRegistryMap=(typeof window!=='undefined')
+    ? (window._liveAnchorRegistries=window._liveAnchorRegistries||new Map())
+    : null;
+  const _existingAnchorRegistry=_anchorRegistryMap?_anchorRegistryMap.get(streamId):null;
+  const _anchorRegistry=_existingAnchorRegistry||(_anchorApi&&typeof _anchorApi.createAssistantTurnAnchorRegistry==='function'
+    ? _anchorApi.createAssistantTurnAnchorRegistry({
+      session_id:activeSid,
+      stream_id:streamId,
+      run_id:null,
+    })
+    : null);
+  let _anchorShadowWarned=false;
+  let _anchorReasoningFlushed=false;
+  let _anchorLocalSeq=0;
+  if(_anchorRegistryMap&&_anchorRegistry) _anchorRegistryMap.set(streamId,_anchorRegistry);
+  function _scheduleAnchorRegistryCleanup(delayMs=600000){
+    if(!_anchorRegistryMap||!_anchorRegistry) return;
+    setTimeout(()=>{
+      if(_anchorRegistryMap.get(streamId)===_anchorRegistry) _anchorRegistryMap.delete(streamId);
+    },delayMs);
+  }
+  // Backstop: schedule an identity-guarded cleanup at creation so this shadow
+  // registry self-expires no matter which teardown path the stream takes
+  // (incl. external ones like sidebar cancelSessionStream() that bypass the
+  // in-closure SSE handlers). Explicit terminal-path calls above just expire it
+  // sooner; this guarantees window._liveAnchorRegistries can't grow unbounded.
+  _scheduleAnchorRegistryCleanup(600000);
+  function _applyToAnchor(sourceEventType, rawEventData, sseEvent){
+    if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
+    const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
+    const eventId=(sseEvent&&sseEvent.lastEventId)||raw.event_id||raw.lastEventId||raw.last_event_id||'';
+    const sourceEvent={
+      ...raw,
+      source_event_type:sourceEventType,
+      activitySegmentSeq:raw.activitySegmentSeq??raw.activity_segment_seq??_assistantSegmentSeq,
+      activityBurstId:raw.activityBurstId??raw.activity_burst_id??_currentActivityBurstId,
+    };
+    if(eventId) sourceEvent.event_id=eventId;
+    try{
+      const result=_anchorApi.applyAssistantTurnAnchorSourceEvent(
+        _anchorRegistry,
+        sourceEvent,
+        {session_id:activeSid,stream_id:streamId}
+      );
+      _renderAnchorLiveScene();
+      return result;
+    }catch(err){
+      if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
+        _anchorShadowWarned=true;
+        console.warn('assistant turn anchor live shadow feed failed',err);
+      }
+      return null;
+    }
+  }
+  function _anchorActivityEvents(){
+    const anchor=_anchorRegistry&&_anchorRegistry.anchor;
+    return anchor&&Array.isArray(anchor.activity_events)?anchor.activity_events:null;
+  }
+  function _findAnchorActivityEventByLocalId(localId, sourceEventType){
+    const events=_anchorActivityEvents();
+    if(!events||!localId) return null;
+    for(let i=events.length-1;i>=0;i--){
+      const event=events[i];
+      if(!event||event.local_id!==localId) continue;
+      if(sourceEventType&&event.source_event_type!==sourceEventType) continue;
+      return event;
+    }
+    return null;
+  }
+  function _latestAnchorCompressionEventIndex(sourceEventType){
+    const events=_anchorActivityEvents();
+    if(!events) return -1;
+    for(let i=events.length-1;i>=0;i--){
+      const event=events[i];
+      if(event&&event.source_event_type===sourceEventType) return i;
+    }
+    return -1;
+  }
+  function _anchorCompressionCompletedAfter(index){
+    const events=_anchorActivityEvents();
+    if(!events) return false;
+    for(let i=events.length-1;i>index;i--){
+      const event=events[i];
+      if(event&&event.source_event_type==='compressed') return true;
+    }
+    return false;
+  }
+  function _ensureAnchorCompressionCompletedOnLiveProgress(sessionId){
+    if(!_anchorRegistry||!_anchorApi) return false;
+    const sid=String(sessionId||activeSid||'');
+    const events=_anchorActivityEvents();
+    const runningIndex=_latestAnchorCompressionEventIndex('compressing');
+    if(runningIndex>=0&&_anchorCompressionCompletedAfter(runningIndex)) return true;
+    const runningEvent=(events&&runningIndex>=0)?events[runningIndex]:null;
+    const basis=String((runningEvent&&(runningEvent.local_id||runningEvent.event_id))||streamId||sid||'compression');
+    const localId=`live-compression-complete:${basis}`;
+    if(_findAnchorActivityEventByLocalId(localId,'compressed')) return true;
+    const eventId=`synthetic:${localId}`;
+    const result=_applyToAnchor('compressed',{
+      event_id:eventId,
+      local_id:localId,
+      session_id:sid,
+      old_session_id:sid,
+      automatic:true,
+      synthetic:true,
+      status:'completed',
+      phase:'done',
+      message:'Context auto-compressed',
+    },{lastEventId:eventId});
+    return !!(result&&(result.applied||result.reason==='duplicate'));
+  }
+  function _replaceAnchorActivityEventByLocalId(localId, sourceEventType, patch){
+    const events=_anchorActivityEvents();
+    if(!events||!localId) return null;
+    for(let i=events.length-1;i>=0;i--){
+      const event=events[i];
+      if(!event||event.local_id!==localId) continue;
+      if(sourceEventType&&event.source_event_type!==sourceEventType) continue;
+      const next={
+        ...event,
+        ...(patch||{}),
+        payload:{
+          ...(event.payload&&typeof event.payload==='object'?event.payload:{}),
+          ...((patch&&patch.payload&&typeof patch.payload==='object')?patch.payload:{}),
+        },
+      };
+      events[i]=next;
+      return next;
+    }
+    return null;
+  }
+  function _nextAnchorLocalSeq(){
+    _anchorLocalSeq+=1;
+    const cursor=Number(_runJournalReplayAfterSeq&&_runJournalReplayAfterSeq());
+    return (Number.isFinite(cursor)?cursor:0)+_anchorLocalSeq;
+  }
+  function _anchorSegmentSeq(){
+    const seq=Number(_assistantSegmentSeq||_currentLiveSegmentSeq||0);
+    return Number.isFinite(seq)&&seq>0?seq:1;
+  }
+  function _anchorSceneActiveMode(){
+    const normalize=value=>value==='transparent_stream'||value==='compact_worklog'?value:'';
+    if(typeof window!=='undefined'){
+      if(typeof window.chatActivityMode==='function'){
+        try{
+          const mode=normalize(window.chatActivityMode());
+          if(mode) return mode;
+        }catch(_){}
+      }
+      const displayMode=normalize(window._chatActivityDisplayMode);
+      if(displayMode) return displayMode;
+      if(window._transparentStream) return 'transparent_stream';
+    }
+    return 'compact_worklog';
+  }
+  function _anchorSceneRowDisplayHintForMode(row, sceneMode){
+    const hints=row&&typeof row==='object'&&row.display_hints&&typeof row.display_hints==='object'
+      ? row.display_hints
+      : null;
+    if(sceneMode==='transparent_stream') return (hints&&hints.transparent_stream)||'chronological_activity';
+    if(sceneMode==='compact_worklog') return (hints&&hints.compact_worklog)||row.display_hint||'activity_row';
+    return row&&row.display_hint||'activity_row';
+  }
+  function _renderAnchorLiveScene(){
+    if(!_anchorRegistry||!_isActiveSession()) return false;
+    if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
+    try{
+      return !!window._renderLiveAnchorActivitySceneForStream(streamId, activeSid, {
+        mode:_anchorSceneActiveMode(),
+      });
+    }catch(err){
+      if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
+        _anchorShadowWarned=true;
+        console.warn('assistant turn anchor live scene render failed',err);
+      }
+      return false;
+    }
+  }
+  function _projectLiveAnchorActivityScene(){
+    if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.projectAssistantTurnAnchorActivityScene!=='function') return null;
+    try{
+      return _anchorApi.projectAssistantTurnAnchorActivityScene(_anchorRegistry,{mode:_anchorSceneActiveMode()});
+    }catch(_){
+      return null;
+    }
+  }
+  function _anchorSceneMessageRef(message){
+    if(!message||typeof message!=='object') return '';
+    let content=message.content||'';
+    if(Array.isArray(content)){
+      try{
+        content=content.map(part=>{
+          if(part&&typeof part==='object') return part.text||part.content||part.input_text||'';
+          return String(part||'');
+        }).join('\n');
+      }catch(_){ content=''; }
+    }
+    const payload={
+      role:String(message.role||''),
+      content:String(content||'').replace(/\s+/g,' ').trim(),
+      timestamp:message._ts||message.timestamp||'',
+    };
+    return JSON.stringify(payload);
+  }
+  function _anchorSceneMessageText(message){
+    if(!message||typeof message!=='object') return '';
+    let content=message.content||'';
+    if(Array.isArray(content)){
+      try{
+        content=content.map(part=>{
+          if(part&&typeof part==='object') return part.text||part.content||part.input_text||'';
+          return String(part||'');
+        }).join('\n');
+      }catch(_){ content=''; }
+    }
+    return typeof content==='string'?content:String(content||'');
+  }
+  function _anchorSceneContentText(part){
+    if(part===undefined||part===null) return '';
+    if(typeof part==='string') return part;
+    if(typeof part!=='object') return String(part||'');
+    return String(part.text||part.content||part.input_text||part.output_text||part.thinking||part.reasoning||part.summary||'');
+  }
+  function _anchorSceneContentVisibleText(part){
+    if(part===undefined||part===null) return '';
+    if(typeof part==='string') return part;
+    if(typeof part!=='object') return String(part||'');
+    const partType=String(part.type||'');
+    if(partType==='thinking'||partType==='reasoning') return '';
+    const contentText=(partType==='text'||partType==='input_text'||partType==='output_text')?part.content:'';
+    return String(part.text||part.input_text||part.output_text||contentText||'');
+  }
+  function _anchorSceneMessageHasContentToolUse(message){
+    return !!(message&&Array.isArray(message.content)&&message.content.some(part=>part&&typeof part==='object'&&part.type==='tool_use'));
+  }
+  function _anchorSceneFinalAnswerText(message){
+    if(!_anchorSceneMessageHasContentToolUse(message)) return _anchorSceneMessageText(message);
+    const content=Array.isArray(message.content)?message.content:[];
+    let lastToolIndex=-1;
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(part&&typeof part==='object'&&part.type==='tool_use') lastToolIndex=i;
+    }
+    const tailText=content.slice(lastToolIndex+1)
+      .map(part=>_anchorSceneContentVisibleText(part))
+      .filter(text=>_anchorSceneCleanText(text))
+      .join('\n');
+    return _anchorSceneCleanText(tailText)?tailText:'';
+  }
+  function _anchorSceneCleanText(value){
+    return String(value||'').replace(/\s+/g,' ').trim();
+  }
+  function _anchorSceneTextKey(value){
+    return _anchorSceneCleanText(value).toLowerCase();
+  }
+  function _anchorSceneSafePayload(value){
+    if(value===undefined) return undefined;
+    if(value===null||typeof value!=='object') return value;
+    try{
+      return JSON.parse(JSON.stringify(value));
+    }catch(_){
+      return String(value);
+    }
+  }
+  function _anchorSceneToolId(tool){
+    return String(tool&&(tool.tid||tool.id||tool.tool_call_id||tool.tool_use_id||tool.call_id)||'').trim();
+  }
+  function _anchorSceneToolName(tool){
+    const fn=tool&&tool.function&&typeof tool.function==='object'?tool.function:{};
+    return String(tool&&(tool.name||tool.tool_name)||fn.name||'tool').trim()||'tool';
+  }
+  function _anchorSceneToolArgs(tool){
+    if(!tool||typeof tool!=='object') return {};
+    if(tool.args&&typeof tool.args==='object') return _anchorSceneSafePayload(tool.args)||{};
+    if(tool.input&&typeof tool.input==='object') return _anchorSceneSafePayload(tool.input)||{};
+    const fn=tool.function&&typeof tool.function==='object'?tool.function:{};
+    if(typeof fn.arguments==='string'&&fn.arguments.trim()){
+      try{
+        const parsed=JSON.parse(fn.arguments);
+        return parsed&&typeof parsed==='object'?_anchorSceneSafePayload(parsed):{};
+      }catch(_){}
+    }
+    return {};
+  }
+  function _anchorSceneContentTool(part){
+    if(!part||typeof part!=='object') return {};
+    const fn=part.function&&typeof part.function==='object'?part.function:{};
+    return {
+      id:part.id||part.tid||part.tool_call_id||part.tool_use_id||part.call_id,
+      tid:part.tid||part.id||part.tool_call_id||part.tool_use_id||part.call_id,
+      tool_call_id:part.tool_call_id,
+      tool_use_id:part.tool_use_id,
+      call_id:part.call_id,
+      name:part.name||part.tool_name||fn.name||'tool',
+      tool_name:part.tool_name,
+      args:part.args,
+      input:part.input,
+      function:part.function,
+      command:part.command||part.raw_command||part.original_command||part.display_command,
+      preview:part.preview||part.summary,
+      snippet:part.snippet||part.result||part.output,
+      result:part.result,
+      output:part.output,
+      is_error:part.is_error,
+      error:part.error,
+      duration:part.duration,
+      started_at:part.started_at,
+    };
+  }
+  function _anchorSceneStringPayload(value){
+    if(value===undefined||value===null) return '';
+    if(typeof value==='string') return value;
+    try{
+      return JSON.stringify(value);
+    }catch(_){
+      return String(value);
+    }
+  }
+  function _anchorSceneRowBase(role, kind, sourceEventType, orderIndex, messageIndex){
+    const groupKey=Number.isFinite(Number(messageIndex))?`assistant:${Number(messageIndex)}`:`activity:${orderIndex}`;
+    return {
+      row_id:`settled:${activeSid||'session'}:${streamId||'stream'}:${role}:${messageIndex}:${orderIndex}`,
+      order_index:orderIndex,
+      kind,
+      role,
+      display_hint:role==='prose'?'main_prose':role==='thinking'?'collapsed_thinking':role==='tool'?'tool_row':role==='terminal'?'terminal_status_row':'activity_row',
+      display_hints:{
+        compact_worklog:role==='prose'?'main_prose':role==='thinking'?'collapsed_thinking':role==='tool'?'tool_row':role==='terminal'?'terminal_status_row':'activity_row',
+        transparent_stream:'chronological_activity',
+      },
+      source_event_type:sourceEventType,
+      event_id:null,
+      local_id:null,
+      run_id:null,
+      stream_id:streamId||null,
+      seq:orderIndex,
+      status:role==='terminal'?'completed':'completed',
+      created_at:null,
+      identity:{event_id:null,local_id:null,run_id:null,stream_id:streamId||null,seq:orderIndex},
+      group:{
+        group_key:groupKey,
+        activity_burst_id:null,
+        activity_segment_seq:null,
+        assistant_msg_idx:Number.isFinite(Number(messageIndex))?Number(messageIndex):null,
+      },
+      text:'',
+      thinking:null,
+      tool_call_id:null,
+      tool:null,
+      payload:{assistant_msg_idx:Number.isFinite(Number(messageIndex))?Number(messageIndex):null},
+    };
+  }
+  function _anchorSceneProseRow(text, orderIndex, messageIndex){
+    const row=_anchorSceneRowBase('prose','process_prose','settled_message',orderIndex,messageIndex);
+    row.text=String(text||'');
+    row.payload={...row.payload,text:row.text};
+    return row;
+  }
+  function _anchorSceneThinkingRow(text, orderIndex, messageIndex){
+    const row=_anchorSceneRowBase('thinking','reasoning','reasoning',orderIndex,messageIndex);
+    row.text=String(text||'');
+    const preview=_anchorSceneCleanText(text);
+    row.thinking={
+      text:row.text,
+      preview:preview.length>180?`${preview.slice(0,177)}...`:preview,
+      dedupe_key:preview?`thinking:${preview.toLowerCase()}`:'',
+    };
+    row.payload={...row.payload,text:row.text};
+    return row;
+  }
+  function _anchorSceneToolRowFromCall(tool, orderIndex, messageIndex){
+    const row=_anchorSceneRowBase('tool','tool_completed','tool_complete',orderIndex,messageIndex);
+    const tid=_anchorSceneToolId(tool);
+    const name=_anchorSceneToolName(tool);
+    const args=_anchorSceneToolArgs(tool);
+    const command=_anchorSceneStringPayload(tool&&(tool.command||tool.raw_command||tool.original_command||tool.display_command))||_anchorSceneStringPayload(args&&(args.cmd||args.command));
+    const preview=_anchorSceneStringPayload(tool&&(tool.preview||tool.summary));
+    const snippet=_anchorSceneStringPayload(tool&&(tool.snippet||tool.result||tool.output));
+    const isError=!!(tool&&(tool.is_error||tool.error));
+    row.row_id=tid?`settled:${activeSid||'session'}:${streamId||'stream'}:tool:${tid}`:row.row_id;
+    row.tool_call_id=tid||null;
+    row.tool={
+      id:tid||null,
+      name,
+      args,
+      command,
+      preview,
+      snippet,
+      result:_anchorSceneSafePayload(tool&&tool.result)??null,
+      output:_anchorSceneSafePayload(tool&&tool.output)??null,
+      done:true,
+      is_error:isError,
+      duration:tool&&tool.duration!==undefined?tool.duration:null,
+      started_at:tool&&tool.started_at!==undefined?tool.started_at:null,
+      signature:[name,tid||'',JSON.stringify(args||{})].join('|'),
+    };
+    row.payload={
+      ...row.payload,
+      tid:tid||undefined,
+      id:tid||undefined,
+      name,
+      args,
+      command,
+      preview,
+      snippet,
+      is_error:isError,
+      duration:tool&&tool.duration!==undefined?tool.duration:undefined,
+      started_at:tool&&tool.started_at!==undefined?tool.started_at:undefined,
+    };
+    return row;
+  }
+  function _anchorSceneToolRowName(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    return String(tool.name||payload.name||'tool').trim().toLowerCase();
+  }
+  function _anchorSceneToolRowId(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    return String(
+      (row&&row.tool_call_id)||
+      tool.id||
+      tool.tid||
+      tool.tool_call_id||
+      tool.tool_use_id||
+      tool.call_id||
+      payload.tid||
+      payload.id||
+      ''
+    ).trim();
+  }
+  function _anchorSceneToolRowsHaveNonConflictingIds(existing, incoming){
+    const existingId=_anchorSceneToolRowId(existing);
+    const incomingId=_anchorSceneToolRowId(incoming);
+    return !existingId||!incomingId||existingId===incomingId;
+  }
+  function _anchorSceneToolRowsHaveDifferentExplicitIds(existing, incoming){
+    const existingId=_anchorSceneToolRowId(existing);
+    const incomingId=_anchorSceneToolRowId(incoming);
+    return !!existingId&&!!incomingId&&existingId!==incomingId;
+  }
+  function _anchorSceneToolRowStartedAt(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const value=tool.started_at!==undefined&&tool.started_at!==null&&tool.started_at!==''?tool.started_at:payload.started_at;
+    return value!==undefined&&value!==null&&value!==''?String(value):'';
+  }
+  function _anchorSceneToolRowsHaveSameStartedAt(existing, incoming){
+    const existingStartedAt=_anchorSceneToolRowStartedAt(existing);
+    const incomingStartedAt=_anchorSceneToolRowStartedAt(incoming);
+    return !!existingStartedAt&&!!incomingStartedAt&&existingStartedAt===incomingStartedAt;
+  }
+  function _anchorSceneToolRowBodyText(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    for(const value of [tool.snippet,payload.snippet,tool.output,payload.output,tool.result,payload.result,tool.preview,payload.preview]){
+      const text=_anchorSceneStringPayload(value).trim();
+      if(text) return text;
+    }
+    return '';
+  }
+  function _anchorSceneToolRowsHaveCompatibleBody(existing, incoming){
+    const existingBody=_anchorSceneToolRowBodyText(existing);
+    const incomingBody=_anchorSceneToolRowBodyText(incoming);
+    return !!existingBody&&!!incomingBody&&(
+      existingBody===incomingBody||
+      existingBody.startsWith(incomingBody)||
+      incomingBody.startsWith(existingBody)
+    );
+  }
+  function _anchorSceneToolRowsHaveCompatibleNames(existing, incoming){
+    const existingName=_anchorSceneToolRowName(existing);
+    const incomingName=_anchorSceneToolRowName(incoming);
+    return !existingName||!incomingName||existingName==='tool'||incomingName==='tool'||existingName===incomingName;
+  }
+  function _anchorSceneToolRowArgs(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const args=(tool.args&&typeof tool.args==='object'&&!Array.isArray(tool.args))?tool.args:payload.args;
+    return args&&typeof args==='object'&&!Array.isArray(args)?args:null;
+  }
+  function _anchorSceneObjectContainsSubset(base, subset){
+    if(!base||!subset||typeof base!=='object'||typeof subset!=='object') return false;
+    const stableStringify=(candidate)=>{
+      const normalize=(value)=>{
+        if(!value||typeof value!=='object') return value;
+        if(Array.isArray(value)) return value.map(normalize);
+        const normalized={};
+        Object.keys(value).sort().forEach((key)=>{normalized[key]=normalize(value[key]);});
+        return normalized;
+      };
+      try{return JSON.stringify(normalize(candidate));}catch(_){return JSON.stringify(candidate);}
+    };
+    for(const [key,value] of Object.entries(subset)){
+      if(!Object.prototype.hasOwnProperty.call(base,key)) return false;
+      if(stableStringify(base[key])!==stableStringify(value)) return false;
+    }
+    return true;
+  }
+  function _anchorSceneToolRowsHaveCompatibleInvocation(existing, incoming){
+    const existingTool=existing&&existing.tool&&typeof existing.tool==='object'?existing.tool:{};
+    const incomingTool=incoming&&incoming.tool&&typeof incoming.tool==='object'?incoming.tool:{};
+    const existingPayload=existing&&existing.payload&&typeof existing.payload==='object'?existing.payload:{};
+    const incomingPayload=incoming&&incoming.payload&&typeof incoming.payload==='object'?incoming.payload:{};
+    const existingCommand=_anchorSceneStringPayload(existingTool.command||existingPayload.command).trim();
+    const incomingCommand=_anchorSceneStringPayload(incomingTool.command||incomingPayload.command).trim();
+    if(existingCommand&&incomingCommand) return existingCommand===incomingCommand;
+    const existingArgs=_anchorSceneToolRowArgs(existing);
+    const incomingArgs=_anchorSceneToolRowArgs(incoming);
+    if(!existingArgs||!incomingArgs||!Object.keys(existingArgs).length||!Object.keys(incomingArgs).length) return false;
+    return _anchorSceneObjectContainsSubset(existingArgs,incomingArgs)||_anchorSceneObjectContainsSubset(incomingArgs,existingArgs);
+  }
+  function _anchorSceneToolRowHasInvocationEvidence(row){
+    const tool=row&&row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row&&row.payload&&typeof row.payload==='object'?row.payload:{};
+    const command=_anchorSceneStringPayload(tool.command||payload.command).trim();
+    const args=_anchorSceneToolRowArgs(row);
+    return !!command||!!(args&&Object.keys(args).length);
+  }
+  function _anchorSceneToolRowsCanNameMatch(existing, incoming){
+    if(!_anchorSceneToolRowsHaveCompatibleNames(existing,incoming)) return false;
+    if(_anchorSceneToolRowHasInvocationEvidence(existing)&&_anchorSceneToolRowHasInvocationEvidence(incoming)){
+      return _anchorSceneToolRowsHaveCompatibleInvocation(existing,incoming);
+    }
+    return true;
+  }
+  function _anchorSceneMatchingContentToolRow(contentToolRows, incomingRow, ordinal, usedRows, incomingTotal, idFlexibleRows){
+    if(!Array.isArray(contentToolRows)||!incomingRow) return null;
+    const incomingTid=incomingRow.tool_call_id||(incomingRow.tool&&incomingRow.tool.id);
+    for(const row of contentToolRows){
+      if(!row||usedRows.has(row)) continue;
+      const tid=row.tool_call_id||(row.tool&&row.tool.id);
+      if(tid&&incomingTid&&tid===incomingTid) return row;
+    }
+    if(contentToolRows.length===1&&Number(incomingTotal)===1){
+      const onlyRow=contentToolRows[0];
+      if(onlyRow&&!usedRows.has(onlyRow)&&_anchorSceneToolRowsCanNameMatch(onlyRow,incomingRow)) return onlyRow;
+    }
+    const availableRows=contentToolRows.filter(row=>row&&!usedRows.has(row));
+    if(availableRows.length===1){
+      if(Number(incomingTotal)===1&&_anchorSceneToolRowsCanNameMatch(availableRows[0],incomingRow)) return availableRows[0];
+      if(
+        _anchorSceneToolRowsHaveCompatibleNames(availableRows[0],incomingRow)&&
+        _anchorSceneToolRowsHaveCompatibleInvocation(availableRows[0],incomingRow)
+      ) return availableRows[0];
+    }
+    const reusableRows=contentToolRows.filter(row=>row&&usedRows.has(row));
+    if(
+      reusableRows.length===1&&
+      Number(incomingTotal)===1&&
+      (
+        (
+          _anchorSceneToolRowId(reusableRows[0])&&
+          _anchorSceneToolRowId(incomingRow)&&
+          _anchorSceneToolRowId(reusableRows[0])===_anchorSceneToolRowId(incomingRow)
+        )||
+        (
+          idFlexibleRows&&
+          idFlexibleRows.has(reusableRows[0])&&
+          _anchorSceneToolRowsHaveSameStartedAt(reusableRows[0],incomingRow)&&
+          _anchorSceneToolRowsHaveCompatibleBody(reusableRows[0],incomingRow)
+        )
+      )&&
+      _anchorSceneToolRowsHaveCompatibleNames(reusableRows[0],incomingRow)&&
+      _anchorSceneToolRowsHaveCompatibleInvocation(reusableRows[0],incomingRow)
+    ) return reusableRows[0];
+    for(const row of contentToolRows){
+      if(!row||usedRows.has(row)) continue;
+      const tid=row.tool_call_id||(row.tool&&row.tool.id);
+      if(!tid&&!incomingTid&&_anchorSceneToolRowsCanNameMatch(row,incomingRow)) return row;
+    }
+    return null;
+  }
+  function _anchorSceneMessageReasoningText(message){
+    if(!message||typeof message!=='object') return '';
+    return String(message.reasoning||message._reasoning||message.reasoning_content||message.thinking||'');
+  }
+  function _anchorSceneRowsFromContentParts(message, messageIndex, options){
+    if(!_anchorSceneMessageHasContentToolUse(message)) return null;
+    options=(options&&typeof options==='object')?options:{};
+    const isFinalMessage=!!options.isFinalMessage;
+    const rows=[];
+    const content=Array.isArray(message.content)?message.content:[];
+    let lastToolIndex=-1;
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(part&&typeof part==='object'&&part.type==='tool_use') lastToolIndex=i;
+    }
+    for(let i=0;i<content.length;i+=1){
+      const part=content[i];
+      if(!part||typeof part!=='object'){
+        if(isFinalMessage&&i>lastToolIndex) continue;
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneProseRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='text'||part.type==='input_text'||part.type==='output_text'){
+        if(isFinalMessage&&i>lastToolIndex&&_anchorSceneContentVisibleText(part)) continue;
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneProseRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='thinking'||part.type==='reasoning'){
+        const text=_anchorSceneContentText(part);
+        if(_anchorSceneCleanText(text)) rows.push(_anchorSceneThinkingRow(text,rows.length,messageIndex));
+        continue;
+      }
+      if(part.type==='tool_use'){
+        rows.push(_anchorSceneToolRowFromCall(_anchorSceneContentTool(part),rows.length,messageIndex));
+      }
+    }
+    return rows;
+  }
+  // #4622: a settled tool row built from messages[].tool_calls (state.db/sidecar)
+  // can lack the result body — terminal stdout, or the diff/output that a
+  // patch/edit card renders — because the persisted row carries only a short
+  // preview (or, on a cold/paginated load, nothing). The full body lives on the
+  // live S.toolCalls entry at settle time. When a settled row and a live call
+  // match by tool id, restore the missing body fields from the live call onto
+  // the settled row's tool+payload (only when the settled value is empty — never
+  // clobber a genuine persisted body), so the rebuilt card shows full output +
+  // the Show-more expander + the rendered diff. Returns true if it enriched.
+  function _enrichSettledToolRowBodyFromLive(row, live){
+    if(!row||typeof row!=='object'||!live||typeof live!=='object') return false;
+    const tool=(row.tool&&typeof row.tool==='object')?row.tool:(row.tool={});
+    const payload=(row.payload&&typeof row.payload==='object')?row.payload:(row.payload={});
+    let enriched=false;
+    const _empty=v=>v===undefined||v===null||v==='';
+    // Result body: _anchorSceneToolCallFromRow renders tool.snippet||payload.snippet
+    // (||payload.result||payload.output) as the card output + diff source, so
+    // restore the snippet onto both tool+payload when the settled row has none.
+    const liveSnippet=_anchorSceneStringPayload(live.snippet||live.result||live.output);
+    // Restore the live body when the settled snippet is missing OR is a bounded
+    // preview of the live one. The backend persists a capped preview
+    // (_TOOL_RESULT_SNIPPET_MAX = 4000 chars in api/streaming.py), so a long
+    // terminal/tool output settles to that 4000-char prefix, not to empty —
+    // #4622's actual symptom. Treat a settled snippet as restorable when the
+    // live snippet is strictly longer AND the settled value is a prefix of it
+    // AND the settled value is at/over the persistence cap (i.e. it's a
+    // truncated preview, not a genuinely short real value we must not clobber).
+    const _SETTLED_SNIPPET_CAP=4000;
+    const _isBoundedPreview=(settled,full)=>(
+      typeof settled==='string'&&typeof full==='string'&&
+      full.length>settled.length&&settled.length>=_SETTLED_SNIPPET_CAP&&
+      full.startsWith(settled)
+    );
+    const _settledSnippet=(!_empty(tool.snippet)?tool.snippet:(!_empty(payload.snippet)?payload.snippet:''));
+    const _snippetRestorable=(_empty(tool.snippet)&&_empty(payload.snippet))||_isBoundedPreview(_settledSnippet,liveSnippet);
+    if(liveSnippet&&_snippetRestorable){
+      tool.snippet=liveSnippet; payload.snippet=liveSnippet; enriched=true;
+    }
+    // Command (shell detail-lead) + args (diff/input reconstruction, the "Full" tab).
+    const liveCommand=_anchorSceneStringPayload(live.command||live.raw_command);
+    if(liveCommand&&_empty(tool.command)&&_empty(payload.command)){
+      tool.command=liveCommand; payload.command=liveCommand; enriched=true;
+    }
+    if(!_empty(live.started_at)&&_empty(tool.started_at)&&_empty(payload.started_at)){
+      tool.started_at=live.started_at; payload.started_at=live.started_at; enriched=true;
+    }
+    const liveArgs=_anchorSceneToolArgs(live);
+    if(liveArgs&&typeof liveArgs==='object'&&Object.keys(liveArgs).length){
+      const mergeMissingArgs=(existing)=>{
+        const base=(existing&&typeof existing==='object'&&!Array.isArray(existing))?{...existing}:{};
+        let changed=!(existing&&typeof existing==='object'&&!Array.isArray(existing));
+        for(const [key,value] of Object.entries(liveArgs)){
+          if(!Object.prototype.hasOwnProperty.call(base,key)){
+            base[key]=value;
+            changed=true;
+          }
+        }
+        return changed?base:existing;
+      };
+      const nextToolArgs=mergeMissingArgs(tool.args);
+      const nextPayloadArgs=mergeMissingArgs(payload.args);
+      if(nextToolArgs!==tool.args){ tool.args=nextToolArgs; enriched=true; }
+      if(nextPayloadArgs!==payload.args){ payload.args=nextPayloadArgs; enriched=true; }
+    }
+    return enriched;
+  }
+  function _anchorSceneRowsByMessageIndex(messages, turnStart, lastAsstIndex, options){
+    options=(options&&typeof options==='object')?options:{};
+    const byIdx=new Map();
+    const add=(idx,row)=>{
+      if(!byIdx.has(idx)) byIdx.set(idx,[]);
+      byIdx.get(idx).push(row);
+    };
+    // Pre-index S.toolCalls by assistant_msg_idx for O(m+n) lookup
+    const toolsByIdx=new Map();
+    if(S.toolCalls) for(const tc of S.toolCalls){
+      const ti=typeof tc.toolIdx==='number'? tc.toolIdx : parseInt(tc.assistant_msg_idx,10);
+      if(Number.isFinite(ti)){
+        if(!toolsByIdx.has(ti)) toolsByIdx.set(ti,[]);
+        toolsByIdx.get(ti).push(tc);
+      }
+    }
+    let encounter=0;
+    const endIndex=options&&options.includeFinal?lastAsstIndex+1:lastAsstIndex;
+    for(let idx=turnStart+1;idx<endIndex;idx+=1){
+      const message=messages[idx];
+      if(!message||message.role!=='assistant') continue;
+      const pool=[];
+      const text=_anchorSceneMessageText(message);
+      const contentRows=_anchorSceneRowsFromContentParts(message,idx,{isFinalMessage:idx===lastAsstIndex});
+      const hasOrderedContentRows=Array.isArray(contentRows)&&contentRows.length>0;
+      const contentToolRows=[];
+      const usedContentToolRows=new Set();
+      const idFlexibleContentToolRows=new Set();
+      const seenToolIds=new Set();
+      const rowByToolId=new Map();
+      if(hasOrderedContentRows){
+        for(const row of contentRows){
+          pool.push({...row,_phase:1,_encounter:encounter++,_fromContent:true});
+          const tid=row.tool_call_id||(row.tool&&row.tool.id);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
+          if(row.role==='tool') contentToolRows.push(row);
+        }
+      }else if(_anchorSceneCleanText(text)){
+        pool.push({..._anchorSceneProseRow(text,0,idx),_phase:2,_encounter:encounter++});
+      }
+      const reasoning=_anchorSceneMessageReasoningText(message);
+      if(_anchorSceneCleanText(reasoning)&&_anchorSceneTextKey(reasoning)!==_anchorSceneTextKey(text)){
+        pool.push({..._anchorSceneThinkingRow(reasoning,0,idx),_phase:0,_encounter:encounter++});
+      }
+      const messageTools=[];
+      if(Array.isArray(message.tool_calls)) messageTools.push(...message.tool_calls);
+      if(Array.isArray(message._partial_tool_calls)) messageTools.push(...message._partial_tool_calls);
+      let messageToolOrdinal=0;
+      for(const tool of messageTools){
+        const row=_anchorSceneToolRowFromCall(tool,0,idx);
+        const tid=row.tool_call_id||(row.tool&&row.tool.id);
+        if(tid&&seenToolIds.has(tid)){
+          const existing=rowByToolId.get(tid);
+          if(existing){
+            _enrichSettledToolRowBodyFromLive(existing, tool);
+            if(contentToolRows.includes(existing)) usedContentToolRows.add(existing);
+          }
+          messageToolOrdinal+=1;
+          continue;
+        }
+        const contentMatch=_anchorSceneMatchingContentToolRow(contentToolRows,row,messageToolOrdinal,usedContentToolRows,messageTools.length,idFlexibleContentToolRows);
+        if(contentMatch){
+          if(_anchorSceneToolRowsHaveDifferentExplicitIds(contentMatch,row)) idFlexibleContentToolRows.add(contentMatch);
+          _enrichSettledToolRowBodyFromLive(contentMatch, tool);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,contentMatch); }
+          usedContentToolRows.add(contentMatch);
+          messageToolOrdinal+=1;
+          continue;
+        }
+        pool.push({...row,_phase:1,_encounter:encounter++});
+        if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
+        messageToolOrdinal+=1;
+      }
+      // Merge S.toolCalls for this index, dedup by tool id. When a live call
+      // matches a settled row already in the pool, don't just skip it —
+      // restore any result body the settled row is missing (#4622): the live
+      // S.toolCalls entry carries the full terminal output / patch diff that the
+      // persisted state.db row may have dropped to a short preview or nothing.
+      let liveToolOrdinal=0;
+      for(const tool of (toolsByIdx.get(idx)||[])){
+        if(!tool||typeof tool!=='object') continue;
+        const toolIdx=Number(tool.assistant_msg_idx);
+        if(!Number.isFinite(toolIdx)||toolIdx!==idx) continue;
+        const row=_anchorSceneToolRowFromCall(tool,0,idx);
+        const tid=row.tool_call_id||(row.tool&&row.tool.id);
+        if(tid&&seenToolIds.has(tid)){
+          const existing=rowByToolId.get(tid);
+          if(existing){
+            _enrichSettledToolRowBodyFromLive(existing, tool);
+            if(contentToolRows.includes(existing)) usedContentToolRows.add(existing);
+          }
+          liveToolOrdinal+=1;
+          continue;
+        }
+        const liveTools=toolsByIdx.get(idx)||[];
+        const contentMatch=_anchorSceneMatchingContentToolRow(contentToolRows,row,liveToolOrdinal,usedContentToolRows,liveTools.length,idFlexibleContentToolRows);
+        if(contentMatch){
+          if(_anchorSceneToolRowsHaveDifferentExplicitIds(contentMatch,row)) idFlexibleContentToolRows.add(contentMatch);
+          _enrichSettledToolRowBodyFromLive(contentMatch, tool);
+          if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,contentMatch); }
+          usedContentToolRows.add(contentMatch);
+          liveToolOrdinal+=1;
+          continue;
+        }
+        if(tid){ seenToolIds.add(tid); rowByToolId.set(tid,row); }
+        pool.push({...row,_phase:1,_encounter:encounter++});
+        liveToolOrdinal+=1;
+      }
+      // Stable sort by (phase, started_at, encounter). Once a message has an
+      // ordered content[] scene, preserve that content bucket order exactly.
+      const useStartedAt=!hasOrderedContentRows;
+      pool.sort((a,b)=>{
+        if(a._phase!==b._phase) return a._phase-b._phase;
+        if(useStartedAt){
+          const aTime=(a.tool&&a.tool.started_at!=null)?a.tool.started_at:Infinity;
+          const bTime=(b.tool&&b.tool.started_at!=null)?b.tool.started_at:Infinity;
+          if(aTime!==bTime) return aTime-bTime;
+        }
+        return a._encounter-b._encounter;
+      });
+      // Emit with sequential order_index values, strip temp props.
+      // Rows were built with orderIndex=0, so their row_id/seq still encode 0.
+      // Rewrite order_index AND regenerate the index-derived identity fields
+      // (row_id/seq) from the final per-bucket position, so two anonymous rows
+      // (no tool id) at the same message index don't collide on the same row_id
+      // and get silently deduped by _completeSettledAnchorSceneForTurn().
+      for(const row of pool){
+        const {_phase,_encounter,_fromContent,...clean}=row;
+        const oi=byIdx.has(idx)?byIdx.get(idx).length:0;
+        clean.order_index=oi;
+        clean.seq=oi;
+        if(clean.identity&&typeof clean.identity==='object') clean.identity={...clean.identity,seq:oi};
+        // Tool rows with a tool id carry a tid-based row_id (already unique) —
+        // only regenerate the default index-based row_id form.
+        const indexRowId=`settled:${activeSid||'session'}:${streamId||'stream'}:${clean.role}:${idx}:0`;
+        if(clean.row_id===indexRowId){
+          clean.row_id=`settled:${activeSid||'session'}:${streamId||'stream'}:${clean.role}:${idx}:${oi}`;
+        }
+        add(idx,clean);
+      }
+    }
+    return byIdx;
+  }
+  function _anchorSceneExistingRowKey(row){
+    if(!row||typeof row!=='object') return '';
+    if(row.role==='tool'){
+      const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
+      return `tool:${row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id||row.row_id||''}`;
+    }
+    if(row.role==='prose'||row.role==='thinking') return `${row.role}:${_anchorSceneTextKey(row.text)}`;
+    return `${row.role||row.kind}:${row.source_event_type||''}:${row.status||''}:${row.row_id||''}`;
+  }
+  function _anchorSceneRowHasLiveIdentity(row){
+    if(!row||typeof row!=='object') return false;
+    const identity=row.identity&&typeof row.identity==='object'?row.identity:{};
+    const values=[row.row_id,row.local_id,row.event_id,identity.local_id,identity.event_id];
+    return values.some(value=>String(value||'').startsWith('live-'));
+  }
+  function _anchorSceneMessageRowsHaveThinking(messageRows){
+    if(!(messageRows instanceof Map)) return false;
+    for(const bucket of messageRows.values()){
+      if(Array.isArray(bucket)&&bucket.some(row=>row&&row.role==='thinking')) return true;
+    }
+    return false;
+  }
+  function _anchorSceneSettleLiveRunningRow(row, hasSettledThinking){
+    if(!row||typeof row!=='object') return row;
+    if(row.role!=='thinking'&&row.role!=='prose'&&row.role!=='tool') return row;
+    if(String(row.status||'').toLowerCase()!=='running') return row;
+    if(!_anchorSceneRowHasLiveIdentity(row)) return row;
+    if(row.role==='thinking'&&hasSettledThinking) return null;
+    return {...row,status:'completed'};
+  }
+  function _anchorSceneRowLooksLikeFinalAnswer(rowTextKey, finalKey){
+    if(!rowTextKey||!finalKey) return false;
+    if(rowTextKey===finalKey) return true;
+    // #4587: align with the renderer's _anchorSceneProseMatchesFinalAnswer — a
+    // prefix-like overlap only counts as "the final answer" (and is dropped from
+    // the scene) when it's a NEAR-complete match (ratio>=0.9). A shorter
+    // intermediate-prose row that merely happens to be a prefix of the final
+    // answer is legitimate progress narration and must be PRESERVED, not dropped.
+    if(!(finalKey.startsWith(rowTextKey)||rowTextKey.startsWith(finalKey))) return false;
+    const shorter=Math.min(rowTextKey.length,finalKey.length);
+    const longer=Math.max(rowTextKey.length,finalKey.length);
+    return shorter>=80&&longer>0&&(shorter/longer)>=0.9;
+  }
+  function _anchorSceneRowTextOverlapsExisting(rowTextKey, seenTextKeys){
+    if(!rowTextKey||!Array.isArray(seenTextKeys)) return false;
+    for(const existing of seenTextKeys){
+      if(!existing) continue;
+      if(rowTextKey===existing) return true;
+      const minLen=Math.min(rowTextKey.length,existing.length);
+      if(minLen>=80&&(rowTextKey.includes(existing)||existing.includes(rowTextKey))) return true;
+    }
+    return false;
+  }
+  function _anchorSceneTurnDurationForSettlement(lastAsst, base){
+    if(lastAsst&&lastAsst._turnDuration!==undefined&&lastAsst._turnDuration!==null) return lastAsst._turnDuration;
+    if(base&&base.turn_duration!==undefined&&base.turn_duration!==null) return base.turn_duration;
+    const session=(typeof S!=='undefined'&&S&&S.session)?S.session:null;
+    // The `pending_started_at` fallback below is the START of an IN-FLIGHT turn.
+    // For a SETTLED turn that recorded no live duration, computing
+    // `now - pending_started_at` is wrong: pending_started_at is either stale
+    // (left over from an earlier turn / a session that sat idle) or belongs to a
+    // different, still-pending turn — which rendered a bogus "Processed 15h 32m"
+    // on fresh conversations (#4930). Only use it while a turn is actually in
+    // flight; otherwise show no duration rather than a fabricated one.
+    const turnInFlight=!!(session&&(session.active_stream_id||session.pending_user_message));
+    if(!turnInFlight) return undefined;
+    const candidates=[
+      session&&session.pending_started_at,
+      session&&session.active_started_at,
+      session&&session.run_started_at,
+      session&&session.started_at,
+    ];
+    for(const raw of candidates){
+      const started=Number(raw);
+      if(Number.isFinite(started)&&started>0){
+        const elapsed=(Date.now()/1000)-started;
+        if(Number.isFinite(elapsed)&&elapsed>=0) return elapsed;
+      }
+    }
+    return undefined;
+  }
+  function _completeSettledAnchorSceneForTurn(messages, lastAsstIndex, projectedScene){
+    if(!Array.isArray(messages)||lastAsstIndex<0) return projectedScene;
+    const lastAsst=messages[lastAsstIndex];
+    if(!lastAsst||lastAsst.role!=='assistant') return projectedScene;
+    let turnStart=-1;
+    for(let idx=lastAsstIndex-1;idx>=0;idx-=1){
+      if(messages[idx]&&messages[idx].role==='user'){
+        turnStart=idx;
+        break;
+      }
+    }
+    const base=(projectedScene&&typeof projectedScene==='object')?projectedScene:{};
+    const sceneMode=base.mode==='transparent_stream'?'transparent_stream':_anchorSceneActiveMode();
+    const messageFinalAnswer=_anchorSceneFinalAnswerText(lastAsst);
+    const finalAnswer=_anchorSceneCleanText(messageFinalAnswer)
+      ? messageFinalAnswer
+      : (typeof base.final_answer==='string'?base.final_answer:'');
+    const finalKey=_anchorSceneTextKey(finalAnswer);
+    const messageRows=_anchorSceneRowsByMessageIndex(messages,turnStart,lastAsstIndex,{includeFinal:true});
+    const hasSettledThinking=_anchorSceneMessageRowsHaveThinking(messageRows);
+    const rows=[];
+    const seen=new Set();
+    const seenTextKeys=[];
+    const pushRow=(row)=>{
+      if(!row||typeof row!=='object') return;
+      row=_anchorSceneSettleLiveRunningRow(row,hasSettledThinking);
+      if(!row||typeof row!=='object') return;
+      const textKey=_anchorSceneTextKey(row.text);
+      const isTextual=row.role==='prose'||row.role==='thinking';
+      if(isTextual&&_anchorSceneRowLooksLikeFinalAnswer(textKey,finalKey)) return;
+      if(isTextual&&_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
+      const key=_anchorSceneExistingRowKey(row);
+      if(key&&seen.has(key)) return;
+      if(key) seen.add(key);
+      if(isTextual&&textKey) seenTextKeys.push(textKey);
+      rows.push({
+        ...row,
+        display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode),
+        order_index:rows.length,
+        seq:rows.length,
+      });
+    };
+    const projectedRows=Array.isArray(base.activity_rows)?base.activity_rows:[];
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') continue;
+      pushRow(row);
+    }
+    for(let idx=turnStart+1;idx<=lastAsstIndex;idx+=1){
+      const bucket=messageRows.get(idx)||[];
+      for(const row of bucket) pushRow(row);
+    }
+    for(const row of projectedRows){
+      if(row&&row.role==='terminal') pushRow(row);
+    }
+    const scene={
+      ...base,
+      version:'activity_scene_v1',
+      mode:sceneMode,
+      identity:{
+        ...((base.identity&&typeof base.identity==='object')?base.identity:{}),
+        source_message_refs:messages.slice(turnStart+1,lastAsstIndex+1)
+          .filter(m=>m&&m.role==='assistant')
+          .map(m=>_anchorSceneMessageRef(m)),
+      },
+      lifecycle:(base.lifecycle&&typeof base.lifecycle==='object')?{...base.lifecycle}:{},
+      final_answer:_anchorSceneCleanText(finalAnswer)?finalAnswer:'',
+      final_message_ref:_anchorSceneMessageRef(lastAsst),
+      turn_duration:_anchorSceneTurnDurationForSettlement(lastAsst,base),
+      terminal_state:base.terminal_state||((base.lifecycle&&base.lifecycle.terminal_state)||null),
+      activity_rows:rows,
+    };
+    return scene;
+  }
+  let _persistAnchorSceneWarned=false;
+  function _anchorSceneMessageOffsetForPersist(){
+    const raw=(typeof _oldestIdx!=='undefined')?_oldestIdx:0;
+    const offset=Number(raw);
+    return Number.isFinite(offset)&&offset>0?Math.floor(offset):0;
+  }
+  function _anchorSceneAbsoluteMessageIndexForPersist(messageIndex, offset){
+    const idx=Number(messageIndex);
+    const off=Number(offset);
+    if(!Number.isFinite(idx)||idx<0) return messageIndex;
+    return idx+(Number.isFinite(off)&&off>0?Math.floor(off):0);
+  }
+  function _persistSettledAnchorScene(message, scene, messageIndex){
+    if(!activeSid||!message||!scene||typeof api!=='function') return;
+    try{
+      const messageOffset=_anchorSceneMessageOffsetForPersist();
+      api('/api/session/anchor-scene',{
+        method:'POST',
+        timeoutMs:8000,
+        timeoutToast:false,
+        body:JSON.stringify({
+          session_id:activeSid,
+          stream_id:streamId,
+          message_index:_anchorSceneAbsoluteMessageIndexForPersist(messageIndex,messageOffset),
+          message_window_index:messageIndex,
+          message_offset:messageOffset,
+          message_ref:_anchorSceneMessageRef(message),
+          scene,
+        }),
+      }).catch(err=>{
+        if(!_persistAnchorSceneWarned&&typeof console!=='undefined'&&console.warn){
+          _persistAnchorSceneWarned=true;
+          console.warn('anchor activity scene persistence failed',err);
+        }
+      });
+    }catch(err){
+      if(!_persistAnchorSceneWarned&&typeof console!=='undefined'&&console.warn){
+        _persistAnchorSceneWarned=true;
+        console.warn('anchor activity scene persistence failed',err);
+      }
+    }
+  }
+  function _anchorSceneHasWorklogWorthyRows(scene){
+    // A worklog (the collapsible "已处理 …" rail) is only meaningful when the turn
+    // actually DID worklog-worthy work — a tool call, a thinking/reasoning pass, or
+    // a compression lifecycle card. A turn that only streamed prose (e.g. a long
+    // plain-text answer, or a degeneration burst that flooded the body with repeated
+    // tokens) projects an activity scene whose rows are ALL `prose`/`terminal`. Folding
+    // such a turn into a collapsed worklog hides the whole answer and, at STREAM_DONE,
+    // shrinks the transcript by the full streamed height → the browser clamps a
+    // bottom-pinned viewport back to the top (the "jump back" report). Require at least
+    // one genuinely worklog-worthy row before promoting the turn to a worklog.
+    const rows=Array.isArray(scene&&scene.activity_rows)?scene.activity_rows:[];
+    for(const row of rows){
+      if(!row||typeof row!=='object') continue;
+      const role=String(row.role||'');
+      if(role==='tool'||role==='thinking') return true;
+      if(role==='lifecycle'){
+        const source=String(row.source_event_type||'');
+        // compression cards are worklog-worthy; a bare terminal/done lifecycle is not.
+        if(source==='compressing'||source==='compressed') return true;
+      }
+    }
+    return false;
+  }
+  function _attachProjectedAnchorSceneToLastAssistant(messages){
+    if(!_anchorRegistry||!Array.isArray(messages)) return false;
+    let lastAsst=null;
+    let lastAsstIndex=-1;
+    for(let i=messages.length-1;i>=0;i--){
+      const candidate=messages[i];
+      if(candidate&&candidate.role==='assistant'){
+        lastAsst=candidate;
+        lastAsstIndex=i;
+        break;
+      }
+    }
+    if(!lastAsst) return false;
+    const projectedScene=_projectLiveAnchorActivityScene();
+    const scene=_completeSettledAnchorSceneForTurn(messages,lastAsstIndex,projectedScene);
+    if(scene&&Array.isArray(scene.activity_rows)&&scene.activity_rows.length
+        &&_anchorSceneHasWorklogWorthyRows(scene)){
+      lastAsst._anchor_stream_id=streamId;
+      lastAsst._anchor_activity_scene=scene;
+      _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex);
+      return true;
+    }
+    return false;
+  }
+  function _upsertAnchorProcessProse(displayText, options={}){
+    const text=String(displayText||'').trim();
+    if(!text||!_anchorRegistry) return null;
+    const segmentSeq=Number(options.segmentSeq||_anchorSegmentSeq());
+    const localId=`live-prose:${streamId}:${segmentSeq}`;
+    const existing=_findAnchorActivityEventByLocalId(localId,'token');
+    if(existing){
+      const replaced=_replaceAnchorActivityEventByLocalId(localId,'token',{
+        status:options.sealed?'completed':'running',
+        payload:{text,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
+      });
+      _renderAnchorLiveScene();
+      return replaced;
+    }
+    _applyToAnchor('token',{
+      text,
+      local_id:localId,
+      seq:_nextAnchorLocalSeq(),
+      status:options.sealed?'completed':'running',
+      activitySegmentSeq:segmentSeq,
+      activityBurstId:_currentActivityBurstId,
+    },null);
+    return _findAnchorActivityEventByLocalId(localId,'token');
+  }
+  // Persistent incremental renderer for anchor-scene live prose rows. The compact
+  // worklog re-renders the whole scene each frame; rendering the growing prose via
+  // renderMd(fullText) every frame is O(n^2) over a long answer. Instead keep a
+  // per-segment smd parser + node (the SAME safe renderer as the main live body)
+  // and feed only the delta, then hand the persistent node back to the ui.js scene
+  // builder. Returns null whenever smd or a stable key is unavailable so the caller
+  // falls back to the full renderMd path — identical structure, just not
+  // incremental. (#5455 WS2.1)
+  const _anchorProseSmdCache = new Map();
+  function _anchorProseIncrementalNode(key, text){
+    if(!window.smd || !key || typeof _safeSmdRenderer!=='function') return null;
+    const value=String(text||'');
+    const fade=typeof _shouldUseLiveProseFade==='function'&&_shouldUseLiveProseFade();
+    try{
+      let st=_anchorProseSmdCache.get(key);
+      // Self-heal desyncs (edit/sanitize made the text no longer a pure append):
+      // rebuild the parser+node from scratch, mirroring _smdWrite's guard.
+      if(st && st.writtenText && !value.startsWith(st.writtenText)) st=null;
+      if(st && st.fade!==fade) st=null;
+      if(!st){
+        const node=document.createElement('div');
+        node.className='assistant-segment';
+        node.setAttribute('data-anchor-scene-prose','1');
+        const body=document.createElement('div');
+        body.className='msg-body';
+        if(body.classList) body.classList.toggle('stream-fade-active',fade);
+        node.appendChild(body);
+        const baseRenderer=fade?_streamFadeRenderer(body):_safeSmdRenderer(body);
+        const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
+        st={node,parser:window.smd.parser(renderer),writtenText:'',fade};
+        _anchorProseSmdCache.set(key,st);
+        // Bound memory across turns: keys embed the stream id, so stale entries
+        // from finished streams age out here.
+        if(_anchorProseSmdCache.size>32){
+          const oldest=_anchorProseSmdCache.keys().next().value;
+          if(oldest!==key) _anchorProseSmdCache.delete(oldest);
+        }
+      }
+      const body=st.node&&st.node.querySelector&&st.node.querySelector('.msg-body');
+      if(body&&body.classList) body.classList.toggle('stream-fade-active',fade);
+      const delta=value.slice(st.writtenText.length);
+      if(delta){
+        window.smd.parser_write(st.parser,delta);
+        st.writtenText=value;
+      }
+      st.node.dataset.rawText=value;
+      return st.node;
+    }catch(_){
+      _anchorProseSmdCache.delete(key);
+      return null;
+    }
+  }
+  window.__anchorProseIncrementalNode=_anchorProseIncrementalNode;
+  function _clearAnchorProseIncrementalNode(){
+    if(typeof window!=='undefined'&&window.__anchorProseIncrementalNode===_anchorProseIncrementalNode) window.__anchorProseIncrementalNode=null;
+    _anchorProseSmdCache.clear();
+  }
+  function _anchorHasReasoningEvents(){
+    const events=_anchorActivityEvents();
+    return !!(events&&events.some(event=>event&&event.source_event_type==='reasoning'));
+  }
+  function _upsertAnchorReasoning(text, options={}){
+    const clean=String(text||'').trim();
+    if(!clean||!_anchorRegistry||window._showThinking===false) return null;
+    const placement=_liveThinkingPlacement();
+    const segmentSeq=Number(options.segmentSeq||placement.segmentSeq||_anchorSegmentSeq());
+    const localId=String(options.localId||`live-reasoning:${streamId}:${segmentSeq}`);
+    const existing=_findAnchorActivityEventByLocalId(localId,'reasoning');
+    if(existing){
+      const replaced=_replaceAnchorActivityEventByLocalId(localId,'reasoning',{
+        status:options.sealed?'completed':'running',
+        payload:{text:clean,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
+      });
+      _renderAnchorLiveScene();
+      return replaced;
+    }
+    _applyToAnchor('reasoning',{
+      text:clean,
+      local_id:localId,
+      seq:_nextAnchorLocalSeq(),
+      status:options.sealed?'completed':'running',
+      activitySegmentSeq:segmentSeq,
+      activityBurstId:_currentActivityBurstId,
+    },null);
+    return _findAnchorActivityEventByLocalId(localId,'reasoning');
+  }
+  function _compactVisibleEchoText(value){
+    return String(value||'').replace(/\s+/g,'');
+  }
+  function _stripCompactEchoSuffix(value, suffix){
+    const raw=String(value||'');
+    const candidate=_compactVisibleEchoText(suffix);
+    if(!raw||!candidate) return {text:raw,removed:false};
+    const windowSize=Math.max(String(suffix||'').length*3,4096);
+    const offset=Math.max(0,raw.length-windowSize);
+    const tail=raw.slice(offset);
+    for(let idx=0;idx<=tail.length;idx+=1){
+      if(_compactVisibleEchoText(tail.slice(idx))===candidate){
+        return {text:raw.slice(0,offset+idx).trimEnd(),removed:true};
+      }
+    }
+    return {text:raw,removed:false};
+  }
+  function _stripAnchorReasoningEcho(visible){
+    const events=_anchorActivityEvents();
+    if(!events||!visible) return false;
+    for(let i=events.length-1;i>=0;i-=1){
+      const event=events[i];
+      if(!event||event.source_event_type!=='reasoning') continue;
+      const payload=(event.payload&&typeof event.payload==='object')?event.payload:{};
+      const rawText=String(payload.text||payload.reasoning||payload.thinking||'');
+      const stripped=_stripCompactEchoSuffix(rawText, visible);
+      if(!stripped.removed) continue;
+      const nextText=String(stripped.text||'').trim();
+      if(nextText){
+        _replaceAnchorActivityEventByLocalId(event.local_id,'reasoning',{
+          payload:{text:nextText},
+        });
+      }else{
+        events.splice(i,1);
+      }
+      _renderAnchorLiveScene();
+      return true;
+    }
+    return false;
+  }
+  function _removeLiveReasoningEchoRows(visible){
+    const turn=$('liveAssistantTurn');
+    const blocks=turn&&typeof _assistantTurnBlocks==='function'?_assistantTurnBlocks(turn):null;
+    if(!blocks||!visible) return false;
+    let removed=false;
+    const selector=[
+      '.agent-activity-thinking[data-anchor-scene-row="1"]',
+      '.agent-activity-thinking[data-live-thinking="1"]',
+      '.wl-reason[data-worklog-anchor-reason="1"]',
+      '.wl-reason[data-worklog-reason-source="reasoning"]'
+    ].join(',');
+    blocks.querySelectorAll(selector).forEach(row=>{
+      const textNode=row.querySelector&&(
+        row.querySelector('.thinking-card-body pre') ||
+        row.querySelector('.thinking-card-body')
+      );
+      const text=String((textNode&&textNode.textContent)||row.textContent||'');
+      if(!_stripCompactEchoSuffix(text, visible).removed) return;
+      row.remove();
+      removed=true;
+    });
+    if(removed&&typeof _syncToolCallGroupSummary==='function'){
+      blocks.querySelectorAll('.tool-worklog-group,.tool-call-group').forEach(group=>{
+        _syncToolCallGroupSummary(group);
+      });
+    }
+    return removed;
+  }
+  function _stripLiveReasoningEcho(visible){
+    let removed=false;
+    const durable=_stripCompactEchoSuffix(reasoningText, visible);
+    if(durable.removed){
+      reasoningText=durable.text;
+      removed=true;
+    }
+    const live=_stripCompactEchoSuffix(liveReasoningText, visible);
+    if(live.removed){
+      liveReasoningText=live.text;
+      removed=true;
+    }
+    const anchorRemoved=_stripAnchorReasoningEcho(visible);
+    const domRemoved=_removeLiveReasoningEchoRows(visible);
+    if(removed) syncInflightAssistantMessage();
+    if((removed||anchorRemoved||domRemoved)&&!String(liveReasoningText||'').trim()&&typeof removeThinking==='function'){
+      removeThinking();
+    }
+    return removed||anchorRemoved||domRemoved;
+  }
+  function _flushReasoningToAnchor(){
+    if(_anchorReasoningFlushed||!reasoningText) return;
+    _anchorReasoningFlushed=true;
+    if(_anchorHasReasoningEvents()) return;
+    _upsertAnchorReasoning(reasoningText,{sealed:true,localId:`live-reasoning:${streamId}:final`});
+  }
+  function _sourceEventTypeForSnapshotAnchorRow(row){
+    const source=String(row&&row.source_event_type||'').trim();
+    if(source&&source!=='runtime_journal_snapshot') return source;
+    const role=String(row&&row.role||'').trim();
+    const kind=String(row&&row.kind||'').trim();
+    if(role==='prose'||kind==='process_prose') return 'token';
+    if(role==='thinking'||kind==='reasoning') return 'reasoning';
+    if(role==='tool') return row&&row.status==='running'?'tool':'tool_complete';
+    if(role==='terminal'||kind==='terminal_status') return row&&row.status==='running'?'compressing':'done';
+    if(role==='lifecycle'||kind==='lifecycle_status') return 'compressing';
+    return '';
+  }
+  function _hydrateAnchorRegistryFromActivityScene(scene){
+    if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return false;
+    if(!scene||scene.version!=='activity_scene_v1'||!Array.isArray(scene.activity_rows)||!scene.activity_rows.length) return false;
+    const sceneKey=[
+      scene.identity&&scene.identity.stream_id||streamId||'',
+      scene.activity_rows.length,
+      scene.activity_rows.map(row=>row&&row.row_id||row&&row.local_id||'').join('|'),
+    ].join(':');
+    if(_anchorRegistry._hydrated_activity_scene_key===sceneKey) return true;
+    const rows=scene.activity_rows;
+    for(let i=0;i<rows.length;i+=1){
+      const row=rows[i];
+      if(!row||typeof row!=='object') continue;
+      const sourceType=_sourceEventTypeForSnapshotAnchorRow(row);
+      if(!sourceType) continue;
+      const payload={
+        ...((row.payload&&typeof row.payload==='object')?row.payload:{}),
+      };
+      if(row.text&&!payload.text) payload.text=row.text;
+      if(row.tool&&typeof row.tool==='object'){
+        payload.name=payload.name||row.tool.name;
+        payload.args=payload.args||row.tool.args;
+        payload.preview=payload.preview||row.tool.preview;
+        payload.snippet=payload.snippet||row.tool.snippet;
+        payload.tid=payload.tid||row.tool.tid||row.tool.id;
+        payload.id=payload.id||row.tool.id||row.tool.tid;
+        payload.is_error=payload.is_error||row.tool.is_error;
+        payload.duration=payload.duration||row.tool.duration;
+      }
+      if(row.group&&typeof row.group==='object'){
+        payload.activitySegmentSeq=payload.activitySegmentSeq||row.group.activity_segment_seq;
+        payload.activityBurstId=payload.activityBurstId||row.group.activity_burst_id;
+      }
+      const sourceEvent={
+        ...payload,
+        source_event_type:sourceType,
+        local_id:row.local_id||row.row_id||`snapshot:${streamId}:${i}`,
+        event_id:row.event_id||null,
+        seq:row.seq??undefined,
+        status:row.status||undefined,
+        stream_id:row.stream_id||streamId,
+        run_id:row.run_id||streamId,
+      };
+      try{
+        _anchorApi.applyAssistantTurnAnchorSourceEvent(_anchorRegistry,sourceEvent,{session_id:activeSid,stream_id:streamId,run_id:streamId});
+      }catch(err){
+        if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
+          _anchorShadowWarned=true;
+          console.warn('assistant turn anchor snapshot hydration failed',err);
+        }
+        return false;
+      }
+    }
+    _anchorRegistry._hydrated_activity_scene_key=sceneKey;
+    return true;
+  }
+  _hydrateAnchorRegistryFromActivityScene(INFLIGHT[activeSid]&&INFLIGHT[activeSid].anchorActivityScene);
+
+  function _mergeSettledToolCallsWithLiveMetadata(rawCalls){
+    const liveCalls=Array.isArray(S.toolCalls)?S.toolCalls:[];
+    const byTid=new Map();
+    liveCalls.forEach((tc,idx)=>{
+      if(!tc||typeof tc!=='object') return;
+      const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
+      if(tid&&!byTid.has(tid)) byTid.set(tid,{tc,idx});
+    });
+    const used=new Set();
+    return (rawCalls||[]).map((raw,idx)=>{
+      const next={...(raw||{}),done:true};
+      const tid=next.tid||next.id||next.tool_call_id||next.tool_use_id||next.call_id||'';
+      let matchEntry=tid?byTid.get(tid):null;
+      if(!matchEntry){
+        const name=next.name||((next.function||{}).name)||'';
+        const matchIdx=liveCalls.findIndex((tc,i)=>tc&&!used.has(i)&&(!name||tc.name===name));
+        if(matchIdx>=0) matchEntry={tc:liveCalls[matchIdx],idx:matchIdx};
+      }
+      if(matchEntry){
+        used.add(matchEntry.idx);
+        const live=matchEntry.tc||{};
+        for(const key of ['activityBurstId','duration','started_at']){
+          if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
+        }
+      }
+      return next;
+    });
+  }
 
   // rAF-throttled rendering: buffer tokens, render at most once per frame
   let _renderPending=false;
@@ -992,8 +3948,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Also handles DSML-prefixed variants from DeepSeek/Bedrock, including
     // spacing variants like "<｜DSML |function_calls" and truncated prefixes.
     if(!s) return s;
-    const lo=String(s).toLowerCase();
-    if(lo.indexOf('function_calls')===-1 && lo.indexOf('dsml')===-1) return s;
+    // Case-insensitive presence check without allocating a full lowercased copy
+    // of the (growing) text on every call — cuts per-token/per-frame GC pressure.
+    // Equivalent to the previous toLowerCase()+indexOf gate. (#5455 WS2.3)
+    if(!/function_calls|dsml/i.test(String(s))) return s;
     // Support both plain <function_calls> and DSML-prefixed variants.
     s=s.replace(/<(?:\s*｜\s*DSML\s*[｜|]\s*)?function_calls>[\s\S]*?<\/(?:\s*｜\s*DSML\s*[｜|]\s*)?function_calls>/gi,'');
     // Also remove truncated opening tags (missing closing ">" at stream tail).
@@ -1003,64 +3961,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return s.trim();
   }
   function _streamDisplay(){
-    const raw=_stripXmlToolCalls(assistantText);
-    // Always run think-block stripping even when reasoningText is populated.
-    // Some providers emit reasoning content via on_reasoning AND wrap it in
-    // <think> tags in the token stream — the early-return caused the thinking
-    // card and main response to show identical content (closes #852).
-    for(const {open,close} of _thinkPairs){
-      // Trim leading whitespace before checking for the open tag — some models
-      // (e.g. MiniMax) emit newlines before <think>.
-      const trimmed=raw.trimStart();
-      if(trimmed.startsWith(open)){
-        const ci=trimmed.indexOf(close,open.length);
-        if(ci!==-1){
-          // Thinking block complete — strip it, show the rest
-          return trimmed.slice(ci+close.length).replace(/^\s+/,'');
-        }
-        // Still inside thinking block — show placeholder
-        return '';
-      }
-      // Hide partial tag prefixes while streaming so users don't see
-      // `<thi`, `<think`, etc. before the model finishes the token.
-      if(open.startsWith(trimmed)) return '';
-    }
-    return raw;
+    return _extractInlineThinkingFromContent(_stripXmlToolCalls(assistantText), liveReasoningText, {streaming:true}).content;
   }
   function _parseStreamState(){
-    const raw=_stripXmlToolCalls(assistantText);
-    if(reasoningText){
-      return {thinkingText:liveReasoningText, displayText:_streamDisplay(), inThinking:false};
-    }
-    for(const {open,close} of _thinkPairs){
-      const trimmed=raw.trimStart();
-      if(trimmed.startsWith(open)){
-        const ci=trimmed.indexOf(close,open.length);
-        if(ci!==-1){
-          return {
-            thinkingText: trimmed.slice(open.length, ci).trim(),
-            displayText: trimmed.slice(ci+close.length).replace(/^\s+/,''),
-            inThinking:false,
-          };
-        }
-        return {
-          thinkingText: trimmed.slice(open.length).trim(),
-          displayText:'',
-          inThinking:true,
-        };
-      }
-      if(open.startsWith(trimmed)){
-        return {thinkingText:'', displayText:'', inThinking:true};
-      }
-    }
-    return {thinkingText:'', displayText:raw, inThinking:false};
+    return _extractInlineThinkingFromContent(_stripXmlToolCalls(assistantText), liveReasoningText, {streaming:true});
   }
   function _renderLiveThinking(parsed){
     if(window._showThinking===false){removeThinking();return;}
     const text=(parsed&&parsed.thinkingText)||'';
     if(text||(parsed&&parsed.inThinking)){
-      if(typeof updateThinking==='function') updateThinking(text||'Thinking…');
-      else appendThinking();
+      _updateLiveThinkingCard(text||'Thinking…');
       return;
     }
     // Only remove thinking if we're not in an active reasoning phase.
@@ -1075,7 +3985,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _smdWrittenLen=0;
     _smdWrittenText='';
     if(!window.smd){_smdParser=null;return;}
-    const baseRenderer=fade ? _streamFadeRenderer(el) : window.smd.default_renderer(el);
+    const baseRenderer=fade ? _streamFadeRenderer(el) : _safeSmdRenderer(el);
     const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
   }
@@ -1112,7 +4022,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       try{window.smd.parser_end(_smdParser);}catch(_){}
       // parser_end may flush remaining markdown that creates new links/images —
       // re-sanitize the body before the DOM is handed off to highlightCode / renderMessages.
-      if(assistantBody){_sanitizeSmdLinks(assistantBody);}
+      if(assistantBody){_sanitizeSmdLinks(assistantBody);enhanceMarkdownTables(assistantBody);}
     }
     _smdParser=null;
     _smdWrittenLen=0;
@@ -1146,14 +4056,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     try{window.smd.parser_write(_smdParser,delta);}catch(_){}
     _smdWrittenLen=displayText.length;
     _smdWrittenText=displayText;
-    // streaming-markdown does NOT sanitize URL schemes. The default live path
-    // scans after writes; fade mode blocks unsafe href/src in its renderer.set_attr.
-    if(assistantBody&&!fade){_sanitizeSmdLinks(assistantBody);}
+    // URL scheme safety is handled by the renderer's set_attr hook
+    // (_safeSmdRenderer or _streamFadeRenderer), applied inline as smd
+    // creates each DOM node — no post-hoc full-DOM scan needed.
     _scheduleStreamingKatex();
   }
   // Allowed URL schemes for anchors and images rendered from agent-streamed markdown.
   // Raw file:// anchors are rewritten to /api/media before the user can click them.
-  const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.|api|session\/)/i;
+  const _SMD_SAFE_URL_RE=/^(?:https?:|mailto:|tel:|message:|\/|#|\?|\.|api|session\/)/i;
   const _SMD_SAFE_IMG_URL_RE=/^(?:https?:|mailto:|tel:|\/|#|\?|\.)/i;
   function _smdLinkHref(raw){
     const href=String(raw||'');
@@ -1210,10 +4120,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeLastArrivalMs=0;
     _streamFadeArrivalWps=0;
     _streamFadeLatestAnimationEndAt=0;
-    _streamFadeAppendOffset=0;
     _streamFadeVisibleWords=0;
     _streamFadeHoldUntilMs=0;
     _streamFadeCurrentMs=_STREAM_FADE_MS;
+    _streamFadeDomText='';
   }
   function _cancelAnimationFramePendingStreamRender(){
     if(_pendingRafHandle===null) return;
@@ -1223,7 +4133,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _renderPending=false;
   }
   function _shouldUseStreamFade(){
-    return _streamFadeEnabledForStream;
+    return window._fadeTextEffect===true;
+  }
+  function _shouldUseTransparentStreamFade(){
+    return typeof isTransparentStream==='function'&&isTransparentStream();
+  }
+  function _shouldUseLiveProseFade(){
+    return !_streamFadeReduceMotionEnabled() && (_shouldUseStreamFade() || _shouldUseTransparentStreamFade());
   }
   function _streamFadeSkipNode(node){
     if(!node||node.nodeType!==1) return false;
@@ -1283,13 +4199,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const span=document.createElement('span');
         span.className='stream-fade-word is-new';
         const fadeMs=_streamFadeCurrentMs||_STREAM_FADE_MS;
-        const delayMs=_streamFadeAppendOffset*_STREAM_FADE_STAGGER_MS;
-        span.style.animationDelay=delayMs+'ms';
         if(fadeMs!==_STREAM_FADE_MS) span.style.setProperty('--stream-fade-ms',fadeMs+'ms');
         span.textContent=match[1];
         frag.appendChild(span);
-        _streamFadeAppendOffset+=1;
-        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+delayMs+fadeMs);
+        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+fadeMs);
         if(match[2]) frag.appendChild(document.createTextNode(match[2]));
         last=match.index+match[0].length;
         changed=true;
@@ -1319,15 +4232,78 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     };
     return renderer;
   }
+  // Safe renderer: wraps default_renderer with a set_attr hook that validates
+  // href/src URL schemes inline — no post-hoc DOM-wide querySelectorAll needed.
+  // Unlike _streamFadeRenderer, this does NOT wrap add_text, so smd adds new
+  // DOM nodes as plain text nodes (no animation spans). Used on the non-fade
+  // streaming path to eliminate _sanitizeSmdLinks(assistantBody) O(DOM) scans
+  // on every token event (#WebUI-perf).
+  function _safeSmdRenderer(el){
+    const renderer=window.smd.default_renderer(el);
+    const baseSetAttr=renderer.set_attr;
+    renderer.set_attr=(data,attr,value)=>{
+      const isHref=window.smd&&attr===window.smd.HREF;
+      const isSrc=window.smd&&attr===window.smd.SRC;
+      const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
+      if(isHref&&/^(file|workspace|session):\/\//i.test(String(value||''))){
+        baseSetAttr(data,attr,_smdLinkHref(value));
+        if(/^session:\/\//i.test(String(value||''))){
+          const node=data&&data.nodes&&data.nodes[data.index];
+          if(node&&node.classList) node.classList.add('session-link');
+        }
+        return;
+      }
+      if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
+        const node=data&&data.nodes&&data.nodes[data.index];
+        if(node&&node.setAttribute) node.setAttribute('data-blocked-scheme','1');
+        return;
+      }
+      baseSetAttr(data,attr,value);
+    };
+    return renderer;
+  }
   function _streamFadeWordCountOf(text){
     const m=String(text||'').match(/\S+/g);
     return m?m.length:0;
   }
+  function _streamFadeAppendText(el, text){
+    if(!el) return;
+    const value=String(text||'');
+    if(!value) return;
+    const reduceMotion=_streamFadeReduceMotionEnabled();
+    const frag=document.createDocumentFragment();
+    const wordRe=/(\S+)(\s*)/g;
+    const appendStartedAt=performance.now();
+    let last=0, match, changed=false;
+    while((match=wordRe.exec(value))){
+      if(match.index>last) frag.appendChild(document.createTextNode(value.slice(last,match.index)));
+      if(reduceMotion){
+        frag.appendChild(document.createTextNode(match[1]));
+      }else{
+        const span=document.createElement('span');
+        span.className='stream-fade-word is-new';
+        const fadeMs=_streamFadeCurrentMs||_STREAM_FADE_MS;
+        if(fadeMs!==_STREAM_FADE_MS) span.style.setProperty('--stream-fade-ms',fadeMs+'ms');
+        span.textContent=match[1];
+        frag.appendChild(span);
+        _streamFadeLatestAnimationEndAt=Math.max(_streamFadeLatestAnimationEndAt,appendStartedAt+fadeMs);
+      }
+      if(match[2]) frag.appendChild(document.createTextNode(match[2]));
+      last=match.index+match[0].length;
+      changed=true;
+    }
+    if(!changed){
+      frag.appendChild(document.createTextNode(value));
+    }else if(last<value.length){
+      frag.appendChild(document.createTextNode(value.slice(last)));
+    }
+    el.appendChild(frag);
+  }
   function _streamFadePauseAfter(text, paragraphBreakIndex){
     if(paragraphBreakIndex>=0) return 90;
     const trimmed=String(text||'').trimEnd();
-    if(/[.!?]["')\]]*$/.test(trimmed)) return 45;
-    if(/[:;]["')\]]*$/.test(trimmed)) return 30;
+    if(/[.!?]["\x27)\]]*$/.test(trimmed)) return 45;
+    if(/[:;]["\x27)\]]*$/.test(trimmed)) return 30;
     return 0;
   }
   function _streamFadeNextText(targetText){
@@ -1426,17 +4402,36 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const next=_streamFadeNextText(displayText);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
-    if(!_smdParser&&window.smd){
-      if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
-      _smdNewParser(assistantBody,true);
+    if(!_shouldUseTransparentStreamFade()){
+      if(!_smdParser&&window.smd){
+        if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
+        _smdNewParser(assistantBody,true);
+      }
+      if(_smdParser){
+        _smdWrite(next.text,true);
+      }else{
+        assistantBody.innerHTML=renderMd ? renderMd(next.text||'') : esc(next.text||'');
+        _sanitizeSmdLinks(assistantBody);
+      }
+      _streamFadeDomText=String(next.text||'');
+      return next.caughtUp;
     }
     if(_smdParser){
-      _streamFadeAppendOffset=0;
-      _smdWrite(next.text,true);
-    }else{
-      assistantBody.innerHTML=renderMd ? renderMd(next.text||'') : esc(next.text||'');
-      _sanitizeSmdLinks(assistantBody);
+      _smdEndParser();
+      assistantBody.textContent='';
+      _streamFadeDomText='';
     }
+    _smdReconnect=false;
+    if(!_streamFadeDomText&&assistantBody.textContent){
+      assistantBody.textContent='';
+    }
+    if(!String(next.text||'').startsWith(_streamFadeDomText)){
+      assistantBody.textContent='';
+      _streamFadeDomText='';
+    }
+    const delta=String(next.text||'').slice(_streamFadeDomText.length);
+    if(delta) assistantBody.appendChild(document.createTextNode(delta));
+    _streamFadeDomText=String(next.text||'');
     return next.caughtUp;
   }
   function _streamFadeCurrentDisplayText(){
@@ -1452,6 +4447,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!assistantBody){onDone();return;}
       const target=_streamFadeCurrentDisplayText();
       const caughtUp=_renderStreamingFadeMarkdown(target);
+      const anchorProcessText=_streamFadeDomText||target;
+      if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
       if(caughtUp){
         // parser_end can flush pending markdown text; include that final text in
@@ -1478,6 +4475,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _flushPendingSegmentRender(options={}){
     const force=!!(options&&options.force);
+    const skipAnchorProcessProse=!!(options&&options.skipAnchorProcessProse);
     if(!assistantBody||(!force&&!_renderPending)) return;
     if(_renderPending) _cancelAnimationFramePendingStreamRender();
     const displayText=segmentStart===0
@@ -1485,11 +4483,25 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
     if(_smdParser){
       _smdWrite(displayText);
+    } else if(window.smd){
+      // Parser was nulled out (e.g. by a prior segment end) but smd is
+      // available — recreate it on the existing element. Uses the non-fade
+      // renderer to match standard rendering, avoiding O(n²) innerHTML
+      // churn on long responses (#4704). Clear any content the renderMd()
+      // fallback already wrote first: _smdNewParser resets _smdWrittenText to
+      // '' but does NOT clear the element, so a following _smdWrite(displayText)
+      // would append the full accumulated segment ON TOP of the existing
+      // fallback render and duplicate the live text.
+      assistantBody.innerHTML='';
+      _smdNewParser(assistantBody, false);
+      if(_smdParser) _smdWrite(displayText);
     } else if(renderMd){
       assistantBody.innerHTML=renderMd(displayText);
     } else {
       assistantBody.innerHTML=esc(displayText);
     }
+    if(!skipAnchorProcessProse) _upsertAnchorProcessProse(displayText,{sealed:force});
+    if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
   }
   function _resetAssistantSegment(){
     assistantRow=null;
@@ -1507,6 +4519,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(Number.isFinite(seq)&&seq>_lastRunJournalSeq){
       _lastRunJournalSeq=seq;
       _lastRunJournalEventId=raw;
+      // Mirror the advanced cursor onto the persisted INFLIGHT entry. persistInflightState()
+      // saves `inflight.lastRunJournalSeq`, and a hard reload / reattach reads it back as the
+      // `after_seq` replay floor (see attachLiveStream reconnecting init). Without this write
+      // the persisted seq stayed 0, so a reload restored `lastAssistantText` and then replayed
+      // the run journal from the zero floor (after_seq of 0) ON TOP of it — duplicating
+      // already-rendered live reply content. Throttled persist keeps this off the hot token path. (#3401 reconnect dup)
+      const inflight=INFLIGHT[activeSid];
+      if(inflight){
+        inflight.lastRunJournalSeq=seq;
+        if(typeof _throttledPersist==='function') _throttledPersist();
+      }
     }
   }
   function _runJournalReplayAfterSeq(){
@@ -1522,8 +4545,260 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return `&replay=1&after_seq=${encodeURIComponent(String(_runJournalReplayAfterSeq()))}&after_event_id=${encodeURIComponent(_lastRunJournalEventId||'')}`;
   }
 
+  function _stableStringify(value){
+    const normalize=(v)=>{
+      if(v===null||typeof v!=='object') return v;
+      if(Array.isArray(v)) return v.map(normalize);
+      const obj={};
+      const keys=Object.keys(v).sort();
+      for(const key of keys){
+        obj[key]=normalize(v[key]);
+      }
+      return obj;
+    };
+    try{
+      return JSON.stringify(normalize(value));
+    }catch(_){
+      return String(value||'');
+    }
+  }
+
+  function _hashString(value){
+    let hash=2166136261;
+    for(let i=0;i<String(value||'').length;i++){
+      hash^=String(value||'').charCodeAt(i);
+      hash=Math.imul(hash,16777619);
+    }
+    return (hash>>>0).toString(16);
+  }
+
+  function _toolCallSignature(d, activityBurstId, activitySegmentSeq){
+    const name=String(d&&d.name||'').trim().toLowerCase();
+    const bid=Number(activityBurstId);
+    const seq=Number(activitySegmentSeq);
+    const args=d&&d.args;
+    return `${name}|${Number.isFinite(bid)?bid:0}|${Number.isFinite(seq)?seq:0}|${_stableStringify(args)}`;
+  }
+
+  function _liveToolTid(d, activityBurstId, activitySegmentSeq){
+    const explicit=String(d&&(d.tid||d.id||d.tool_call_id||d.tool_use_id||d.call_id)||'').trim();
+    if(explicit) return explicit;
+    return `live-${activeSid}-${_hashString(_toolCallSignature(d,activityBurstId,activitySegmentSeq))}`;
+  }
+
+  function _coerceLiveToolCallSignature(tc, activityBurstId, activitySegmentSeq){
+    if(tc&&typeof tc==='object' && !tc._liveToolCallSignature){
+      tc._liveToolCallSignature=_toolCallSignature(tc,activityBurstId,activitySegmentSeq);
+    }
+    return tc&&tc._liveToolCallSignature||'';
+  }
+
+  function _findPendingLiveToolCallIndex(toolCalls, opts){
+    if(!Array.isArray(toolCalls)) return -1;
+    const wantedTid=opts&&opts.tid||'';
+    const wantedName=String(opts&&opts.name||'');
+    const wantedSig=opts&&opts.signature||'';
+    const wantedBurst=Number(opts&&opts.activityBurstId);
+    const wantedSeq=Number(opts&&opts.activitySegmentSeq);
+    const allowDone=!!(opts&&opts.allowDone);
+    const matchName=(candidate)=>{
+      return !candidate||!candidate.name||!wantedName ? false : String(candidate.name)===wantedName;
+    };
+    if(wantedTid){
+      for(let i=toolCalls.length-1;i>=0;i--){
+        const candidate=toolCalls[i];
+        if(!candidate||typeof candidate!=='object') continue;
+        if(!allowDone&&candidate.done===true) continue;
+        const candidateTid=String(candidate.tid||candidate.id||candidate.tool_call_id||candidate.tool_use_id||candidate.call_id||'');
+        if(candidateTid&&candidateTid===wantedTid) return i;
+      }
+    }
+    if(wantedSig){
+      for(let i=toolCalls.length-1;i>=0;i--){
+        const candidate=toolCalls[i];
+        if(!candidate||typeof candidate!=='object') continue;
+        if(!allowDone&&candidate.done===true) continue;
+        const canonicalSig=_coerceLiveToolCallSignature(
+          candidate,
+          Number.isFinite(wantedBurst)?wantedBurst:activityBurstFallbackFromCandidate(candidate),
+          Number.isFinite(wantedSeq)?wantedSeq:activitySegmentSeqFallbackFromCandidate(candidate),
+        );
+        if(canonicalSig&&canonicalSig===wantedSig) return i;
+      }
+    }
+    for(let i=toolCalls.length-1;i>=0;i--){
+      const candidate=toolCalls[i];
+      if(!candidate||typeof candidate!=='object') continue;
+      if(!allowDone&&candidate.done===true) continue;
+      if(!matchName(candidate)) continue;
+      const candidateSeq=Number(candidate.activitySegmentSeq);
+      const candidateBid=Number(candidate.activityBurstId);
+      if(Number.isFinite(wantedSeq)&&Number.isFinite(candidateSeq)&&candidateSeq!==wantedSeq) continue;
+      if(Number.isFinite(wantedBurst)&&Number.isFinite(candidateBid)&&candidateBid!==wantedBurst) continue;
+      return i;
+    }
+    return -1;
+  }
+
+  function activityBurstFallbackFromCandidate(candidate){
+    return Number(candidate && candidate.activityBurstId);
+  }
+  function activitySegmentSeqFallbackFromCandidate(candidate){
+    return Number(candidate && candidate.activitySegmentSeq);
+  }
+
+  function _coerceLiveToolCallSeq(candidate){
+    const raw=Number.isFinite(candidate)?candidate:Number(candidate&&candidate.activitySegmentSeq);
+    return Number.isFinite(raw)&&raw>0?raw:undefined;
+  }
+
+  function _currentLiveToolAnchor(){
+    const segmentSeq=Number(
+      assistantRow&&assistantRow.getAttribute('data-live-segment-seq')||
+      _assistantSegmentSeq||
+      _currentLiveSegmentSeq||
+      0
+    );
+    const burst=Number(_currentActivityBurstId);
+    return {
+      segmentSeq:Number.isFinite(segmentSeq)&&segmentSeq>0?segmentSeq:undefined,
+      burstId:Number.isFinite(burst)?burst:0,
+    };
+  }
+
+  function upsertLiveToolCall(d, phase){
+    if(!d||d.name==='clarify') return null;
+    const name=String(d&&d.name||'').trim();
+    if(!name) return null;
+    const current=_currentLiveToolAnchor();
+    const inflight=INFLIGHT[activeSid] || (INFLIGHT[activeSid]={
+      messages:[...S.messages],
+      uploaded:[...uploaded],
+      toolCalls:[],
+    });
+    if(!Array.isArray(inflight.toolCalls)) inflight.toolCalls=[];
+    if(!Array.isArray(inflight.messages)) inflight.messages=[...(inflight.messages||[])];
+
+    const explicitTid=String(d&&d.tid||d&&d.id||d&&d.tool_call_id||d&&d.tool_use_id||d&&d.call_id||'').trim();
+    const isComplete=phase==='complete';
+    let signature=_toolCallSignature(d,current.burstId,current.segmentSeq);
+    let index=-1;
+
+    if(explicitTid){
+      index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
+        tid:explicitTid,
+        allowDone:isComplete,
+      });
+    }
+    if(index<0){
+      index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
+        signature,
+        name,
+        activityBurstId:current.burstId,
+        activitySegmentSeq:current.segmentSeq,
+        allowDone:isComplete,
+      });
+    }
+    if(index<0 && isComplete && !explicitTid){
+      index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
+        name,
+        activityBurstId:current.burstId,
+        allowDone:true,
+      });
+    }
+
+    let tc=null;
+    if(index>=0&&inflight.toolCalls[index]){
+      tc=inflight.toolCalls[index];
+    }
+
+    if(!tc){
+      tc={
+        name,
+        preview:String(d.preview||''),
+        args:d.args||{},
+        snippet:'',
+        done:isComplete,
+        tid:explicitTid||_liveToolTid(d,current.burstId,current.segmentSeq),
+        activityBurstId:current.burstId,
+        activitySegmentSeq:_coerceLiveToolCallSeq(current.segmentSeq),
+      };
+      if(!isComplete){
+        tc.started_at=Date.now()/1000;
+      }
+      if(isComplete) tc._createdByComplete=true;
+      inflight.toolCalls.push(tc);
+      if(!signature){
+        signature=_toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
+      }
+    } else {
+      if(!tc.name) tc.name=name;
+      if(!tc._liveToolCallSignature){
+        tc._liveToolCallSignature=_toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
+      }
+    }
+
+    if(isComplete){
+      if(d.preview){
+        tc.snippet=tc.snippet||String(d.preview||'');
+        if(!tc.preview) tc.preview=String(d.preview||'');
+      }
+    } else {
+      tc.preview=String(d.preview||tc.preview||'');
+    }
+    if(d.args!==undefined) tc.args=d.args;
+    if(d.snippet!==undefined) tc.snippet=d.snippet;
+    tc._liveToolCallSignature = _toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
+    tc.activityBurstId = Number.isFinite(Number(tc.activityBurstId))
+      ? Number(tc.activityBurstId)
+      : current.burstId;
+
+    const currentSegmentSeq=_coerceLiveToolCallSeq(current.segmentSeq);
+    const startSeq=_coerceLiveToolCallSeq(tc._toolCallStartSeq);
+    const inferredSeq=_coerceLiveToolCallSeq(tc.activitySegmentSeq);
+    if(!isComplete){
+      if(inferredSeq===undefined && currentSegmentSeq!==undefined){
+        tc.activitySegmentSeq=currentSegmentSeq;
+      } else if(inferredSeq!==undefined){
+        tc.activitySegmentSeq=inferredSeq;
+      }
+      tc._toolCallStartSeq=tc.activitySegmentSeq;
+    } else if(startSeq!==undefined){
+      tc.activitySegmentSeq=startSeq;
+    } else if(inferredSeq!==undefined){
+      tc.activitySegmentSeq=inferredSeq;
+    }
+
+    if(isComplete){
+      tc.done=true;
+      if(typeof d.is_error==='boolean') tc.is_error=d.is_error;
+      if(d.duration!==undefined) tc.duration=d.duration;
+      if(tc.started_at===undefined||tc.started_at===null) tc.started_at=Date.now()/1000;
+      if(!tc.tid) tc.tid=explicitTid||_liveToolTid(d,tc.activityBurstId,tc.activitySegmentSeq);
+    } else {
+      tc.done=false;
+      tc.started_at=tc.started_at||Date.now()/1000;
+    }
+
+    S.toolCalls=inflight.toolCalls;
+    persistInflightState();
+    return tc;
+  }
+
   let _lastRenderMs=0;
-  function _scheduleRender(){
+  // Parse-result cache: _scheduleRender can accept a pre-computed _parseStreamState()
+  // from the token event handler, avoiding a duplicate O(n) scan inside _doRender
+  // when the rAF fires before the next token arrives.
+  let _cachedParsed=null;
+  let _cachedParsedText='';
+  let _cachedParsedReasoning='';
+  function _scheduleRender(parsed){
+    // If caller provides a pre-computed parse result, cache it for _doRender.
+    if(parsed){
+      _cachedParsed=parsed;
+      _cachedParsedText=assistantText;
+      _cachedParsedReasoning=liveReasoningText;
+    }
     if(_renderPending) return;
     if(_streamFinalized) return; // Bug A: don't schedule new rAF after stream finalized
     _renderPending=true;
@@ -1534,22 +4809,28 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Throttling to 66ms intervals prevents this pileup without noticeable
     // visual degradation — streaming text updates still feel immediate.
     // performance.now() is monotonic so tab suspend/resume and NTP adjustments
-    // can't produce negative or enormous deltas.
+    // cannot produce negative or enormous deltas.
     const sinceLastMs=performance.now()-_lastRenderMs;
     const _doRender=()=>{
       _pendingRafHandle=null;
       _renderPending=false;
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
+      // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
+      // writes to suppress Chromium scroll re-anchoring during streaming growth.
+      if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
       _lastRenderMs=performance.now();
-      const parsed=_parseStreamState();
+      const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
+      _cachedParsed=null;
       _renderLiveThinking(parsed);
+      const displayText = segmentStart===0
+        ? parsed.displayText                          // first segment: uses think-tag stripping
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      let anchorProcessText=displayText;
       if(assistantBody){
-        const displayText = segmentStart===0
-          ? parsed.displayText                          // first segment: uses think-tag stripping
-          : _stripXmlToolCalls(assistantText.slice(segmentStart));
-        if(_shouldUseStreamFade()){
+        if(_shouldUseLiveProseFade()){
           const caughtUp=_renderStreamingFadeMarkdown(displayText);
+          anchorProcessText=_streamFadeDomText||'';
           if(!caughtUp&&!_streamFinalized){
             setTimeout(()=>_scheduleRender(), 33);
           }
@@ -1562,9 +4843,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             if(_smdReconnect){assistantBody.innerHTML='';_smdReconnect=false;}
             _smdNewParser(assistantBody);
           }
-          if(_smdParser){
-            _smdWrite(displayText);
-          } else {
+        if(_smdParser){
+          _smdWrite(displayText);
+        } else {
             // Fallback: smd not loaded yet, reconnect session, or smd unavailable — use renderMd
             // for every live segment. Without this, the first segment inserts raw
             // parsed.displayText and users see unformatted markdown until done.
@@ -1574,11 +4855,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
           }
         }
+        if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
       }
+      if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
-      snapshotLiveTurn();
+      _throttledSnapshotLiveTurn();
     };
-    const frameIntervalMs=_shouldUseStreamFade()?33:66;
+    const frameIntervalMs=_shouldUseLiveProseFade()?33:66;
     if(sinceLastMs>=frameIntervalMs){
       _pendingRafHandle=requestAnimationFrame(_doRender);
     } else {
@@ -1586,10 +4869,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
   }
 
+  function _completeAutomaticCompressionOnLiveProgress(sessionId){
+    const sid=String(sessionId||'');
+    const hasRunningLiveCard=!!document.querySelector('[data-live-compression-card="1"][data-compression-started-at]');
+    const hasRunningState=!!(window._compressionUi&&window._compressionUi.automatic&&window._compressionUi.phase==='running'&&(!sid||!window._compressionUi.sessionId||String(window._compressionUi.sessionId)===sid));
+    if(!hasRunningLiveCard&&!hasRunningState) return false;
+    _ensureAnchorCompressionCompletedOnLiveProgress(sid);
+    if(typeof appendLiveCompressionCard==='function'){
+      appendLiveCompressionCard({
+        sessionId:sid,
+        phase:'done',
+        automatic:true,
+        message:'Context auto-compressed',
+      });
+    }
+    return true;
+  }
+
   function _wireSSE(source){
     const existingLive=LIVE_STREAMS[activeSid];
     if(existingLive&&existingLive.source&&existingLive.source!==source){
-      try{existingLive.source.close();}catch(_){ }
+      try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
     }
     LIVE_STREAMS[activeSid]={streamId,source};
 
@@ -1614,10 +4914,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       assistantText+=d.text;
       syncInflightAssistantMessage();
       if(!S.session||S.session.session_id!==activeSid) return;
-      const parsed=_parseStreamState();
-      if(_freshSegment&&window._showThinking!==false) appendThinking(_liveThinkingText());
-      if(String((parsed&&parsed.displayText)||'').trim()||assistantRow) ensureAssistantRow();
-      _scheduleRender();
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
+      if(_freshSegment) appendThinking('', _liveThinkingPlacement());
+      // Once the assistant row exists its creation gate is already satisfied, and
+      // the throttled _doRender re-parses once per frame anyway — so the per-token
+      // full-text parse here is pure waste (O(n)/token -> O(n^2) over the answer).
+      // Still call ensureAssistantRow() every token exactly as before (cheap; it
+      // also starts a new segment on a post-tool _freshSegment). Only the parse is
+      // skipped, and only once the row exists. (#5455 WS2.3)
+      if(assistantRow){
+        ensureAssistantRow();
+        _scheduleRender();
+      }else{
+        const parsed=_parseStreamState();
+        if(String((parsed&&parsed.displayText)||'').trim()) ensureAssistantRow();
+        _scheduleRender(parsed);
+      }
     });
 
     source.addEventListener('interim_assistant',e=>{
@@ -1625,27 +4937,80 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const d=JSON.parse(e.data);
       const visible=String(d&&d.text?d.text:'').trim();
       const alreadyStreamed=!!(d&&d.already_streamed);
+      const reasoningEcho=!!(d&&d.reasoning_echo);
       if(!visible){
         return;
       }
-      reasoningText='';
+      if(reasoningEcho) _stripLiveReasoningEcho(visible);
       liveReasoningText='';
       if(alreadyStreamed){
-        if(!S.session||S.session.session_id!==activeSid) return;
+        if(!S.session||S.session.session_id!==activeSid){
+          recordActivityBoundary();
+          _resetAssistantSegment();
+          return;
+        }
+        _completeAutomaticCompressionOnLiveProgress(activeSid);
+        const parsed=_parseStreamState();
+        if(String((parsed&&parsed.displayText)||'').trim()||assistantRow){
+          ensureAssistantRow(true);
+          _flushPendingSegmentRender({force:true});
+          if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
+          if(typeof closeCurrentLiveActivityGroup==='function') closeCurrentLiveActivityGroup();
+          recordActivityBoundary();
+        }
         _resetAssistantSegment();
         return;
       }
       assistantText += assistantText ? `\n\n${visible}` : visible;
       visibleInterimSnippets.push(visible);
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid) return;
-      if(window._showThinking!==false){
-        if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
-        else appendThinking(_liveThinkingText());
+      if(!S.session||S.session.session_id!==activeSid){
+        recordActivityBoundary();
+        _resetAssistantSegment();
+        return;
       }
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
       ensureAssistantRow(true);
-      _flushPendingSegmentRender({force:true});
+      if(assistantRow) assistantRow.setAttribute('data-interim','1');
+      _flushPendingSegmentRender({force:true,skipAnchorProcessProse:true});
+      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       if(typeof closeCurrentLiveActivityGroup==='function') closeCurrentLiveActivityGroup();
+      _applyToAnchor('interim_assistant',d,e);
+      // Collapse old interim notes once more than INTERIM_COLLAPSE_THRESHOLD accumulate.
+      const INTERIM_COLLAPSE_THRESHOLD=3;
+      if(visibleInterimSnippets.length>INTERIM_COLLAPSE_THRESHOLD&&assistantRow){
+        const blocks=assistantRow.parentElement;
+        if(blocks){
+          const anchorSceneOwnsLive=!!(blocks.closest&&blocks.closest('[data-anchor-scene-live-owner="1"]'));
+          if(anchorSceneOwnsLive){
+            blocks.querySelectorAll('.interim-collapse-toggle').forEach(el=>el.remove());
+          }else{
+            const allInterim=Array.from(blocks.querySelectorAll('[data-interim="1"]'));
+            const toHide=allInterim.slice(0,allInterim.length-INTERIM_COLLAPSE_THRESHOLD);
+            let toggle=blocks.querySelector('.interim-collapse-toggle');
+            if(!toggle){
+              toggle=document.createElement('span');
+              toggle.className='interim-collapse-toggle';
+              // No per-element listener: clicks are handled by a delegated
+              // document-level handler (see _interimCollapseDelegatedClick) so
+              // the toggle keeps working after a live-turn DOM restore
+              // (snapshotLiveTurnHtmlForSession/restoreLiveTurnHtmlForSession
+              // rebuild via innerHTML, which would drop a direct listener and
+              // leave the collapsed notes permanently unreachable). The
+              // threshold rides on the markup so the handler stays stateless.
+              toggle.dataset.threshold=String(INTERIM_COLLAPSE_THRESHOLD);
+              if(toHide.length) toHide[0].before(toggle);
+            }
+            // Skip re-collapse when the user expanded manually; always update the stored count.
+            if(!toggle.dataset.expanded){
+              toHide.forEach(el=>el.classList.add('interim-collapsed'));
+            }
+            const stillHidden=blocks.querySelectorAll('[data-interim="1"].interim-collapsed').length;
+            if(stillHidden) toggle.textContent='Show '+stillHidden+' earlier update'+(stillHidden===1?'':'s');
+          }
+        }
+      }
+      recordActivityBoundary();
       _resetAssistantSegment();
       _scheduleRender();
     });
@@ -1653,51 +5018,49 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('reasoning',e=>{
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
-      reasoningText += d.text || '';
-      liveReasoningText += d.text || '';
+      const text=d.text||'';
+      reasoningText += text;
+      liveReasoningText += text;
+      if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid) return;
-      // Render thinking card synchronously — not via rAF — so the DOM is
-      // up-to-date before a 'tool' event in the same microtask batch calls
-      // finalizeThinkingCard(). The old rAF-only path caused a race where
-      // the thinking row was still a spinner when finalized.
-      if(window._showThinking!==false){
-        if(typeof updateThinking==='function') updateThinking(_liveThinkingText());
-        else appendThinking(_liveThinkingText());
+      if(text&&S.session&&S.session.session_id===activeSid){
+        const liveThinkingText=_liveThinkingText();
+        if(!_upsertAnchorReasoning(liveThinkingText)){
+          _updateLiveThinkingCard(liveThinkingText);
+        }
       }
-      _scheduleRender();
     });
 
     source.addEventListener('tool',e=>{
+      if(_terminalStateReached||_streamFinalized) return;
+      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
-      const tc={name:d.name, preview:d.preview||'', args:d.args||{}, snippet:'', done:false, tid:d.tid||`live-${Date.now()}-${Math.random().toString(36).slice(2,8)}`};
-      const inflight = INFLIGHT[activeSid] || (INFLIGHT[activeSid] = {
-        messages:[...S.messages],
-        uploaded:[],
-        toolCalls:[]
-      });
-      if(!Array.isArray(inflight.toolCalls)) inflight.toolCalls=[];
-      INFLIGHT[activeSid].toolCalls.push(tc);
-      S.toolCalls=INFLIGHT[activeSid].toolCalls;
-      persistInflightState();
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
+      const tc=upsertLiveToolCall(d,'start');
+      if(!tc) return;
+      const pendingDisplayTextBeforeTool=segmentStart===0
+        ? (_parseStreamState().displayText||'')
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      if(String(pendingDisplayTextBeforeTool||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeTool,{sealed:true});
+      _applyToAnchor('tool',{...d,...tc},e);
 
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
-      // NOTE: don't removeThinking() here — keep the thinking card visible
-      // above the tool card so the turn reads top-to-bottom as:
-      // user → thinking → tool cards → response. Removing it caused the card
-      // to be re-created below everything when reasoning resumed post-tool.
+      // Provider reasoning/thinking is a Worklog Thinking Card, separate from
+      // tool cards. Close the current live card before appending a tool row.
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       liveReasoningText='';
-      reasoningText='';
       const oldRow=$('toolRunningRow');if(oldRow)oldRow.remove();
-      appendLiveToolCard(tc);
-      snapshotLiveTurn();
-      // Reset the live assistant row reference so that any text tokens arriving
-      // after this tool call create a NEW segment appended below the tool card,
-      // rather than updating the old segment that sits above it in the DOM.
+      const pendingDisplayText=segmentStart===0
+        ? (_parseStreamState().displayText||'')
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      if((assistantRow&&assistantBody)||String(pendingDisplayText||'').trim()){
+        ensureAssistantRow(true);
+      }
       _flushPendingSegmentRender({force:true});
+      appendLiveToolCard(tc,{sessionId:activeSid,streamId});
+      snapshotLiveTurn();
       _freshSegment=true;
       _smdEndParser();
       _resetAssistantSegment();
@@ -1705,59 +5068,106 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('tool_complete',e=>{
+      if(_terminalStateReached||_streamFinalized) return;
+      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
-      const inflight=INFLIGHT[activeSid];
-      if(!inflight) return;
-      if(!Array.isArray(inflight.toolCalls)) inflight.toolCalls=[];
-      let tc=null;
-      for(let i=inflight.toolCalls.length-1;i>=0;i--){
-        const cur=inflight.toolCalls[i];
-        if(cur&&cur.done===false&&(!d.name||cur.name===d.name)){
-          tc=cur;
-          break;
-        }
-      }
-      if(!tc){
-        tc={name:d.name||'tool', preview:d.preview||'', args:d.args||{}, snippet:'', done:true};
-        inflight.toolCalls.push(tc);
-      }
-      // Route result to .snippet (detail) instead of overwriting .preview
-      // (header).  During streaming .preview already holds the last progress
-      // text — replacing it with the same content caused header/detail
-      // duplication.  Fallback: if no progress events were sent, use the
-      // result as preview so the header is not blank.
-      if(d.preview){
-        tc.snippet=tc.snippet||d.preview;
-        if(!tc.preview) tc.preview=d.preview;
-      }
-      tc.args=d.args||tc.args||{};
-      tc.done=true;
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
+      const tc=upsertLiveToolCall(d,'complete');
+      if(!tc) return;
       tc.is_error=!!d.is_error;
-      if(d.duration!==undefined) tc.duration=d.duration;
-      S.toolCalls=inflight.toolCalls;
-      persistInflightState();
+      const pendingDisplayTextBeforeComplete=segmentStart===0
+        ? (_parseStreamState().displayText||'')
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      if(String(pendingDisplayTextBeforeComplete||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeComplete,{sealed:true});
+      _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e);
       if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
+      _maybeNotifyPersistentStateSaved(tc);
       if(typeof refreshOpenPreviewIfMutated==='function') refreshOpenPreviewIfMutated();
-      appendLiveToolCard(tc);
+      if(tc._createdByComplete){
+        const pendingDisplayText=segmentStart===0
+          ? (_parseStreamState().displayText||'')
+          : _stripXmlToolCalls(assistantText.slice(segmentStart));
+        if((assistantRow&&assistantBody)||String(pendingDisplayText||'').trim()){
+          ensureAssistantRow(true);
+          _flushPendingSegmentRender({force:true});
+        }
+        appendLiveToolCard(tc,{sessionId:activeSid,streamId});
+        _freshSegment=true;
+        _smdEndParser();
+        _resetAssistantSegment();
+      } else {
+        appendLiveToolCard(tc,{sessionId:activeSid,streamId});
+      }
       snapshotLiveTurn();
       scrollIfPinned();
     });
 
+    // Phase 2: dedicated `todo_state` event carries a full snapshot of
+    // the upstream TodoStore.  We treat it as the single source of truth
+    // for the Todos panel — never merge, always replace.  The handler
+    // is intentionally cheap: parse, validate, write S.todos, mirror to
+    // INFLIGHT, schedule a RAF render.  Out-of-order events are filtered
+    // by ts; SSE journal replay is idempotent because snapshots are full.
+    // Cross-session protection mirrors every other live listener:
+    // payload.session_id must match activeSid or the event is dropped.
+    source.addEventListener('todo_state',e=>{
+      let d;
+      try{ d=JSON.parse(e.data||'{}'); }catch(_){ return; }
+      if(!d||typeof d!=='object') return;
+      // Cross-session double check: payload.session_id is the SSE-side
+      // filter (some legacy emissions omit it), and S.session.session_id
+      // is the UI-side filter (a late event that arrives after the user
+      // already navigated to another session must not pollute S.todos).
+      // Both must agree with activeSid before we touch global state.
+      if(d.session_id&&d.session_id!==activeSid) return;
+      if(!S.session||S.session.session_id!==activeSid) return;
+      if(!Array.isArray(d.todos)) return;
+      const incomingTs=Number(d.ts)||0;
+      const currentTs=(S.todoStateMeta&&Number(S.todoStateMeta.ts))||0;
+      // Strictly older snapshots are discarded; equal-ts events still
+      // apply so a compression-source refresh can land on the same
+      // second as the tool emit it follows.
+      if(incomingTs&&currentTs&&incomingTs<currentTs) return;
+      S.todos=d.todos;
+      S.todoStateMeta={
+        ts:incomingTs||(Date.now()/1000),
+        source:String(d.source||'tool'),
+        version:Number(d.version)||1,
+      };
+      const inflight=INFLIGHT[activeSid];
+      if(inflight){
+        inflight.todos=S.todos;
+        inflight.todoStateMeta=S.todoStateMeta;
+      }
+      if(typeof persistInflightState==='function') persistInflightState();
+      if(typeof scheduleTodosRefresh==='function') scheduleTodosRefresh();
+    });
+
     source.addEventListener('approval',e=>{
       const d=JSON.parse(e.data);
+      _applyToAnchor('approval',d,e);
       showApprovalForSession(activeSid, d, 1);
       playAttentionSound(_attentionSoundKey(activeSid,'approval',1));
-      sendBrowserNotification('Approval required',d.description||'Tool approval needed');
+      sendBrowserNotification('Approval required',d.description||'Tool approval needed',{sid:activeSid});
     });
 
     source.addEventListener('clarify',e=>{
       const d=JSON.parse(e.data);
+      _applyToAnchor('clarify',d,e);
       showClarifyForSession(activeSid, d);
       playAttentionSound(_attentionSoundKey(activeSid,'clarify',1));
-      sendBrowserNotification('Clarification needed',d.question||'Tool clarification needed');
+      sendBrowserNotification('Clarification needed',d.question||'Tool clarification needed',{sid:activeSid});
+    });
+
+    source.addEventListener('state_saved',e=>{
+      let d={};
+      try{ d=JSON.parse(e.data||'{}'); }catch(_){}
+      if((d.session_id||activeSid)!==activeSid) return;
+      if(!S.session||S.session.session_id!==activeSid) return;
+      _showPersistentStateToast(d.kind, d.name||'', {created:String(d.action||'').toLowerCase()==='created'});
     });
 
     source.addEventListener('title',e=>{
@@ -1834,6 +5244,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const sid=d.session_id||activeSid;
         const continuation_prompt=String(d.continuation_prompt||d.text||'').trim();
         if(!continuation_prompt||sid!==activeSid)return;
+        _applyToAnchor('goal_continue',d,e);
         const _modelState=_chatPayloadModelState();
         _pendingGoalContinuation={
           sid,
@@ -1848,8 +5259,33 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     });
 
+    // bg_task_complete: terminal(notify_on_complete=true) background process
+    // exited. Option Z PIVOT: the agent wakeup is started SERVER-SIDE by the
+    // drain thread (api/background_process._process_one →
+    // routes.start_session_turn) with NO browser round-trip — so the
+    // closed-tab case works (parity with CLI/Telegram). The browser does NOT
+    // re-POST /api/chat/start anymore. This SSE event is pure LIVE-VIEW: if
+    // a tab is open the server-initiated turn streams live via the normal
+    // /api/chat/stream EventSource; if the tab is closed the turn still runs
+    // server-side and persists to the session store.
+    //
+    // Idempotency: dedupe by (session_id, event_id) via a Map+TTL ring
+    // buffer (`_bgTaskCompleteRingBufferAdd`).
+    //
+    // Option X: this handler is the in-turn (STREAMS-bound) path. The server
+    // dual-emits to the persistent session-scoped channel too — the
+    // `_handleBgTaskCompleteEvent` function below is shared between both
+    // paths (dedupe only; the wakeup itself is server-side).
+    source.addEventListener('bg_task_complete',e=>{
+      if(typeof _handleBgTaskCompleteEvent==='function'){
+        _handleBgTaskCompleteEvent(e, activeSid, {source:'stream'});
+      }
+    });
+
     source.addEventListener('done',e=>{
       if(_streamFinalized) return;
+      _clearStreamEndRecovery();
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       // Set _streamFinalized IMMEDIATELY — before any fade delay. Without this,
       // a stream_end event arriving during the fade window sees
       // _streamFinalized=false, calls _restoreSettledSession(), and overwrites
@@ -1857,7 +5293,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamFinalized=true;
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
       const _doneData=JSON.parse(e.data);
+      const _doneEvent=e;
       const _finishDone=()=>{
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
@@ -1880,13 +5318,33 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _smdEndParser();
         }
         const d=_doneData;
+        _flushReasoningToAnchor();
+        _applyToAnchor('done',{
+          status:d.status||'completed',
+          usage:d.usage||null,
+          created_at:d.created_at||null,
+        },_doneEvent);
+        _scheduleAnchorRegistryCleanup();
+        _clearAnchorProseIncrementalNode();
         const isActiveSession=_isSessionCurrentPane(activeSid);
         const isSessionViewed=_isSessionActivelyViewed(activeSid);
         const completedSession=d.session||{session_id:activeSid};
         const completedSid=completedSession.session_id||activeSid;
+        const completedMessageCount=completedSession.message_count != null
+          ? completedSession.message_count
+          : (
+            Array.isArray(completedSession.messages)
+              ? completedSession.messages.length
+              : (
+                (S.session&&((S.session.session_id||activeSid)===completedSid)&&S.session.message_count != null)
+                  ? S.session.message_count
+                  : ((Array.isArray(S.messages)&&S.messages.length)||0)
+              )
+          );
         if(!isSessionViewed && typeof _markSessionCompletionUnread==='function'){
-          _markSessionCompletionUnread(completedSid, completedSession.message_count);
+          _markSessionCompletionUnread(completedSid, completedMessageCount);
         }
+        if(isSessionViewed) _markSessionViewed(completedSid, completedMessageCount);
         _clearOwnerInflightState();
         if(typeof _markSessionCompletedInList==='function'){
           _markSessionCompletedInList(completedSession, activeSid);
@@ -1896,9 +5354,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const shouldFollowOnDone=isActiveSession&&((typeof _shouldFollowMessagesOnDomReplace==='function')
           ? _shouldFollowMessagesOnDomReplace()
           : (typeof _isMessagePaneNearBottom==='function'&&_isMessagePaneNearBottom(1200)));
+        const _settledStreamId=isActiveSession?(S.activeStreamId||(d&&d.stream_id)||''):'';
         if(isActiveSession){
           S.activeStreamId=null;
         }
+        let lastAsst=null;
         if(isActiveSession){
           // Capture previous session totals BEFORE overwriting S.session with the new
           // cumulative values from the done event. prevIn/prevOut are the totals as of
@@ -1910,7 +5370,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
           const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
           S.session=d.session;S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
+          // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
+          if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
           S.messages=_filterRecoveryControlMessages(S.messages || []);
+          if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
+          if(typeof clearVisibleMessageRowCache==='function') clearVisibleMessageRowCache();
           if(S.session&&S.session.session_id){
             try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
             if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
@@ -1924,13 +5388,36 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             window._compressionUi={...window._compressionUi, sessionId:d.session.session_id};
           }
           // Find the last assistant message once for both reasoning persistence and timestamp
-          const lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
-          // Persist reasoning trace so thinking card survives page reload
+          lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
+          // Persist reasoning trace for Worklog Thinking Cards; normal transcript
+          // rendering keeps provider reasoning out of the final answer.
           if(reasoningText&&lastAsst&&!lastAsst.reasoning) lastAsst.reasoning=reasoningText;
+          // Strip any inline <think> blocks still embedded in the server-side
+          // content (M3 OpenAI-compat doesn't separate reasoning). Move them
+          // to m.reasoning so the persisted session stays compact and the
+          // thinking card has a proper source field on reload.
+          if(lastAsst && typeof lastAsst.content === 'string' && lastAsst.content){
+            const split=_splitThinkFromContent(lastAsst.content, lastAsst.reasoning);
+            if(split.content!==lastAsst.content){
+              lastAsst.content=split.content;
+              if(split.reasoning) lastAsst.reasoning=split.reasoning;
+            }
+          }
           // Stamp _ts on the last assistant message if it has no timestamp
           if(lastAsst&&!lastAsst._ts&&!lastAsst.timestamp) lastAsst._ts=Date.now()/1000;
           if(d.usage){
-            S.lastUsage=d.usage;_syncCtxIndicator(d.usage);
+            const _doneUsageFallback={...(S.lastUsage||{})};
+            if(S.session){
+              for(const _usageField of ['context_length','threshold_tokens','last_prompt_tokens']){
+                if(_doneUsageFallback[_usageField]==null&&S.session[_usageField]!=null){
+                  _doneUsageFallback[_usageField]=S.session[_usageField];
+                }
+              }
+            }
+            S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
+              ? _mergeUsageForCtxIndicator(d.usage,_doneUsageFallback)
+              : {..._doneUsageFallback,...d.usage};
+            _syncCtxIndicator(S.lastUsage);
             // #503 — compute per-turn cost delta and attach to last assistant message
             if(lastAsst){
               const prevIn=_prevIn;
@@ -1966,6 +5453,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               }
             }
           }
+          _attachProjectedAnchorSceneToLastAssistant(S.messages);
           const hasMessageToolMetadata=S.messages.some(m=>{
             if(!m||m.role!=='assistant') return false;
             const hasTc=Array.isArray(m.tool_calls)&&m.tool_calls.length>0;
@@ -1974,15 +5462,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             return hasTc||hasPartialTc||hasTu;
           });
           if(!hasMessageToolMetadata&&d.session.tool_calls&&d.session.tool_calls.length){
-            S.toolCalls=d.session.tool_calls.map(tc=>({...tc,done:true}));
+            S.toolCalls=d.session.tool_calls.map(tc=>tc);
+            S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(d.session.tool_calls);
           } else {
+            if(hasMessageToolMetadata) S._settledLiveToolMetadata=S.toolCalls.map(tc=>({...tc,done:true}));
             S.toolCalls=hasMessageToolMetadata?[]:S.toolCalls.map(tc=>({...tc,done:true}));
           }
           if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
-          if(typeof _copyActivityDisclosureState==='function'&&lastAsst){
-            const assistantIdx=S.messages.indexOf(lastAsst);
-            if(assistantIdx>=0) _copyActivityDisclosureState('live:'+streamId, 'assistant:'+assistantIdx);
-          }
           if(uploaded.length){
             const lastUser=[...S.messages].reverse().find(m=>m.role==='user');
             if(lastUser)lastUser.attachments=uploaded;
@@ -2001,13 +5487,46 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // No-reply guard (#373): if agent returned nothing, show inline error
           if(!S.messages.some(m=>m.role==='assistant'&&String(m.content||'').trim())&&!assistantText){removeThinking();S.messages.push({role:'assistant',content:'**No response received.** Check your API key and model selection.'});}
           if(_markerOnlyAssistantError&&typeof showToast==='function') showToast('No response received after context compression. Please retry.',5000,'error');
-          if(isSessionViewed) _markSessionViewed(completedSid, completedSession.message_count ?? S.messages.length);
+          if(isSessionViewed) _markSessionViewed(completedSid, completedMessageCount);
+          // Cooldown: prevent refreshActiveSessionIfExternallyUpdated from
+          // force-reloading immediately after "done" — the event already
+          // delivered the final messages and tool calls.
+          if(typeof window!=='undefined') window._streamJustFinished=true;
+          setTimeout(()=>{ if(typeof window!=='undefined') window._streamJustFinished=false; }, 5000);
+          // Expand render window to cover all messages so the done render
+          // doesn't hide Activity behind a tiny window (winSize=50).
+          if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
+            _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
+          }
+          // #4650 review: the agent turn that just completed may have changed
+          // server-side reasoning config (e.g. a `/reasoning <level>` slash
+          // command writes agent.reasoning_effort) WITHOUT changing the model/
+          // provider cache key. Invalidate the reasoning-chip cache once at the
+          // turn boundary so the following syncTopbar() refetches the authoritative
+          // effort exactly once (not per-token — the storm short-circuit is intact).
+          if(typeof _lastReasoningFetchKey!=='undefined') _lastReasoningFetchKey=null;
+          // Arm one-shot keep-open so the JUST-settled worklog stays open on the
+          // settle render (height-stable swap, no shrink jump). Disarm, then run a
+          // scroll-PRESERVING collapse pass for BOTH pin states so the worklog
+          // returns to its copied live/user disclosure state (a pinned follower's
+          // scrollToBottom() only settles scroll, it does NOT re-render, so without
+          // this pass the forced-open DOM would persist for them). This unarmed
+          // render also populates the cache with the correctly-collapsed DOM, and
+          // the same-frame JS restore absorbs the collapse so there is no jump.
+          // (#5260 gate-cert: keep-open must be transient + uncached for everyone.)
+          if(typeof _armKeepSettledWorklogOpen==='function') _armKeepSettledWorklogOpen(_settledStreamId);
           syncTopbar();renderMessages({preserveScroll:true});
+          if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
+          if(typeof _renderMessagesWithScrollSnapshot==='function') _renderMessagesWithScrollSnapshot();
+          else renderMessages({preserveScroll:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
           loadDir('.', { preservePreview: true });
           // TTS auto-read: speak the last assistant response if enabled (#499)
           if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
+        }
+        if(!lastAsst&&d.session&&Array.isArray(d.session.messages)){
+          lastAsst=[...d.session.messages].reverse().find(m=>m&&m.role==='assistant')||null;
         }
         if(isActiveSession&&_pendingGoalContinuation&&typeof queueSessionMessage==='function'){
           const _goalNext=_pendingGoalContinuation;
@@ -2025,9 +5544,19 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         renderSessionList();
         _setActivePaneIdleIfOwner();
         playNotificationSound();
-        sendBrowserNotification('Response complete',assistantText?assistantText.slice(0,100):'Task finished');
+        // #4416: notify if the tab was hidden at ANY point during this stream
+        // (not just at done-receive time, which a throttled background-tab SSE
+        // delivers late — after the user returns and document.hidden is false).
+        // If the user watched the whole stream, _wasEverHidden stays false and
+        // the notification is suppressed (matches Slack/Discord/Gmail/Claude).
+        const _wasEverBackgrounded=_shouldForceCompletionNotification(activeSid, streamId);
+        const _completionPreview=_completionNotificationPreviewText(lastAsst,{
+          sessionId:completedSid,
+          liveDisplayText:typeof _streamDisplay==='function'?_streamDisplay():assistantText,
+        });
+        sendBrowserNotification('Response complete',_completionPreview||'Task finished',{forceHidden:_wasEverBackgrounded,sid:activeSid});
       };
-      if(_shouldUseStreamFade()&&assistantBody){
+      if(_shouldUseLiveProseFade()&&assistantBody){
         _cancelAnimationFramePendingStreamRender();
         _drainStreamFadeBeforeDone(_finishDone);
         return;
@@ -2040,26 +5569,30 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _closeSource(source);
         return;
       }
-      _terminalStateReached=true;
+      _clearStreamEndRecovery();
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
       }catch(_){}
+      if(S.activeStreamId===streamId && _liveStreamEndScenePresent()){
+        _scheduleStreamEndRecovery(source);
+        return;
+      }
       // Some replay/journal paths can deliver stream_end without a preceding
       // done event. In that case closing the EventSource is not enough: the
       // live DOM/inflight state remains projected and can duplicate Thinking or
       // assistant content until a later session switch. Settle from the persisted
       // session before closing so the pane converges on canonical state.
-      if(await _restoreSettledSession(source)){
+      const status=await _restoreSettledSession(source,{status:true});
+      if(status==='restored'){
         return;
       }
-      if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
-      _streamFinalized=true;
-      _cancelAnimationFramePendingStreamRender();
-      _streamFadeCleanupReduceMotionListener();
-      _smdEndParser();
-      if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
-      _closeSource(source);
+      if(status==='active'&&S.activeStreamId===streamId){
+        _scheduleStreamEndRecovery(source,200);
+        return;
+      }
+      _finalizeStreamEndFallback(source);
     });
 
     source.addEventListener('pending_steer_leftover',e=>{
@@ -2072,6 +5605,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const sid=d.session_id||activeSid;
         const txt=String(d.text||'').trim();
         if(!txt||sid!==activeSid) return;
+        _applyToAnchor('pending_steer_leftover',d,e);
         if(typeof queueSessionMessage==='function'){
           const _modelState=_chatPayloadModelState();
           queueSessionMessage(sid,{
@@ -2093,33 +5627,33 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       let d={};
       try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
       if(d.session_id&&d.session_id!==activeSid) return;
-      if(typeof setCompressionUi==='function'){
-        const state={
-          sessionId:activeSid,
-          phase:'running',
-          automatic:true,
-          message:d.message||'Auto-compressing context...',
-          startedAt:Date.now()/1000,
-        };
-        setCompressionUi(state);
-        const liveAnswerStarted=!!(assistantRow||String(((_parseStreamState&&_parseStreamState())||{}).displayText||'').trim());
-        if(liveAnswerStarted&&typeof appendLiveCompressionCard==='function'&&appendLiveCompressionCard(state)){
-          // The live card is now anchored in the turn. Keeping the same running
-          // state in global transient UI makes later renderMessages() calls insert
-          // a duplicate Automatic Compression card.
-          window._compressionUi=null;
-          snapshotLiveTurn();
-          return;
-        }
+      _applyToAnchor('compressing',d,e);
+      const state={
+        sessionId:activeSid,
+        phase:'running',
+        automatic:true,
+        message:'Compressing context',
+        startedAt:Date.now()/1000,
+      };
+      if(typeof appendLiveCompressionCard==='function'&&appendLiveCompressionCard(state)){
+        // Keep automatic compression inside the active Worklog. Calling
+        // renderMessages() here rebuilds from the still-empty persisted
+        // transcript during active streams and can erase already replayed tools.
+        if(typeof clearCompressionUi==='function') clearCompressionUi();
+        else window._compressionUi=null;
+        snapshotLiveTurn();
+        return;
       }
-      if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+      if(typeof setCompressionUi==='function'){
+        setCompressionUi(state);
+      }
       snapshotLiveTurn();
     });
 
     source.addEventListener('compressed',e=>{
-      // Context was auto-compressed during this turn. Render it through the
-      // same transient compression-card path as manual /compress, without
-      // inserting a fake assistant message into history or model context.
+      // Context was auto-compressed during this turn. Keep the live timeline
+      // honest by transitioning the running divider into a completed divider;
+      // final settlement removes live-only compression rows from the Worklog.
       if(!S.session) return;
       const currentSid=S.session.session_id;
       let d={};
@@ -2128,37 +5662,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const continuationSid=d.new_session_id||d.continuation_session_id||'';
       const eventMatchesCurrent=!!(currentSid&&(eventSid===currentSid||d.new_session_id===currentSid||d.continuation_session_id===currentSid));
       if(!eventMatchesCurrent) return;
+      _applyToAnchor('compressed',d,e);
       const displaySid=currentSid;
-      const message=String(d.message||'Context auto-compressed to continue the conversation').trim();
       if(d.usage&&typeof _syncCtxIndicator==='function'){
-        S.lastUsage={...(S.lastUsage||{}),...d.usage};
+        S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
+          ? _mergeUsageForCtxIndicator(d.usage,S.lastUsage||{})
+          : {...(S.lastUsage||{}),...d.usage};
         _syncCtxIndicator(S.lastUsage);
       }
-      if(typeof setCompressionUi==='function'){
-        const state={
+      if(typeof appendLiveCompressionCard==='function'){
+        appendLiveCompressionCard({
           sessionId:displaySid,
           phase:'done',
           automatic:true,
-          message,
-          engine:d.engine,
-          mode:d.mode,
-          details:d.details,
-          summary:{headline:message},
+          message:'Context auto-compressed',
           continuationSessionId:continuationSid,
-        };
-        setCompressionUi(state);
-        const appended=typeof appendLiveCompressionCard==='function'&&appendLiveCompressionCard(state);
-        if(appended){
-          // The live card is now anchored in the turn. Do not keep the automatic
-          // completion state as global transient UI, otherwise every subsequent
-          // render projects the same Auto Compression card again.
-          window._compressionUi=null;
-          snapshotLiveTurn();
-        }
+        });
       }
+      if(typeof clearCompressionUi==='function') clearCompressionUi();
+      else window._compressionUi=null;
       if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
       if(!S.busy&&typeof renderMessages==='function') renderMessages();
-      showToast(message||'Context compressed', 8000);
     });
 
     source.addEventListener('metering',e=>{
@@ -2167,7 +5691,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if((d.session_id||activeSid)!==activeSid) return;
         if(d.usage&&typeof _syncCtxIndicator==='function'){
           if(S.session&&S.session.session_id===activeSid){
-            S.lastUsage={...(S.lastUsage||{}),...d.usage};
+            S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
+              ? _mergeUsageForCtxIndicator(d.usage,S.lastUsage||{})
+              : {...(S.lastUsage||{}),...d.usage};
             _syncCtxIndicator(S.lastUsage);
           }
         }
@@ -2180,8 +5706,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('apperror',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
@@ -2189,16 +5719,37 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       // Application-level error sent explicitly by the server (rate limit, crash, etc.)
       // This is distinct from the SSE network 'error' event below.
-      source.close();
+      try{if(source&&source.readyState!==2)source.close();}catch(_){ }
       _clearOwnerInflightState();
+      _clearStreamHidden(activeSid, streamId);  // #4416: terminal path, drop hidden tracker
+      _clearStreamNotificationBackground(activeSid, streamId);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
-      if(S.session&&S.session.session_id===activeSid){
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      const currentSid=S.session&&S.session.session_id;
+      const eventSid=d.old_session_id||d.session_id||'';
+      const continuationSid=(d.session&&d.session.session_id)||d.new_session_id||d.continuation_session_id||'';
+      const eventMatchesCurrent=!!(currentSid&&(eventSid===currentSid||continuationSid===currentSid));
+      if(eventMatchesCurrent){
+        _flushReasoningToAnchor();
+        _applyToAnchor('apperror',{
+          type:d.type||'error',
+          status:d.status||d.type||'error',
+          message:d.message||'',
+          hint:d.hint||'',
+          details:d.details||'',
+          session_id:d.session_id||eventSid||activeSid,
+          old_session_id:d.old_session_id||null,
+          new_session_id:d.new_session_id||d.continuation_session_id||null,
+        },e);
+      }
+      if(S.session&&eventMatchesCurrent){
         S.activeStreamId=null;
+        _scheduleAnchorRegistryCleanup();
         clearLiveToolCards();if(!assistantText)removeThinking();
         let isRecoveryControlMessage=false;
         try{
-          const d=JSON.parse(e.data);
           const isRateLimit=d.type==='rate_limit';
           const isQuotaExhausted=d.type==='quota_exhausted';
           const isAuthMismatch=d.type==='auth_mismatch';
@@ -2206,23 +5757,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const isModelNotFound=d.type==='model_not_found';
           const isCancelled=d.type==='cancelled';
           const isInterrupted=d.type==='interrupted';
+          const isCompressionExhausted=d.type==='compression_exhausted';
+          const isToolLimitReached=d.type==='tool_limit_reached';
           isRecoveryControlMessage=isInterrupted && (d.recovery_control===true || _streamRecoveryControlMessageText(d.message));
           const isNoResponse=d.type==='no_response'||d.type==='silent_failure';
-          const label=isCancelled?'Task cancelled':isInterrupted?'Response interrupted':isQuotaExhausted?'Out of credits':isRateLimit?'Rate limit reached':isGatewayAuthError?(typeof t==='function'?t('gateway_auth_label'):'Gateway authentication failed'):isAuthMismatch?(typeof t==='function'?t('provider_mismatch_label'):'Provider mismatch'):isModelNotFound?(typeof t==='function'?t('model_not_found_label'):'Model not found'):isNoResponse?'No response from provider':'Error';
+          const label=isCancelled?'Task cancelled':isInterrupted?'Response interrupted':isCompressionExhausted?'Context compression exhausted':isToolLimitReached?'Tool iteration limit reached':isQuotaExhausted?'Out of credits':isRateLimit?'Rate limit reached':isGatewayAuthError?(typeof t==='function'?t('gateway_auth_label'):'Gateway authentication failed'):isAuthMismatch?(typeof t==='function'?t('provider_mismatch_label'):'Provider mismatch'):isModelNotFound?(typeof t==='function'?t('model_not_found_label'):'Model not found'):isNoResponse?'No response from provider':'Error';
           const hint=d.hint?`\n\n*${d.hint}*`:'';
           const details=d.details?String(d.details).replace(/```/g,'`\u200b``'):'';
-          const detailsLabel=isCancelled?'Cancellation details':isInterrupted?'Interruption details':undefined;
+          const detailsLabel=isCancelled?'Cancellation details':isInterrupted?'Interruption details':isToolLimitReached?'Terminal state details':undefined;
+          window._compressionUi=null;
+          if(typeof clearCompressionUi==='function') clearCompressionUi();
           if(isRecoveryControlMessage){
             if(typeof showToast==='function') showToast('Stream recovery signal received. Restoring transcript...',3500,'error');
+          } else if(d.session&&typeof d.session==='object'){
+            S.session=d.session;
+            const _nextMsgs3018=(d.session.messages||[]).filter(m=>m&&m.role);
+            _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
+            S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
+            if(S.session&&S.session.session_id){
+              try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
+              if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
+            }
           } else {
-            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel});
+            const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')?d.compression_recovery:null;
+            S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
+            _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
         }catch(_){
           S.messages.push({role:'assistant',content:'**Error:** An error occurred. Check server logs.'});
+          _attachProjectedAnchorSceneToLastAssistant(S.messages);
         }
         if(isRecoveryControlMessage){
           (async()=>{
-            if(await _restoreSettledSession(source)) return;
+            if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
             if(S.session&&S.session.session_id===activeSid){
               S.messages=_filterRecoveryControlMessages(S.messages||[]);
               _markSessionViewed(activeSid, S.messages.length);
@@ -2230,13 +5797,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             }
           })();
         } else {
-          _markSessionViewed(activeSid, S.messages.length);
+          _markSessionViewed((S.session&&S.session.session_id)||activeSid, S.messages.length);
           renderMessages({preserveScroll:true});
         }
       }else if(typeof trackBackgroundError==='function'){
         const _errTitle=(typeof _allSessions!=='undefined'&&_allSessions.find(s=>s.session_id===activeSid)||{}).title||null;
-        try{const d=JSON.parse(e.data);trackBackgroundError(activeSid,_errTitle,d.message||'Error');}
-        catch(_){trackBackgroundError(activeSid,_errTitle,'Error');}
+        trackBackgroundError(activeSid,_errTitle,d.message||'Error');
       }
       _setActivePaneIdleIfOwner();
       renderSessionList(); // clear streaming indicator immediately on apperror
@@ -2247,6 +5813,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!S.session||S.session.session_id!==activeSid) return;
       try{
         const d=JSON.parse(e.data);
+        if(d.type==='approval_gateway_unsupported'){
+          if(typeof showToast==='function') showToast(typeof t==='function'?t('approval_gateway_unsupported_label'):'Approvals not supported',4000,'warning');
+          return;
+        }
+        if(d.type==='approval_gateway_offline'){
+          if(typeof showToast==='function') showToast(d.message||'Gateway offline',4000,'warning');
+          return;
+        }
         // Show as a small inline notice, not a full error
         setComposerStatus(`${d.message||'Warning'}`);
         // If it's a fallback notice, show it briefly then clear
@@ -2255,12 +5829,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('error',async e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source) && !_streamFinalized){
+        return;
+      }
       if(_terminalStateReached || _streamFinalized){
         _closeSource(source);
         return;
       }
+      // #3885: if a stream_end recovery is in flight, don't start a competing
+      // reconnect — recovery polls server state and owns the terminal decision
+      // (else its exhaustion could mute a freshly reconnected stream). Opus stage-LK.
+      if(_pendingStreamEndRecovery){
+        _closeSource(source);
+        return;
+      }
       if(typeof recordClientSSEError==='function') recordClientSSEError('chat-response',{ready_state:source?source.readyState:null,session_id:activeSid,stream_id:streamId,reason:'chat EventSource.onerror'});
-      source.close();
+      try{if(source&&source.readyState!==2)source.close();}catch(_){ }
       if(_deferStreamErrorIfOffline()) return;
       if(_deferStreamErrorIfPageHidden(source)) return;
       _closeSource(source);
@@ -2271,19 +5855,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_terminalStateReached || _streamFinalized){
         return;
       }
-      // Attempt one reconnect if the stream is still active server-side
+      // Attempt several reconnect/replay probes before declaring the turn lost.
+      // A short-lived SSE error can arrive while the worker is still running or
+      // while the run-journal replay file is just becoming visible. The old
+      // single 1.5s probe could fall through to _handleStreamError(), clearing
+      // S.activeStreamId/INFLIGHT and rendering a connection-interrupted marker
+      // even though the backend was still producing tokens; the settled response
+      // then reappeared later from sidecar/replay. Keep the live DOM/state intact
+      // during this retry window and only surface an error after all probes fail.
       if(!_reconnectAttempted && streamId){
         _reconnectAttempted=true;
-        setComposerStatus('Reconnecting…');
-        setTimeout(async()=>{
+        const _retryDelays=[1500,3000,5000,8000,12000,20000];
+        setComposerStatus(`Reconnecting… (1/${_retryDelays.length})`);
+        const _probeReconnect=async(attempt=0)=>{
+          if(_terminalStateReached || _streamFinalized) return;
+          if(!_isSessionCurrentPane(activeSid)) return;
           try{
             const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
-            if(st.active){
+            if(st&&st.active){
               setComposerStatus('Reconnected');
               _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
-            if(st.replay_available){
+            if(st&&st.replay_available){
               setComposerStatus('Restoring stream…');
               _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
@@ -2291,54 +5885,152 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }catch(_){
             if(_deferStreamErrorIfOffline()) return;
           }
-          if(await _restoreSettledSession(source)) return;
+          if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
           if(_deferStreamErrorIfOffline()) return;
           if(_deferStreamErrorIfPageHidden(source)) return;
+          const nextDelay=_retryDelays[attempt+1];
+          if(nextDelay){
+            setComposerStatus(`Reconnecting… (${attempt+2}/${_retryDelays.length})`);
+            setTimeout(()=>{void _probeReconnect(attempt+1);}, nextDelay);
+            return;
+          }
+          // Last-ditch: the stream may have finished while we were retrying.
+          // _restoreSettledSession polls the full session API (not just stream
+          // status) and can recover a completed response without an error banner.
+          // This is especially important on iOS where Tailscale reconnects can
+          // take longer than the retry window.
+          setComposerStatus('Restoring session…');
+          let _restoreTimedOut=false;
+          const _restoreTimer=setTimeout(()=>{
+            // If _restoreSettledSession hangs (flaky Tailscale), don't leave
+            // the UI stuck on "Restoring session…" forever. Fall through to
+            // _handleStreamError after 8s.
+            _restoreTimedOut=true;
+            if(!_terminalStateReached&&!_streamFinalized){
+              if(_deferStreamErrorIfOffline()) return;
+              if(_deferStreamErrorIfPageHidden(source)) return;
+              _flushReasoningToAnchor();
+              _scheduleAnchorRegistryCleanup(120000);
+              _handleStreamError(source);
+            }
+          },8000);
+          try{
+            if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})){
+              if(_restoreTimedOut) return; // timer already fired _handleStreamError
+              clearTimeout(_restoreTimer);
+              return;
+            }
+          }catch(_){
+            // _restoreSettledSession threw. If the timer already fired,
+            // _handleStreamError was called there; we return below.
+            // Otherwise the code below cancels the timer and calls it directly.
+          }
+          if(_restoreTimedOut) return; // timer already fired _handleStreamError
+          clearTimeout(_restoreTimer);
+          if(_terminalStateReached||_streamFinalized) return;
+          if(_deferStreamErrorIfOffline()) return;
+          if(_deferStreamErrorIfPageHidden(source)) return;
+          _flushReasoningToAnchor();
+          _scheduleAnchorRegistryCleanup(120000);
           _handleStreamError(source);
-        },1500);
+        };
+        setTimeout(()=>{void _probeReconnect(0);},_retryDelays[0]);
         return;
       }
-      if(await _restoreSettledSession(source)) return;
+      if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
       if(_deferStreamErrorIfOffline()) return;
       if(_deferStreamErrorIfPageHidden(source)) return;
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup(120000);
       _handleStreamError(source);
     });
 
     source.addEventListener('cancel',e=>{
+      if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
-      source.close();
+      try{if(source&&source.readyState!==2)source.close();}catch(_){ }
       _clearOwnerInflightState();
+      _clearStreamHidden(activeSid, streamId);  // #4416: terminal path, drop hidden tracker
+      _clearStreamNotificationBackground(activeSid, streamId);
       _clearApprovalForOwner();
       _clearClarifyForOwner('cancelled');
+      let _cancelData={};
+      try{ _cancelData=JSON.parse(e.data||'{}')||{}; }catch(_){ _cancelData={}; }
+      _flushReasoningToAnchor();
+      _applyToAnchor('cancel',{
+        status:_cancelData.status||_cancelData.type||'cancelled',
+        message:_cancelData.message||'',
+        session_id:_cancelData.session_id||activeSid,
+      },e);
+      _scheduleAnchorRegistryCleanup();
       if(S.session&&S.session.session_id===activeSid){
         S.activeStreamId=null;
       }
-      // Fetch latest session from server to get accurate message list (includes cancel status)
-      // This ensures messages stay in sync with server, fixing race condition where local
-      // "*Task cancelled.*" message gets lost when done event overwrites S.messages
+      const _applyCancelSessionPayload=(sessionPayload)=>{
+        if(!sessionPayload||typeof sessionPayload!=='object'||!S.session||S.session.session_id!==activeSid) return false;
+        // Belt-and-suspenders: the embedded cancel snapshot must be for THIS session.
+        // The GET path guarantees it via the URL; the embedded path via the stream→session
+        // binding — but reject a mismatched id so a stray payload can't overwrite the view.
+        if(sessionPayload.session_id&&sessionPayload.session_id!==activeSid) return false;
+        // Capture follow-intent BEFORE replacing S.messages: a reader who was
+        // following the live stream when it got cancelled/reconnected must land at
+        // the bottom (where the cancellation notice renders), not be stranded at a
+        // stale mid-stream scrollTop by preserveScroll's restore path. Same
+        // jump-on-recovery class as the Connection-interrupted path below.
+        const _wasFollowingAtCancel=((typeof _isMessagePaneNearBottom==='function')
+            ? _isMessagePaneNearBottom(1200)
+            : true)
+          && !((typeof _isMessageReaderUnpinned==='function')
+            ? _isMessageReaderUnpinned()
+            : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
+        S.session=sessionPayload;
+        const _nextMsgs3018=(sessionPayload.messages||[]).filter(m=>m&&m.role);
+        _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
+        S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
+        if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
+        clearLiveToolCards();if(!assistantText)removeThinking();
+        _markSessionViewed(activeSid, sessionPayload.message_count ?? S.messages.length);
+        renderMessages({preserveScroll:true});
+        if(_wasFollowingAtCancel && typeof scrollToBottom==='function') scrollToBottom();
+        return true;
+      };
+      // Prefer the canonical session snapshot embedded in the terminal cancel event.
+      // It includes _partial reasoning/tool rows captured by cancel_stream(), avoiding
+      // a second GET race where the visible cancelled work briefly collapses to only
+      // the fallback "Task cancelled" marker (#4076).
+      const _cancelSessionPayload=_cancelData&&typeof _cancelData.session==='object'?_cancelData.session:null;
       (async()=>{
         try{
+          if(_applyCancelSessionPayload(_cancelSessionPayload)) return;
+          // Fetch latest session from server to get accurate message list (includes cancel status)
+          // This ensures messages stay in sync with server, fixing race condition where local
+          // "*Task cancelled.*" message gets lost when done event overwrites S.messages
           const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);
-          if(data&&data.session&&S.session&&S.session.session_id===activeSid){
-            S.session=data.session;
-            const _nextMsgs3018=(data.session.messages||[]).filter(m=>m&&m.role);
-            S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
-            clearLiveToolCards();if(!assistantText)removeThinking();
-            _markSessionViewed(activeSid, data.session.message_count ?? S.messages.length);
-            renderMessages({preserveScroll:true});
-          }
+          if(data&&data.session) _applyCancelSessionPayload(data.session);
         }catch(_){
           // Fallback to local cancel message if API fails
           if(S.session&&S.session.session_id===activeSid){
+            const _wasFollowingAtCancelFb=((typeof _isMessagePaneNearBottom==='function')
+                ? _isMessagePaneNearBottom(1200)
+                : true)
+              && !((typeof _isMessageReaderUnpinned==='function')
+                ? _isMessageReaderUnpinned()
+                : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
             clearLiveToolCards();if(!assistantText)removeThinking();
             const cancelAgentName=(assistantDisplayName()+'').trim()||'Hermes';
-            S.messages.push({role:'assistant',content:`**Task cancelled:** Task cancelled.\n\n*The run was cancelled by the user before ${cancelAgentName} finished. No provider failure occurred.*`,provider_details:'Task cancelled.',provider_details_label:'Cancellation details',_error:true});renderMessages({preserveScroll:true});
+            S.messages.push({role:'assistant',content:`**Task cancelled:** Task cancelled.\n\n*The run was cancelled by the user before ${cancelAgentName} finished. No provider failure occurred.*`,provider_details:'Task cancelled.',provider_details_label:'Cancellation details',_error:true});
+            _attachProjectedAnchorSceneToLastAssistant(S.messages);
+            renderMessages({preserveScroll:true});
+            if(_wasFollowingAtCancelFb && typeof scrollToBottom==='function') scrollToBottom();
             _markSessionViewed(activeSid, S.messages.length);
           }
         }
@@ -2347,7 +6039,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _setActivePaneIdleIfOwner();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','approval','clarify','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
   }
@@ -2370,7 +6062,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return `${m.role}|${ts}|${body.slice(0,160)}`;
   }
-  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard'];
+  const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];
   function _carryForwardEphemeralTurnFields(prevMessages, nextMessages){
     if(!Array.isArray(prevMessages)||!Array.isArray(nextMessages)) return nextMessages;
     if(!prevMessages.length||!nextMessages.length) return nextMessages;
@@ -2394,22 +6086,32 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     window._carryForwardEphemeralTurnFields=_carryForwardEphemeralTurnFields;
   }
 
-  async function _restoreSettledSession(source){
+  async function _restoreSettledSession(source, options=null){
+    const returnStatus=!!(options&&options.status);
+    const preserveVisibleOnShorterTerminalSnapshot=!!(options&&options.preserveVisibleOnShorterTerminalSnapshot);
+    if(_isActiveSession() && S.activeStreamId!==streamId){
+      _closeSource(source);
+      return returnStatus?'stale':false;
+    }
     try{
       const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);
       // Opus #2852 race-fix: if a late `done` event ran the finalize path while
       // we were awaiting the network roundtrip, bail out — done already settled.
-      if(_streamFinalized) return true;
+      if(_streamFinalized) return returnStatus?'restored':true;
       const session=data&&data.session;
-      if(!session) return false;
-      if(session.active_stream_id||session.pending_user_message) return false;
+      if(!session) return returnStatus?'missing':false;
+      if(session.active_stream_id||session.pending_user_message) return returnStatus?'active':false;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+      _cancelThrottledSnapshotTimer();
+      _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       _clearOwnerInflightState();
+      _flushReasoningToAnchor();
+      _scheduleAnchorRegistryCleanup();
       _closeSource(source);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
@@ -2424,8 +6126,30 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         clearLiveToolCards();if(!assistantText)removeThinking();
         S.session=session;
         const _nextMsgs3018=(session.messages||[]).filter(m=>m&&m.role);
-        S.messages=_carryForwardEphemeralTurnFields(S.messages||[], _nextMsgs3018);
-        S.messages=_filterRecoveryControlMessages(S.messages || []);
+        const _currentMessages=Array.isArray(S.messages)?S.messages:[];
+        const _currentVisibleMessages=_filterRecoveryControlMessages(_currentMessages || []);
+        const _stagedMessages=_carryForwardEphemeralTurnFields(_currentMessages, _nextMsgs3018);
+        const _currentVisibleEndsWithTerminalMarker=(
+          _currentVisibleMessages.length>0 &&
+          _isTerminalStreamErrorMarkerMessage(_currentVisibleMessages[_currentVisibleMessages.length-1])
+        );
+        const _stagedMatchesCurrentPrefix=(
+          _stagedMessages.length>0 &&
+          _stagedMessages.length<_currentVisibleMessages.length &&
+          _currentVisibleEndsWithTerminalMarker &&
+          _stagedMessages.every((message, idx)=>{
+            const stagedKey=_messageIdentityKey(message);
+            const currentKey=_messageIdentityKey(_currentVisibleMessages[idx]);
+            return !!stagedKey && stagedKey===currentKey;
+          })
+        );
+        const _preserveCurrentTranscript=preserveVisibleOnShorterTerminalSnapshot&&_stagedMatchesCurrentPrefix;
+        const _resolvedMessages=_preserveCurrentTranscript
+          ? [..._stagedMessages,..._currentVisibleMessages.slice(_stagedMessages.length)]
+          : _stagedMessages;
+        S.messages=_filterRecoveryControlMessages(_resolvedMessages || []);
+        _attachProjectedAnchorSceneToLastAssistant(S.messages);
+        if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
         if(S.session&&S.session.session_id){
           try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
           if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
@@ -2444,26 +6168,38 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           return hasTc||hasPartialTc||hasTu;
         });
         if(!hasMessageToolMetadata&&session.tool_calls&&session.tool_calls.length){
-          S.toolCalls=(session.tool_calls||[]).map(tc=>({...tc,done:true}));
+          S.toolCalls=_mergeSettledToolCallsWithLiveMetadata(session.tool_calls||[]);
         }else{
+          if(hasMessageToolMetadata) S._settledLiveToolMetadata=S.toolCalls.map(tc=>({...tc,done:true}));
           S.toolCalls=[];
         }
         if(isSessionViewed) _markSessionViewed(completedSid, session.message_count ?? S.messages.length);
+        // Expand render window so the settled render doesn't hide Activity.
+        if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
+          _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
+        }
         syncTopbar();renderMessages({preserveScroll:true});
       }
       if(_isActiveSession()) _queueDrainSid=activeSid;
       renderSessionList();
       _setActivePaneIdleIfOwner();
-      return true;
+      return returnStatus?'restored':true;
     }catch(_){
-      return false;
+      return returnStatus?'error':false;
     }
   }
 
   function _handleStreamError(source){
+    if(_isActiveSession() && S.activeStreamId!==streamId){
+      _closeSource(source);
+      return;
+    }
+    _clearStreamEndRecovery();
     // Opus review Q1: mirror done/apperror/cancel finalization so any pending rAF
     // cannot fire after renderMessages() has settled the DOM with the error message.
     if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
+    _cancelThrottledSnapshotTimer();
+    _clearAnchorProseIncrementalNode();
     _streamFinalized=true;
     _cancelAnimationFramePendingStreamRender();
     _streamFadeCleanupReduceMotionListener();
@@ -2474,8 +6210,45 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _clearClarifyForOwner('terminal');
     if(S.session&&S.session.session_id===activeSid){
       S.activeStreamId=null;
+      // Capture the reader's follow-intent BEFORE mutating S.messages. If the SSE
+      // dropped while they were following the live stream (pinned / near the
+      // bottom), the disconnect-recovery render must land them at the bottom where
+      // the "Connection interrupted" notice appears — NOT restore a stale
+      // mid-stream scrollTop. preserveScroll's restore path keys on the pre-render
+      // snapshot's bottom-distance, which during a live stream can read large
+      // (content was still growing under a followed viewport), so it would yank a
+      // following reader up to a historical position on a process restart / SSE
+      // drop. This is the "restart/disconnect jump-back" report: the jump is the
+      // recovery render restoring an old position into a DOM whose height changed.
+      // Follow-intent must be STICKY-aware: a reader who manually scrolled up
+      // (sets _messageUserUnpinned, ui.js scroll listener) but stayed within
+      // 1200px of the bottom would read _isMessagePaneNearBottom(1200)===true,
+      // so a proximity-only check would re-follow them on recovery and clobber
+      // their position (maintainer-reproduced bounce). Require near-bottom AND
+      // not-unpinned. scrollToBottom() clears _messageUserUnpinned, so a genuine
+      // follower stays pinned; only a manually-unpinned reader is spared.
+      const _wasFollowingAtDisconnect=((typeof _isMessagePaneNearBottom==='function')
+          ? _isMessagePaneNearBottom(1200)
+          : true)
+        && !((typeof _isMessageReaderUnpinned==='function')
+          ? _isMessageReaderUnpinned()
+          : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
+      _flushReasoningToAnchor();
+      _applyToAnchor('error',{
+        status:'connection_lost',
+        message:'The browser lost the live SSE connection before the response finished.',
+        session_id:activeSid,
+      },null);
       clearLiveToolCards();if(!assistantText)removeThinking();
-      S.messages.push({role:'assistant',content:'**Connection interrupted:** The browser lost the live SSE connection before the response finished. If the worker completed, reopening this session should restore the settled transcript.'});renderMessages({preserveScroll:true});
+      _ensureSingleTerminalStreamErrorMarker(S.messages);
+      _attachProjectedAnchorSceneToLastAssistant(S.messages);
+      renderMessages({preserveScroll:true});
+      // If they were following the stream, force the viewport to the bottom after
+      // the recovery render so they see the interruption notice in place instead
+      // of being thrown back into the transcript. Readers who had scrolled up to
+      // read history are left where they were (the near-bottom guard above is
+      // false for them).
+      if(_wasFollowingAtDisconnect && typeof scrollToBottom==='function') scrollToBottom();
       _markSessionViewed(activeSid, S.messages.length);
     }else{
       if(typeof trackBackgroundError==='function'){
@@ -2500,19 +6273,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           _clearApprovalForOwner();
           _clearClarifyForOwner('terminal');
           if(S.session&&S.session.session_id===activeSid){
+            // Follow-intent BEFORE removing live placeholders: a reader following
+            // the (now-dead) stream should stay pinned to the bottom as the
+            // thinking/tool placeholders are cleared, not be stranded mid-transcript
+            // by preserveScroll restoring a stale scrollTop after the height shrinks.
+            const _wasFollowingAtReconnectDead=((typeof _isMessagePaneNearBottom==='function')
+                ? _isMessagePaneNearBottom(1200)
+                : true)
+              && !((typeof _isMessageReaderUnpinned==='function')
+                ? _isMessageReaderUnpinned()
+                : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
             S.activeStreamId=null;
             clearLiveToolCards();
             removeThinking();
             if(_isActiveSession()) _queueDrainSid=activeSid;
             _setActivePaneIdleIfOwner();
             renderMessages({preserveScroll:true});
+            if(_wasFollowingAtReconnectDead && typeof scrollToBottom==='function') scrollToBottom();
             renderSessionList();
           }
+          _scheduleAnchorRegistryCleanup(120000);
           return;
         }
       }catch(_){}
     }
-    const replayParams=replayOnly?_runJournalReplayParams():'';
+    const replayParams=(reconnecting||replayOnly)?_runJournalReplayParams():'';
     _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${replayParams}`,document.baseURI||location.href).href,{withCredentials:true}));
   })();
 
@@ -2533,7 +6318,34 @@ function transcript(){
   return lines.join('\n');
 }
 
-function autoResize(){const el=$('msg');el.style.height='auto';el.style.height=Math.min(el.scrollHeight,200)+'px';updateSendBtn();}
+let _composerAutoResizeRaf=0;
+function autoResize(){
+  if(_composerAutoResizeRaf && typeof cancelAnimationFrame==='function'){
+    cancelAnimationFrame(_composerAutoResizeRaf);
+    _composerAutoResizeRaf=0;
+  }
+  const el=$('msg');
+  const _prevComposerH=el.offsetHeight;
+  el.style.height='auto';
+  el.style.height=Math.min(el.scrollHeight,200)+'px';
+  updateSendBtn();
+  // #5514/#5515: growing the composer shrinks the flex:1 transcript viewport, so
+  // a reader pinned to the bottom would be stranded above it ("scrolls up 1 row
+  // per composer row"). Re-pin the transcript when it's genuinely still pinned —
+  // but only when the composer actually GREW (a shrink enlarges the viewport and
+  // can't strand a reader), so the common no-height-change keystroke skips the
+  // re-pin's DOM read entirely. The #composerWrap ResizeObserver is the safety
+  // net for any growth path that doesn't route through here.
+  if(el.offsetHeight>_prevComposerH && typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
+}
+function scheduleComposerAutoResize(){
+  if(typeof requestAnimationFrame!=='function'){autoResize();return;}
+  if(_composerAutoResizeRaf) return;
+  _composerAutoResizeRaf=requestAnimationFrame(()=>{
+    _composerAutoResizeRaf=0;
+    autoResize();
+  });
+}
 
 
 // ── YOLO mode state ──
@@ -2591,6 +6403,26 @@ const APPROVAL_MIN_VISIBLE_MS = 30000;
 
 // showApprovalCard moved above respondApproval
 
+function _setPromptFlyoutHidden(card, hidden) {
+  if (!card) return;
+  if (hidden) {
+    card.setAttribute("aria-hidden", "true");
+    card.setAttribute("inert", "");
+    const markHidden = () => {
+      if (!card.classList || !card.classList.contains("visible")) card.hidden = true;
+    };
+    if (typeof setTimeout === "function") setTimeout(markHidden, 450);
+    else markHidden();
+    return;
+  }
+  card.hidden = false;
+  card.setAttribute("aria-hidden", "false");
+  card.removeAttribute("inert");
+  // Force the unhidden, pre-visible state to be observed so the existing
+  // transform/opacity transition can still animate when `.visible` is added.
+  void card.offsetHeight;
+}
+
 function _clearApprovalHideTimer() {
   if (_approvalHideTimer) {
     clearTimeout(_approvalHideTimer);
@@ -2623,6 +6455,9 @@ function hideApprovalCard(force=false) {
   _approvalSessionId = null;
   _resetApprovalCardState();
   card.classList.remove("visible");
+  card.classList.remove("collapsed");
+  _setPromptFlyoutHidden(card, true);
+  _syncApprovalTranscriptSpace(null);
   $("approvalCmd").textContent = "";
   $("approvalDesc").textContent = "";
 }
@@ -2631,6 +6466,46 @@ function hideApprovalCard(force=false) {
 let _approvalSessionId = null;
 let _approvalCurrentId = null;  // approval_id of the card currently shown
 let _approvalPendingBySession = new Map();
+let _approvalResponding = null;
+
+const _DISMISSED_APPROVALS_KEY = 'hermes_dismissed_approvals';
+
+// Dismissed approvals are namespaced by session so that two sessions carrying
+// the SAME approval_id (e.g. a gateway/run source that reuses externally
+// supplied IDs across sessions) can't have a dismissal in one session hide the
+// other's still-pending approval. Stored value is "<sid>\u0000<approval_id>".
+function _approvalDismissKey(sid, approvalId) {
+  if (!approvalId) return '';
+  return String(sid || '') + '\u0000' + String(approvalId);
+}
+
+function _getDismissedApprovals() {
+  try { return JSON.parse(localStorage.getItem(_DISMISSED_APPROVALS_KEY) || '[]'); }
+  catch (_) { return []; }
+}
+
+function _isApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return false;
+  return _getDismissedApprovals().includes(key);
+}
+
+function _markApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return;
+  const set = _getDismissedApprovals().filter(k => k !== key);
+  set.push(key);
+  try { localStorage.setItem(_DISMISSED_APPROVALS_KEY, JSON.stringify(set.slice(-100))); }
+  catch (_) {}
+}
+
+function _unmarkApprovalDismissed(sid, approvalId) {
+  const key = _approvalDismissKey(sid, approvalId);
+  if (!key) return;
+  const set = _getDismissedApprovals().filter(k => k !== key);
+  try { localStorage.setItem(_DISMISSED_APPROVALS_KEY, JSON.stringify(set)); }
+  catch (_) {}
+}
 
 function _promptActiveSessionId() {
   return (S.session && S.session.session_id) || null;
@@ -2638,6 +6513,14 @@ function _promptActiveSessionId() {
 
 function _approvalPromptBelongsToActiveSession(sid) {
   return !!(sid && _promptActiveSessionId() === sid);
+}
+
+function activeSessionHasPendingPromptAttention() {
+  const sid = _promptActiveSessionId();
+  return !!(sid && (
+    _approvalPendingBySession.has(sid) ||
+    _clarifyPendingBySession.has(sid)
+  ));
 }
 
 function _rememberApprovalPending(pending, pendingCount) {
@@ -2650,11 +6533,18 @@ function _rememberApprovalPending(pending, pendingCount) {
 }
 
 function _clearApprovalPendingForSession(sid) {
-  if (sid) _approvalPendingBySession.delete(sid);
+  if (sid) {
+    _approvalPendingBySession.delete(sid);
+    if (typeof syncTopbar === 'function') syncTopbar();
+  }
 }
 
 function _hideApprovalCardIfOwner(sid, force=false) {
   if (!sid || _approvalSessionId === sid) hideApprovalCard(force);
+}
+
+function _approvalPollingSessionMissingOrMismatched(sid) {
+  return !sid || !S.session || S.session.session_id !== sid;
 }
 
 function _renderPendingApprovalForActiveSession() {
@@ -2663,6 +6553,27 @@ function _renderPendingApprovalForActiveSession() {
   if (_approvalSessionId && _approvalSessionId !== sid) hideApprovalCard(true);
   const entry = _approvalPendingBySession.get(sid);
   if (entry) showApprovalCard(entry.pending, entry.pendingCount);
+}
+
+function _approvalResponseMatches(sid, approvalId) {
+  return !!(
+    _approvalResponding &&
+    _approvalResponding.sid === sid &&
+    (_approvalResponding.approvalId || null) === (approvalId || null)
+  );
+}
+
+function _setApprovalControlsDisabled(choice, disabled) {
+  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
+    const b = $(id);
+    if (!b) return;
+    b.disabled = !!disabled;
+    if (disabled && choice && b.id === "approvalBtn" + choice.charAt(0).toUpperCase() + choice.slice(1)) {
+      b.classList.add("loading");
+    } else {
+      b.classList.remove("loading");
+    }
+  });
 }
 
 function showApprovalForSession(sid, pending, pendingCount) {
@@ -2674,10 +6585,11 @@ function showApprovalForSession(sid, pending, pendingCount) {
 function showApprovalCard(pending, pendingCount) {
   const sid = _rememberApprovalPending(pending, pendingCount);
   if (!_approvalPromptBelongsToActiveSession(sid)) return;
+  if (pending && pending.approval_id && _isApprovalDismissed(sid, pending.approval_id)) return;
   const keys = pending.pattern_keys || (pending.pattern_key ? [pending.pattern_key] : []);
   const desc = (pending.description || "") + (keys.length ? " [" + keys.join(", ") + "]" : "");
   const cmd = pending.command || "";
-  const sig = JSON.stringify({desc, cmd, sid: pending._session_id || (S.session && S.session.session_id) || null});
+  const sig = JSON.stringify({desc, cmd, sid: pending._session_id || (S.session && S.session.session_id) || null, approval_id: pending.approval_id || null});
   const card = $("approvalCard");
   const sameApproval = card.classList.contains("visible") && _approvalSignature === sig;
   $("approvalDesc").textContent = desc;
@@ -2698,81 +6610,173 @@ function showApprovalCard(pending, pendingCount) {
   if (!sameApproval) {
     _approvalVisibleSince = Date.now();
     _clearApprovalHideTimer();
+    // A distinct approval must always render expanded — never inherit a prior
+    // approval's collapsed state, which would hide its command + action buttons. (#3515)
+    card.classList.remove("collapsed");
   }
-  // Re-enable buttons in case a previous approval disabled them
-  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
-    const b = $(id); if (b) { b.disabled = false; b.classList.remove("loading"); }
-  });
+  const responding = _approvalResponseMatches(sid, _approvalCurrentId);
+  _setApprovalControlsDisabled(
+    responding ? _approvalResponding.choice : null,
+    responding,
+  );
+  _setPromptFlyoutHidden(card, false);
   card.classList.add("visible");
+  _syncApprovalCollapseButton(card);
+  _syncApprovalTranscriptSpace(card, {immediate: true});
   if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
   const onceBtn = $("approvalBtnOnce");
   if (onceBtn && document.activeElement !== $('msg')) {
     setTimeout(() => onceBtn.focus({preventScroll: true}), 50);
   }
+  if (typeof syncTopbar === 'function') syncTopbar();
+}
+
+function dismissApprovalCard() {
+  const sid = _approvalSessionId;
+  if (_approvalCurrentId) _markApprovalDismissed(sid, _approvalCurrentId);
+  hideApprovalCard(true);
+  if (sid) _clearApprovalPendingForSession(sid);
+}
+
+function _syncApprovalCollapseButton(card) {
+  const collapse = $("approvalCollapse");
+  if (!collapse || !card) return;
+  const collapsed = card.classList.contains("collapsed");
+  collapse.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  // Icon swap: chevron-down when expanded (click to collapse), chevron-up when collapsed (click to expand)
+  const polyline = collapse.querySelector("svg polyline");
+  if (polyline) polyline.setAttribute("points", collapsed ? "18 15 12 9 6 15" : "6 9 12 15 18 9");
+  const label = collapsed ? "Expand approval" : "Collapse approval";
+  collapse.setAttribute("aria-label", label);
+  collapse.title = label;
+}
+
+function _approvalMessagesNearBottom(messages) {
+  if (!messages) return false;
+  return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 150;
+}
+
+function _syncApprovalTranscriptSpace(card, opts) {
+  opts = opts || {};
+  const messages = $("messages");
+  if (!messages) return;
+  const wasNearBottom = _approvalMessagesNearBottom(messages);
+  if (!card || !card.classList.contains("visible")) {
+    messages.classList.remove("approval-open");
+    messages.classList.remove("approval-collapsed");
+    messages.style.removeProperty("--approval-card-height");
+    messages.style.removeProperty("--approval-dock-height");
+    if (wasNearBottom && typeof scrollToBottom === "function" && typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(scrollToBottom);
+    }
+    return;
+  }
+  const collapsed = card.classList.contains("collapsed");
+  messages.classList.add("approval-open");
+  messages.classList.toggle("approval-collapsed", collapsed);
+  const measure = () => {
+    if (!card.classList.contains("visible")) return;
+    const target = collapsed ? card : (card.querySelector(".approval-inner") || card);
+    const h = target && target.getBoundingClientRect().height;
+    if (h > 0) {
+      messages.style.setProperty(collapsed ? "--approval-dock-height" : "--approval-card-height", Math.ceil(h + 24) + "px");
+    }
+    if (wasNearBottom && typeof scrollToBottom === "function") scrollToBottom();
+  };
+  if (opts.immediate) measure();
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
+  setTimeout(measure, 420);
+}
+
+function _restoreFailedApprovalResponse(sid, errMsg) {
+  _approvalResponding = null;
+  _setApprovalControlsDisabled(null, false);
+  if (_approvalPromptBelongsToActiveSession(sid)) _renderPendingApprovalForActiveSession();
+  if (typeof showToast === "function") showToast(errMsg, 5000);
+  if (typeof setStatus === "function") setStatus(errMsg);
+}
+
+function toggleApprovalCardCollapsed(forceCollapsed) {
+  const card = $("approvalCard");
+  if (!card) return;
+  const collapsed = typeof forceCollapsed === "boolean" ? forceCollapsed : !card.classList.contains("collapsed");
+  card.classList.toggle("collapsed", collapsed);
+  _syncApprovalCollapseButton(card);
+  _syncApprovalTranscriptSpace(card, {immediate: true});
 }
 
 async function respondApproval(choice) {
   const sid = _approvalSessionId || (S.session && S.session.session_id);
   if (!sid) return;
   const approvalId = _approvalCurrentId;
-  // Disable all buttons immediately to prevent double-submit
-  ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
-    const b = $(id);
-    if (b) { b.disabled = true; if (b.id === "approvalBtn" + choice.charAt(0).toUpperCase() + choice.slice(1)) b.classList.add("loading"); }
-  });
-  _approvalSessionId = null;
-  _approvalCurrentId = null;
-  _clearApprovalPendingForSession(sid);
-  hideApprovalCard(true);
+  if (_approvalResponseMatches(sid, approvalId)) return;
+  _unmarkApprovalDismissed(sid, approvalId);
+  _approvalResponding = {sid, approvalId: approvalId || null, choice};
+  _setApprovalControlsDisabled(choice, true);
   try {
-    await api("/api/approval/respond", {
+    const result = await api("/api/approval/respond", {
       method: "POST",
       body: JSON.stringify({ session_id: sid, choice, approval_id: approvalId })
     });
-  } catch(e) { setStatus(t("approval_responding") + " " + e.message); }
+    if (result && result.ok) {
+      _approvalResponding = null;
+      const pendingEntry = _approvalPendingBySession.get(sid);
+      const samePending = !!(pendingEntry && pendingEntry.pending && (pendingEntry.pending.approval_id || null) === (approvalId || null));
+      // `stale_cleared` means the server found nothing pending for this session
+      // (the approval already resolved or its stream ended while the card was
+      // up). The orphan card must be cleared unconditionally so it can never
+      // get stuck — even if the displayed id has since drifted. (#4948 local
+      // variant: previously surfaced as a stuck "Approval response not
+      // accepted." toast.)
+      if (result.stale_cleared || (_approvalSessionId === sid && _approvalCurrentId === approvalId)) {
+        _approvalSessionId = null;
+        _approvalCurrentId = null;
+        hideApprovalCard(true);
+      }
+      if (samePending || result.stale_cleared) _clearApprovalPendingForSession(sid);
+      // Hardening for the narrow stale-clear race: a brand-new approval could
+      // have been parked server-side after the server's empty-check but before
+      // we processed this stale response. The unconditional clear above would
+      // hide that fresh card. Re-query the authoritative server pending state
+      // (same endpoint the fallback poll uses) so any approval that arrived in
+      // the window re-surfaces immediately instead of waiting for the next
+      // SSE/poll tick. Best-effort; poll/SSE remain the backstop. (Opus review
+      // nit on the #4948 fix.)
+      if (result.stale_cleared) {
+        api("/api/approval/pending?session_id=" + encodeURIComponent(sid), {timeoutToast: false})
+          .then(data => {
+            if (data && data.pending && _approvalPromptBelongsToActiveSession(sid)) {
+              showApprovalForSession(sid, data.pending, data.pending_count || 1);
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+    const errMsg = (result && result.error) || "Approval response not accepted.";
+    _restoreFailedApprovalResponse(sid, errMsg);
+  } catch(e) {
+    const errMsg = (e && e.message) || (t("approval_responding") + " failed");
+    _restoreFailedApprovalResponse(sid, errMsg);
+  }
 }
 
 function startApprovalPolling(sid) {
   stopApprovalPolling();
   _approvalPollingSessionId = sid || null;
-  // ── SSE (preferred): long-lived connection, server pushes instantly ──
-  try {
-    const es = new EventSource(new URL('api/approval/stream?session_id=' + encodeURIComponent(sid), document.baseURI || location.href).href);
-    let _fallbackActive = false;
 
-    es.addEventListener('initial', e => {
-      const d = JSON.parse(e.data);
-      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
-      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
-    });
-
-    es.addEventListener('approval', e => {
-      const d = JSON.parse(e.data);
-      if (d.pending) { showApprovalForSession(sid, d.pending, d.pending_count || 1); }
-      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
-    });
-
-    es.onerror = () => {
-      // SSE failed — fall back to HTTP polling (3s interval)
-      if (_fallbackActive) return;
-      _fallbackActive = true;
-      try { es.close(); } catch(_){}
-      _startApprovalFallbackPoll(sid);
-    };
-
-    // If the session changes or stops being busy, close the SSE.
-    // We detect this via a periodic check (cheap — no network request).
-    _approvalSSEHealthTimer = setInterval(() => {
-      if (!S.busy || !S.session || S.session.session_id !== sid) {
-        stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true);
-      }
-    }, 5000);
-
-    _approvalEventSource = es;
-  } catch(_e) {
-    // EventSource constructor failed — use polling directly
-    _startApprovalFallbackPoll(sid);
-  }
+  // Use HTTP polling instead of SSE to avoid browser connection pool exhaustion.
+  // Browsers limit to 6 concurrent HTTP connections per origin over HTTP/1.1.
+  // With 6 persistent SSE streams (sessions/events, gateway/stream,
+  // session/stream, approval/stream, clarify/stream, chat/stream), the pool
+  // fills and all fetch() requests queue indefinitely. The server responds
+  // normally (curl works), but the browser has no available sockets.
+  //
+  // This was introduced in v0.51.340 when /api/session/stream was added as
+  // the 6th persistent SSE connection. Until we multiplex streams or serve
+  // SSE from a separate origin, use HTTP polling to free 2 connection slots.
+  // (1.5-second interval, acceptable tradeoff)
+  _startApprovalFallbackPoll(sid);
 }
 
 let _approvalEventSource = null;
@@ -2780,8 +6784,11 @@ let _approvalSSEHealthTimer = null;
 let _approvalPollingSessionId = null;
 
 function _startApprovalFallbackPoll(sid) {
-  _approvalPollTimer = setInterval(async () => {
-    if (!S.busy || !S.session || S.session.session_id !== sid) {
+  // Run one tick immediately so a session already blocked on a pending approval
+  // shows its card instantly (the removed SSE 'initial' event used to do this);
+  // then poll on the 1500ms cadence. (#3913 SHOULD-FIX)
+  const _tick = async () => {
+    if (_approvalPollingSessionMissingOrMismatched(sid)) {
       stopApprovalPolling(); _hideApprovalCardIfOwner(sid, true); return;
     }
     if (_approvalFallbackPollInFlight) return;
@@ -2789,10 +6796,21 @@ function _startApprovalFallbackPoll(sid) {
     try {
       const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid),{timeoutToast:false});
       if (data.pending) { showApprovalForSession(sid, data.pending, data.pending_count||1); }
-      else { _clearApprovalPendingForSession(sid); _hideApprovalCardIfOwner(sid); }
+      else if (!_approvalPollingSessionMissingOrMismatched(sid)) {
+        const _resolvedEntry = _approvalPendingBySession.get(sid);
+        _clearApprovalPendingForSession(sid);
+        const _resolvedId = _resolvedEntry && _resolvedEntry.pending && _resolvedEntry.pending.approval_id;
+        if (_resolvedId) _unmarkApprovalDismissed(sid, _resolvedId);
+        _hideApprovalCardIfOwner(sid);
+        if (!S.busy) {
+          stopApprovalPollingForSession(sid);
+        }
+      }
     } catch(e) { /* ignore poll errors */ }
     finally { _approvalFallbackPollInFlight = false; }
-  }, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
+  };
+  _approvalPollTimer = setInterval(_tick, 1500);  // matches the v0.50.247 polling cadence so degraded-mode users see the same responsiveness
+  _tick();
 }
 
 function stopApprovalPollingForSession(sid) {
@@ -2802,10 +6820,507 @@ function stopApprovalPollingForSession(sid) {
 
 function stopApprovalPolling() {
   if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
-  if (_approvalEventSource) { try { _approvalEventSource.close(); } catch(_){} _approvalEventSource = null; }
+  if (_approvalEventSource) { try { if(_approvalEventSource.readyState!==2)_approvalEventSource.close(); } catch(_){} _approvalEventSource = null; }
   if (_approvalSSEHealthTimer) { clearInterval(_approvalSSEHealthTimer); _approvalSSEHealthTimer = null; }
   _approvalFallbackPollInFlight = false;
   _approvalPollingSessionId = null;
+}
+
+// ── Session-scoped SSE stream (Option X) ──────────────────────────────────
+// Long-lived EventSource bound to /api/session/stream?session_id=<sid>.
+// Lives across agent turns (unlike the per-turn /api/chat/stream which is
+// torn down at end-of-turn). Carries bg_task_complete events fired while no
+// turn is active — the architectural fix for the notify_on_complete wakeup
+// gap that #2242 + #2279 papered over.
+//
+// Lifecycle: opened on session mount (loadSession / newSession), closed on
+// session switch / unmount. The browser closes it implicitly on tab close
+// (server detects disconnect via the SSE read-loop and unsubscribes).
+let _sessionEventSource = null;
+let _sessionStreamSessionId = null;
+let _sessionStreamReconnectTimer = null;
+// Holds the session id across a hidden-tab close so the visibility handler can
+// reopen the per-session SSE on re-show (stopSessionStream nulls _sessionStreamSessionId).
+let _sessionStreamHiddenSid = null;
+// Hidden-tab active-stream poll (Defect B continuation): while the tab is
+// hidden we do NOT hold the persistent per-session SSE open (connection-pool
+// budget — see #3992/#4151). But a server-initiated turn (self-wake / cron /
+// restart hook) fans `server_turn_started` onto that channel, so a hidden tab
+// would miss it and only reconcile on the next interaction ("过了15秒没弹出来").
+// Bridge the gap with a lightweight poll of /api/session/status (a single
+// short-lived GET, NOT a held connection) that attaches the live renderer when
+// it sees an active_stream_id. Cleared on re-show (the real SSE takes over) and
+// on session switch.
+let _sessionStreamHiddenPollTimer = null;
+let _sessionStreamHiddenPollSid = null;
+// Bounded-retry budget for the hidden poll's "attach returned false → keep
+// polling" path (PR #5266 follow-up gate). A never-current pane (multi-pane:
+// another session stays on screen) would otherwise poll /api/session/status
+// every 6s forever. Cap the consecutive-false retries per (sid, streamId); once
+// the budget is exhausted, stop the hidden poll and rely on the normal
+// session-switch / loadSession / visible-tab SSE to reattach later.
+let _sessionStreamHiddenPollFalseStreamId = null;
+let _sessionStreamHiddenPollFalseCount = 0;
+const _SESSION_STREAM_HIDDEN_POLL_MAX_FALSE = 20; // ~2 min at the 6s cadence
+
+// Attach the existing chat-stream renderer to a server-created stream. Shared
+// by the `server_turn_started` SSE handler (visible tab) and the hidden-tab
+// active-stream poll. Idempotent per (sid, streamId): bails if this tab is
+// already rendering that stream. `recovered` routes through the reconnecting
+// (replay) path so the renderer rebuilds from the run journal mid-flight.
+//
+// Returns true when this tab is now responsible for rendering the stream
+// (either the renderer was attached, OR a renderer was already attached to
+// the same (sid,streamId) — both are "stream is in good hands"). Returns
+// false when the attach was NOT consummated — sid not on screen (multi-pane:
+// the active pane is a different session) or input invalid or thrown — so
+// the hidden-tab poll caller can keep polling and try again on a later tick
+// (e.g. once the user switches the pane back to `sid`). Without this
+// signal, a poll that fires while another session is in the current pane
+// would attach nothing AND stop polling, leaving the turn invisible until
+// the next user interaction.
+function _attachServerInitiatedStream(sid, streamId, recovered) {
+  let handedOff = false;
+  try {
+    streamId = String(streamId || '');
+    if (!streamId) return false;
+    const isCurrent = (typeof _isSessionCurrentPane === 'function')
+      ? _isSessionCurrentPane(sid)
+      : (S.session && S.session.session_id === sid);
+    // Multi-pane edge: caller's sid is not the active pane. Don't attach to
+    // a different pane's UI; tell the poll to keep trying.
+    if (!isCurrent) return false;
+    // Already rendering this exact stream — treat as success so the poll
+    // stops cleanly (renderer owns the stream from here).
+    if (S.activeStreamId === streamId) return true;
+    const existingLive = (typeof LIVE_STREAMS !== 'undefined') ? LIVE_STREAMS[sid] : null;
+    if (existingLive && existingLive.streamId === streamId) return true;
+    S.busy = true;
+    S.activeStreamId = streamId;
+    if (S.session && S.session.session_id === sid) {
+      S.session.active_stream_id = streamId;
+      if (!S.session.pending_started_at) S.session.pending_started_at = Date.now()/1000;
+    }
+    if (typeof ensureLiveWorklogShell === 'function') ensureLiveWorklogShell();
+    else if (typeof appendThinking === 'function') appendThinking();
+    if (typeof updateSendBtn === 'function') updateSendBtn();
+    if (typeof setComposerStatus === 'function') setComposerStatus('');
+    if (typeof syncTopbar === 'function') syncTopbar();
+    if (typeof startApprovalPolling === 'function') startApprovalPolling(sid);
+    if (typeof startClarifyPolling === 'function') startClarifyPolling(sid);
+    if (typeof attachLiveStream === 'function') {
+      attachLiveStream(
+        sid, streamId,
+        (S.session && S.session.pending_attachments) || [],
+        recovered ? {reconnecting: true} : {},
+      );
+      // The renderer now owns the stream. Any failure AFTER this point (e.g. a
+      // post-attach UI refresh throwing) is NOT an attach failure — the stream is
+      // in good hands, so the caller must not be told to keep polling/retrying.
+      handedOff = true;
+    }
+    if (typeof renderSessionList === 'function') void renderSessionList();
+    return true;
+  } catch (_) {
+    try { console.error('hidden-tab server-initiated attach failed', _); } catch (_e) {}
+    // If the stream was already handed to the renderer, the attach DID succeed;
+    // a later UI-refresh throw must not be reported as failure (would make the
+    // poll keep retrying an already-attached stream).
+    if (handedOff) return true;
+    // Otherwise the attach threw mid-setup, leaving partial state (S.busy /
+    // S.activeStreamId / S.session.active_stream_id were set before the DOM
+    // calls). Clear it so the next hidden-poll tick doesn't see a stale
+    // activeStreamId, exit early as "already attached", and wedge the turn
+    // invisible with the composer stuck busy. Only clear when THIS pane/session
+    // still owns the sid/streamId we were attaching (don't stomp a newer stream
+    // that a concurrent path may have started).
+    try {
+      const stillOurs = (S.session && S.session.session_id === sid) &&
+        (S.activeStreamId === streamId || (S.session && S.session.active_stream_id === streamId));
+      if (stillOurs) {
+        S.busy = false;
+        S.activeStreamId = null;
+        if (S.session) S.session.active_stream_id = null;
+        if (typeof updateSendBtn === 'function') updateSendBtn();
+        if (typeof syncTopbar === 'function') syncTopbar();
+        if (typeof renderSessionList === 'function') void renderSessionList();
+      }
+    } catch (_e2) {}
+    return false;
+  }
+}
+
+// Poll /api/session/status (~6s) for an active stream while the tab is hidden.
+// One short GET per tick — does not consume a persistent connection-pool slot.
+// On hit, attach via the reconnecting/replay path (the turn is already
+// mid-flight) and stop polling; the renderer owns it from here.
+function _startHiddenActiveStreamPoll(sid) {
+  if (!sid) return;
+  _stopHiddenActiveStreamPoll();
+  _sessionStreamHiddenPollSid = sid;
+  const tick = () => {
+    // Stop conditions: tab became visible (real SSE takes over), session
+    // switched, or we're already rendering a stream.
+    if (typeof document !== 'undefined' && !document.hidden) { _stopHiddenActiveStreamPoll(); return; }
+    if (_sessionStreamHiddenPollSid !== sid) { _stopHiddenActiveStreamPoll(); return; }
+    if (S.activeStreamId) return; // already rendering; wait it out
+    try {
+      fetch(_apiUrl('api/session/status?session_id=' + encodeURIComponent(sid)), {credentials: 'same-origin'})
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (!d || _sessionStreamHiddenPollSid !== sid) return;
+          const streamId = d.active_stream_id;
+          if (streamId && S.activeStreamId !== String(streamId)) {
+            // Server-initiated turn in flight while hidden → attach as replay.
+            // Only stop polling when the attach actually consummated. In the
+            // multi-pane edge where the active pane is a different session,
+            // _attachServerInitiatedStream returns false (sid not on screen), so
+            // we keep polling and re-try on a later tick — e.g. once the user
+            // switches the active pane back to `sid`, or by then the turn has
+            // finished and status returns active_stream_id=null naturally.
+            const streamKey = String(streamId);
+            // Reset the bounded-retry budget whenever the stream id changes (a new
+            // server-initiated turn deserves a fresh set of retries).
+            if (_sessionStreamHiddenPollFalseStreamId !== streamKey) {
+              _sessionStreamHiddenPollFalseStreamId = streamKey;
+              _sessionStreamHiddenPollFalseCount = 0;
+            }
+            const attached = _attachServerInitiatedStream(sid, streamId, true);
+            if (attached) {
+              _stopHiddenActiveStreamPoll();
+            } else {
+              // Bounded give-up: a never-current pane would poll forever otherwise.
+              // Count consecutive false attaches for this stream id; once the
+              // budget is spent, stop the hidden poll. A later session-switch /
+              // loadSession / visible-tab SSE will reattach if the turn is still
+              // live by then.
+              _sessionStreamHiddenPollFalseCount += 1;
+              if (_sessionStreamHiddenPollFalseCount >= _SESSION_STREAM_HIDDEN_POLL_MAX_FALSE) {
+                _stopHiddenActiveStreamPoll();
+              }
+            }
+          }
+        })
+        .catch(() => {});
+    } catch (_) {}
+  };
+  _sessionStreamHiddenPollTimer = setInterval(tick, 6000);
+  // Fire one immediately so a turn already running when we go hidden is caught
+  // without waiting a full interval.
+  tick();
+}
+
+function _stopHiddenActiveStreamPoll() {
+  if (_sessionStreamHiddenPollTimer) { clearInterval(_sessionStreamHiddenPollTimer); _sessionStreamHiddenPollTimer = null; }
+  _sessionStreamHiddenPollSid = null;
+  // Reset the bounded-retry budget so a fresh poll never inherits a stale count.
+  _sessionStreamHiddenPollFalseStreamId = null;
+  _sessionStreamHiddenPollFalseCount = 0;
+}
+
+function _chatStreamActiveForSession(sid) {
+  if (!sid) return false;
+  if (typeof LIVE_STREAMS !== 'undefined' && LIVE_STREAMS[sid]) return true;
+  return !!(
+    S &&
+    S.session &&
+    S.session.session_id === sid &&
+    S.activeStreamId
+  );
+}
+
+function _suspendSessionStreamForLiveChat(sid) {
+  if (!sid) return;
+  if (_sessionStreamSessionId !== sid) return;
+  _sessionStreamHiddenSid = sid;
+  stopSessionStream();
+}
+
+function _resumeSessionStreamAfterLiveChat(sid) {
+  if (!sid) return;
+  setTimeout(() => {
+    if (!S || !S.session || S.session.session_id !== sid) return;
+    if (_chatStreamActiveForSession(sid)) return;
+    _sessionStreamHiddenSid = null;
+    startSessionStream(sid);
+  }, 0);
+}
+
+function startSessionStream(sid) {
+  if (!sid) return;
+  // Already on this session? No-op (loadSession is a no-op when re-selecting
+  // the same session; this defends against external re-callers).
+  if (_sessionStreamSessionId === sid && _sessionEventSource) return;
+  // While the visible conversation has a live token stream, /api/chat/stream
+  // already carries bg_task_complete and terminal events for this turn. Keeping
+  // /api/session/stream open at the same time burns one of Chrome's six
+  // same-origin HTTP/1.1 sockets and can starve ordinary /api/session fetches.
+  if (_chatStreamActiveForSession(sid)) {
+    _sessionStreamHiddenSid = sid;
+    return;
+  }
+  stopSessionStream();
+  _sessionStreamSessionId = sid;
+  // Visibility hook (install once) — mirror ensureSessionEventsSSE() pattern.
+  // Capture the active session id into a dedicated var BEFORE closing, because
+  // stopSessionStream() nulls _sessionStreamSessionId — so the reopen path can't
+  // rely on it (that was the bug: the stream never reopened on tab re-show).
+  if (typeof document !== 'undefined' && !document._hermesSessionStreamVisibilityHook) {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        _sessionStreamHiddenSid = _sessionStreamSessionId;
+        stopSessionStream();
+        // Tab went to background: don't hold the SSE, but bridge
+        // server-initiated turns (self-wake / cron / restart) with the
+        // lightweight status poll so they still render without interaction.
+        // (stopSessionStream cleared any prior poll; start a fresh one for the
+        // session we just hid.)
+        if (_sessionStreamHiddenSid) _startHiddenActiveStreamPoll(_sessionStreamHiddenSid);
+      } else if (_sessionStreamHiddenSid) {
+        const resumeSid = _sessionStreamHiddenSid;
+        _sessionStreamHiddenSid = null;
+        void startSessionStream(resumeSid);
+      }
+    });
+    document._hermesSessionStreamVisibilityHook = true;
+  }
+  // Don't open when tab is hidden — saves connection pool slots. Preserve the
+  // pending session id so the visibility handler reopens it on re-show (a session
+  // loaded/restored while the tab is already hidden must still reattach).
+  if (typeof document !== 'undefined' && document.hidden) {
+    _sessionStreamHiddenSid = sid;
+    // Don't hold the SSE open while hidden, but DO bridge server-initiated
+    // turns (self-wake / cron / restart) with a lightweight status poll so the
+    // turn renders without waiting for the user to interact.
+    _startHiddenActiveStreamPoll(sid);
+    return;
+  }
+  // Tab is visible — the real SSE owns live-view; ensure no stale hidden poll.
+  _stopHiddenActiveStreamPoll();
+  try {
+    // Report our last-known message_count so the server's on-subscribe
+    // self-heal can detect a server-initiated turn (self-wake / cron / restart)
+    // that started AND finished entirely inside an SSE gap — the fire-and-forget
+    // `server_turn_started` was missed AND the run already cleared from
+    // ACTIVE_RUNS by the time we reconnect, so the `server_turn_started` replay
+    // finds nothing. When the server is ahead of this count it emits a
+    // `session-updated` frame (handled below) and we incrementally sync. Use the
+    // session's full message_count (same basis the server persists), NOT
+    // S.messages.length, which is only the rendered tail window for long
+    // sessions and would false-trigger a reload on every reconnect.
+    let _knownCount = '';
+    try {
+      if (S.session && S.session.session_id === sid && Number.isFinite(Number(S.session.message_count))) {
+        _knownCount = String(Number(S.session.message_count));
+      }
+    } catch (_) {}
+    const _streamUrl = 'api/session/stream?session_id=' + encodeURIComponent(sid)
+      + (_knownCount !== '' ? '&known_count=' + encodeURIComponent(_knownCount) : '');
+    const es = new EventSource(_apiUrl(_streamUrl));
+    _sessionEventSource = es;
+    es.addEventListener('initial', () => { /* connection confirmed */ });
+    es.addEventListener('bg_task_complete', e => {
+      // Shared handler — same dedupe set as the in-turn STREAMS path.
+      if (typeof _handleBgTaskCompleteEvent === 'function') {
+        _handleBgTaskCompleteEvent(e, sid, {source: 'session'});
+      }
+    });
+    // ── Visible-tab self-heal: a server-initiated turn finished during an SSE
+    // gap ─────────────────────────────────────────────────────────────────
+    // Distinct from `server_turn_started` (which attaches a LIVE stream): this
+    // frame fires when the server detected, at our (re)subscribe, that a turn
+    // started AND finished while our EventSource was momentarily down (so we
+    // missed the live broadcast and the run already cleared). The turn is
+    // persisted but our transcript is stale and there is NO live stream left to
+    // attach. Incrementally sync via the SAME swap-in-place path #5189 uses for
+    // the hidden-tab return (loadSession force + keepStaleUntilLoaded): the new
+    // transcript replaces the old in a single render frame — NO clear+refetch,
+    // so the #5177/#5189 blank-gap "jump" is not reintroduced.
+    es.addEventListener('session-updated', e => {
+      try {
+        const d = JSON.parse(e.data || '{}');
+        const evSid = d.session_id || sid;
+        if (evSid !== sid) return;
+        // Only act when this session is the one on screen and we're idle (no
+        // live turn rendering — that path owns its own message updates).
+        const isCurrent = (typeof _isSessionCurrentPane === 'function')
+          ? _isSessionCurrentPane(sid)
+          : (S.session && S.session.session_id === sid);
+        if (!isCurrent) return;
+        if (S.activeStreamId) return;
+        // Re-check against our CURRENT known count — a concurrent load may have
+        // already caught us up between the server's emit and now.
+        const localCount = (S.session && S.session.session_id === sid && Number.isFinite(Number(S.session.message_count)))
+          ? Number(S.session.message_count)
+          : (Array.isArray(S.messages) ? S.messages.length : 0);
+        const serverCount = Number(d.message_count);
+        if (!Number.isFinite(serverCount) || serverCount <= localCount) return;
+        if (typeof loadSession === 'function') {
+          void loadSession(sid, {force: true, externalRefreshReason: 'session-updated', keepStaleUntilLoaded: true});
+        }
+      } catch (_) {}
+    });
+    // ── Defect B: live-view of server-initiated (Option Z) turns ──────────
+    // The drain thread starts the wakeup turn server-side and the server
+    // fans a `server_turn_started` {stream_id} frame onto this per-session
+    // channel. No browser POSTed /api/chat/start, so nothing is attached to
+    // that STREAMS[stream_id] yet. Attach the EXISTING chat-stream renderer
+    // (attachLiveStream — the exact path /api/chat/start uses) to the
+    // server-created stream so the open tab renders the turn live. Reuses
+    // the one renderer; does NOT hand-roll a second one.
+    es.addEventListener('server_turn_started', e => {
+      try {
+        const d = JSON.parse(e.data || '{}');
+        const evSid = d.session_id || sid;
+        const streamId = String(d.stream_id || '');
+        if (!streamId || evSid !== sid) return;
+        // `recovered` marks an on-subscribe replay from the server: the tab
+        // (re)connected to /api/session/stream AFTER the original
+        // fire-and-forget server_turn_started had already been broadcast, so
+        // the live stream is mid-flight. Attach via the reconnecting (replay)
+        // path so the renderer rebuilds from the run journal instead of
+        // expecting token 0 (which would render a truncated turn). A fresh
+        // (non-recovered) frame still attaches from the first token.
+        const recovered = !!d.recovered;
+        // Only drive the renderer when this session is the one on screen.
+        const isCurrent = (typeof _isSessionCurrentPane === 'function')
+          ? _isSessionCurrentPane(sid)
+          : (S.session && S.session.session_id === sid);
+        if (!isCurrent) return;
+        // A turn is already rendering in this tab (user-initiated, or we
+        // already attached to this very stream). attachLiveStream is
+        // idempotent per (sid, streamId); bail if we're already on it.
+        if (S.activeStreamId === streamId) return;
+        const existingLive = (typeof LIVE_STREAMS !== 'undefined') ? LIVE_STREAMS[sid] : null;
+        if (existingLive && existingLive.streamId === streamId) return;
+        // Mirror the loadSession reattach setup. For a fresh frame the turn
+        // renders from its first token; for a recovered (replay) frame
+        // attachLiveStream reconstructs the in-progress stream.
+        S.busy = true;
+        S.activeStreamId = streamId;
+        if (S.session && S.session.session_id === sid) {
+          S.session.active_stream_id = streamId;
+          if (typeof d.pending_started_at === 'number') S.session.pending_started_at = d.pending_started_at;
+          else if (!S.session.pending_started_at) S.session.pending_started_at = Date.now()/1000;
+        }
+        if (typeof ensureLiveWorklogShell === 'function') ensureLiveWorklogShell();
+        else if (typeof appendThinking === 'function') appendThinking();
+        if (typeof updateSendBtn === 'function') updateSendBtn();
+        if (typeof setComposerStatus === 'function') setComposerStatus('');
+        if (typeof syncTopbar === 'function') syncTopbar();
+        if (typeof startApprovalPolling === 'function') startApprovalPolling(sid);
+        if (typeof startClarifyPolling === 'function') startClarifyPolling(sid);
+        if (typeof attachLiveStream === 'function') {
+          attachLiveStream(
+            sid, streamId,
+            (S.session && S.session.pending_attachments) || [],
+            recovered ? {reconnecting: true} : {},
+          );
+        }
+        if (typeof renderSessionList === 'function') void renderSessionList();
+      } catch (_) {}
+    });
+    es.onerror = () => {
+      // Browser already auto-reconnects EventSource on most transient
+      // failures. We only intervene if the connection has been closed for
+      // good (readyState === 2) — schedule a one-shot re-open after 5s.
+      if (es.readyState === 2 && _sessionStreamSessionId === sid) {
+        if (_sessionStreamReconnectTimer) clearTimeout(_sessionStreamReconnectTimer);
+        // The CLOSED EventSource (readyState === 2) will never reconnect on
+        // its own, and startSessionStream's top guard
+        // (`_sessionStreamSessionId === sid && _sessionEventSource`) would
+        // short-circuit the re-open while this dead object is still pinned.
+        // Drop our reference (and close it for good measure) so the timer's
+        // startSessionStream() reaches stopSessionStream() and builds a FRESH
+        // EventSource instead of reusing the closed one. Only clear if `es`
+        // is still the active source — a newer connection may have replaced
+        // it in the interim (stale onerror from a superseded stream), in
+        // which case we must not stomp the live one.
+        if (_sessionEventSource === es) {
+          try { if(es.readyState!==2)es.close(); } catch (_) {}
+          _sessionEventSource = null;
+        }
+        _sessionStreamReconnectTimer = setTimeout(() => {
+          _sessionStreamReconnectTimer = null;
+          if (_sessionStreamSessionId === sid) startSessionStream(sid);
+        }, 5000);
+      }
+    };
+  } catch(_) {
+    // EventSource ctor threw — silently disabled; the in-turn STREAMS path
+    // still works for events that fire during an active turn.
+    _sessionEventSource = null;
+  }
+}
+
+function stopSessionStream() {
+  if (_sessionStreamReconnectTimer) { clearTimeout(_sessionStreamReconnectTimer); _sessionStreamReconnectTimer = null; }
+  _stopHiddenActiveStreamPoll();
+  if (_sessionEventSource) {
+    try { if(_sessionEventSource.readyState!==2)_sessionEventSource.close(); } catch(_){}
+    _sessionEventSource = null;
+  }
+  _sessionStreamSessionId = null;
+}
+
+// Shared bg_task_complete handler — invoked from BOTH the in-turn STREAMS
+// channel (legacy path, still kept as defense-in-depth) AND the session-
+// scoped channel (Option X primary path). Dedupes by (session_id, event_id)
+// via the Map+TTL ring buffer declared at the top of this module.
+// Events without `event_id` are ignored — the server contract guarantees one
+// on every completion emit, so a missing key signals a malformed or replayed
+// payload we should not surface or ack.
+// PR (c) UX surface: post-dedupe the handler marks the session viewed (when
+// the session pane is current and the doc is visible+focused), then runs the
+// T4 drop-when-focused gate; only out-of-focus or off-pane completions spawn
+// a toast. The diagnostic ack POST still fires for both focused and
+// unfocused viewers so the server receives the delivery/cleanup signal;
+// the focus gate suppresses UI noise only.
+function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
+  try {
+    const d = JSON.parse(e.data || '{}');
+    const sid = d.session_id || expectedSid;
+    if (sid !== expectedSid) return;
+    const evt_id = d.event_id ? String(d.event_id) : '';
+    if (!evt_id) return;  // server contract requires event_id; ignore otherwise
+    if (_bgTaskCompleteRingBufferAdd(sid, evt_id)) return;  // duplicate
+    const pid = String(d.task_id || '');
+    const _viewed = typeof _isSessionActivelyViewed === 'function' && _isSessionActivelyViewed(sid);
+    if (_viewed) {
+      try { _markSessionViewed(sid, (S&&S.session&&S.session.session_id===sid)?(S.session.message_count??(S.messages&&S.messages.length)??0):0); } catch(_){}
+      try { if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(sid); } catch(_){}
+    } else {
+      // T4 drop-when-focused: suppress toast only; ack below still fires.
+      try {
+        const tid = (d.task_id || '').slice(0, 8) || '?';
+        const tail = d.summary ? `: ${String(d.summary).slice(0, 80)}` : '';
+        showToast(`Task ${tid} done${tail}`, 2600);
+      } catch (_) {}
+    }
+
+    // Fire-and-forget ack (diagnostic only — Option Z made this a no-op for
+    // state. The agent wakeup is now started SERVER-SIDE by the drain thread
+    // in api/background_process._process_one → start_session_turn; the
+    // browser is no longer in the wakeup path at all.)
+    try {
+      fetch(_apiUrl('api/bg-task-complete-ack'), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({session_id: sid, task_id: pid, event_id: evt_id}),
+      }).catch(() => {});
+    } catch(_) {}
+
+    // Option Z PIVOT: the browser NO LONGER re-POSTs the chat-start endpoint
+    // to wake the agent. Server-side wakeup is the PRIMARY mechanism — the
+    // drain thread starts the turn directly (no tab required), so the
+    // closed-tab case works (parity with CLI/Telegram). The per-session SSE
+    // channel this handler is wired into is DEMOTED to a pure live-view
+    // layer: if a tab is open the server-initiated turn streams live via the
+    // existing chat-stream EventSource; if the tab is closed the turn still
+    // runs server-side and the result is persisted to the session store.
+    // The user-facing toast + drop-when-focused gate land in PR (c).
+  } catch(_) {}
 }
 
 // ── Clarify polling ──
@@ -2835,7 +7350,10 @@ function _rememberClarifyPending(pending) {
 }
 
 function _clearClarifyPendingForSession(sid) {
-  if (sid) _clarifyPendingBySession.delete(sid);
+  if (sid) {
+    _clarifyPendingBySession.delete(sid);
+    if (typeof syncTopbar === 'function') syncTopbar();
+  }
 }
 
 function _hideClarifyCardIfOwner(sid, force=false, reason="dismissed") {
@@ -2857,8 +7375,15 @@ function showClarifyForSession(sid, pending) {
 }
 
 function _renderPendingPromptsForActiveSession() {
+  const sid = _promptActiveSessionId();
   _renderPendingApprovalForActiveSession();
   _renderPendingClarifyForActiveSession();
+  if (
+    sid &&
+    typeof activeSessionHasPendingPromptAttention === 'function' &&
+    activeSessionHasPendingPromptAttention()
+  ) return;
+  if (typeof syncTopbar === 'function') syncTopbar();
 }
 
 function _ensureClarifyCardDom() {
@@ -2872,6 +7397,7 @@ function _ensureClarifyCardDom() {
   card.setAttribute("role", "dialog");
   card.setAttribute("aria-labelledby", "clarifyHeading");
   card.setAttribute("aria-describedby", "clarifyQuestion clarifyHint");
+  _setPromptFlyoutHidden(card, true);
   card.innerHTML = `
     <div class="clarify-inner">
       <div class="clarify-header">
@@ -3021,6 +7547,8 @@ function _startClarifyCountdown(pending) {
 
 function _stashClarifyDraft(reason) {
   if (reason !== "expired" && reason !== "terminal") return false;
+  const submit = $("clarifySubmit");
+  if (submit && submit.classList.contains("loading")) return false;
   const input = $("clarifyInput");
   const draft = String((input && input.value) || "").trim();
   if (!draft) return false;
@@ -3082,6 +7610,7 @@ function hideClarifyCard(force=false, reason="dismissed") {
   _clarifySessionId = null;
   _resetClarifyCardState();
   card.classList.remove("visible");
+  _setPromptFlyoutHidden(card, true);
   _syncClarifyTranscriptSpace(null);
   if (typeof unlockComposerForClarify === "function") unlockComposerForClarify();
   $("clarifyQuestion").textContent = "";
@@ -3200,6 +7729,7 @@ function showClarifyCard(pending) {
   }
   _clarifySetControlsDisabled(false, false);
   _ensureClarifyResizeListener();
+  _setPromptFlyoutHidden(card, false);
   card.classList.add("visible");
   _syncClarifyCollapseButton(card);
   _syncClarifyTranscriptSpace(card, {immediate: true});
@@ -3209,6 +7739,7 @@ function showClarifyCard(pending) {
   if (input && !sameClarify && document.activeElement !== $('msg')) {
     input.focus({preventScroll: true});
   }
+  if (typeof syncTopbar === 'function') syncTopbar();
 }
 
 async function respondClarify(response) {
@@ -3263,15 +7794,55 @@ async function respondClarify(response) {
       if (typeof setStatus === "function") setStatus(errMsg);
     }
   } catch(e) {
-    // Stale (409) or network error — keep the card and draft visible so the user can retry.
+    // The server returns 409 with ``stale: true`` for both genuinely-expired
+    // prompts and wrong-session/next-prompt-loaded races. In both cases the
+    // server-side ``_pending`` entry for *this* clarify_id is gone, so
+    // retrying it can never succeed — the prior keep-card-and-draft
+    // behavior left the user with a permanently 409-ing card and a locked
+    // composer, with no affordance to dismiss it (#4504). Treat 409 as
+    // terminal here, but only when the visible card still matches what we
+    // just submitted: mirroring the success path's ``_clarifyId === clarifyId``
+    // guard (codex review P1, #2639) — if a parallel poll already rendered
+    // the *next* queued prompt B while A's response was in flight, we must
+    // not tear B down on A's late 409. The SSE/poll path will re-render the
+    // next prompt's card from scratch via ``showClarifyCard`` either way.
+    if (e && e.status === 409) {
+      if (_clarifyId === clarifyId) {
+        // Same card still showing — dismiss it and rescue the typed draft.
+        // Order matters: ``_stashClarifyDraft`` (called from
+        // ``hideClarifyCard``) bails when ``#clarifySubmit`` still carries
+        // the ``loading`` class set above. Clear loading first, otherwise
+        // the typed answer is silently dropped (reviewer P1).
+        _clarifySetControlsDisabled(false, false);
+        _clarifySessionId = null;
+        _clarifyId = null;
+        _clearClarifyPendingForSession(sid);
+        hideClarifyCard(true, "expired");
+        const errMsg = (e.message || "Clarification prompt expired or not found.");
+        if (typeof setStatus === "function") setStatus("Clarify: " + errMsg);
+        // ``_stashClarifyDraft('expired')`` already surfaces the actionable
+        // "Clarification timed out. Your draft was kept in the composer."
+        // toast when there is a draft to rescue, so we don't double-toast.
+        return;
+      }
+      // A newer prompt is showing (race between user click and SSE/poll).
+      // Don't dismiss it on this late 409 — just re-enable controls and
+      // surface the error. The user's draft for the now-stale prompt is
+      // dropped intentionally; the next prompt has its own input cycle.
+      _clarifySetControlsDisabled(false, false);
+      if (typeof setStatus === "function") {
+        setStatus("Clarify: previous prompt expired — a newer one is showing.");
+      }
+      return;
+    }
+    // Network / other transient errors — keep the card and draft visible so
+    // the user can retry once connectivity returns.
     _clarifySetControlsDisabled(false, false);
     if (input) {
       input.value = draft;
       input.focus();
     }
-    const errMsg = (e && e.status === 409)
-      ? (e.message || "Clarification prompt expired or not found.")
-      : ((e && e.message) || "Failed to deliver clarification response.");
+    const errMsg = (e && e.message) || "Failed to deliver clarification response.";
     if (typeof setStatus === "function") setStatus("Clarify: " + errMsg);
     if (typeof showToast === "function") showToast(errMsg, 5000);
   }
@@ -3288,64 +7859,26 @@ function startClarifyPolling(sid) {
   _clarifyPollingSessionId = sid || null;
   _clarifyMissingEndpointWarned = false;
 
-  // SSE primary path: long-lived connection pushes events instantly.
-  try {
-    _clarifyEventSource = new EventSource(new URL('api/clarify/stream?session_id=' + encodeURIComponent(sid), document.baseURI || location.href).href);
-  } catch(e) {
-    _startClarifyFallbackPoll(sid);
-    return;
-  }
-
-  _clarifyEventSource.addEventListener('initial', function(ev) {
-    try {
-      var d = JSON.parse(ev.data);
-      if (d.pending) { showClarifyForSession(sid, d.pending); }
-      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
-    } catch(e) {}
-  });
-
-  _clarifyEventSource.addEventListener('clarify', function(ev) {
-    try {
-      var d = JSON.parse(ev.data);
-      if (d.pending) { showClarifyForSession(sid, d.pending); }
-      else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
-    } catch(e) {}
-  });
-
-  _clarifyEventSource.onerror = function() {
-    if (_clarifyEventSource) { try { _clarifyEventSource.close(); } catch(_){} _clarifyEventSource = null; }
-    if (_clarifyHealthTimer) { clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null; }
-    _startClarifyFallbackPoll(sid);
-  };
-
-  // Stale-detector: track last event timestamp; only reconnect if no event
-  // (initial or clarify) has arrived in 60s. The server sends a keepalive
-  // comment line every 30s but EventSource silently consumes those; we only
-  // bump lastEventAt on actual application events. With no real events for
-  // 60s on a long-lived clarify connection the server is effectively silent
-  // and a reconnect is the safe move.
+  // Use HTTP polling instead of SSE to avoid browser connection pool exhaustion.
+  // Browsers limit to 6 concurrent HTTP connections per origin over HTTP/1.1.
+  // With 6 persistent SSE streams (sessions/events, gateway/stream,
+  // session/stream, approval/stream, clarify/stream, chat/stream), the pool
+  // fills and all fetch() requests queue indefinitely. The server responds
+  // normally (curl works), but the browser has no available sockets.
   //
-  // Without the lastEventAt gate the original PR force-reconnected every 60s
-  // regardless of activity, which churned one TCP/SSE setup per minute per
-  // active session. (Opus pre-release review of v0.50.249.)
-  let _lastClarifyEventAt = Date.now();
-  const _markClarifyEvent = () => { _lastClarifyEventAt = Date.now(); };
-  _clarifyEventSource.addEventListener('initial', _markClarifyEvent);
-  _clarifyEventSource.addEventListener('clarify', _markClarifyEvent);
-  _clarifyHealthTimer = setInterval(function() {
-    if (Date.now() - _lastClarifyEventAt < 60000) return;
-    if (_clarifyEventSource) {
-      try { _clarifyEventSource.close(); } catch(_){}
-      _clarifyEventSource = null;
-    }
-    clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null;
-    startClarifyPolling(sid);
-  }, 60000);
+  // This was introduced in v0.51.340 when /api/session/stream was added as
+  // the 6th persistent SSE connection. Until we multiplex streams or serve
+  // SSE from a separate origin, use HTTP polling to free 2 connection slots.
+  // (3-second interval, acceptable tradeoff)
+  _startClarifyFallbackPoll(sid);
 }
 
 function _startClarifyFallbackPoll(sid) {
   _clarifyPollingSessionId = sid || null;
-  _clarifyFallbackTimer = setInterval(async () => {
+  // Run one tick immediately so a session already blocked on a pending clarify
+  // shows its card instantly (the removed SSE 'initial' event used to do this);
+  // then poll on the 3000ms cadence. (#3913 SHOULD-FIX)
+  const _tick = async () => {
     if (!S.session || S.session.session_id !== sid) {
       stopClarifyPolling(); _hideClarifyCardIfOwner(sid, true, 'session'); return;
     }
@@ -3357,18 +7890,72 @@ function _startClarifyFallbackPoll(sid) {
       else { _clearClarifyPendingForSession(sid); _hideClarifyCardIfOwner(sid, false, 'expired'); }
     } catch(e) {
       const msg = String((e && e.message) || "");
-      if (!_clarifyMissingEndpointWarned && /(^|\b)(404|not found)(\b|$)/i.test(msg)) {
-        _clarifyMissingEndpointWarned = true;
-        setComposerStatus("Clarify unavailable on current server build. Restart server.");
-        if (typeof showToast === "function") {
-          showToast("Clarify endpoint unavailable. Please restart server.", 5000);
+      // `api()` attaches the raw HTTP status on the thrown Error (err.status).
+      // Branch on that structured value instead of scraping the message string
+      // so an unrelated stale-session or lifecycle error can never masquerade as
+      // a missing clarify endpoint. (#5345)
+      const status = (e && typeof e.status === "number") ? e.status : null;
+      const currentSid = (S.session && S.session.session_id) || null;
+      const logDetails = {
+        path: "/api/clarify/pending",
+        status: status,
+        pollingSessionId: sid,
+        currentSessionId: currentSid,
+        message: msg,
+      };
+      // A 404 from the active session domain is a STALE-SESSION signal — e.g.
+      // the old profile's session still polling briefly after a profile switch,
+      // or a session deleted server-side — NOT a missing clarify endpoint. Stop
+      // this stale poll and hide its card silently instead of telling the user
+      // to restart the server. Keep this branch before any warn-level logging:
+      // routine profile switches must not fill DevTools with expected warnings.
+      // (#5343 / #5345)
+      const isSessionScoped404 = status === 404
+        && (/session/i.test(msg) || (currentSid !== null && currentSid !== sid));
+      if (isSessionScoped404) {
+        _clearClarifyPendingForSession(sid);
+        _hideClarifyCardIfOwner(sid, true, 'session');
+        stopClarifyPolling();
+        return;
+      }
+      // Only a GENUINE missing-endpoint 404 (the route-not-found fall-through,
+      // body {"error":"not found"}, from a server build that predates
+      // /api/clarify/pending) should surface the restart-server warning. The
+      // previous code matched arbitrary "404"/"not found" text in ANY caught
+      // error message, so an unrelated stale-session 404 or a transient network
+      // error produced a false "Clarify endpoint unavailable" toast even though
+      // the endpoint is present and returning HTTP 200 on every request. Gate
+      // strictly on the structured status + a route-not-found body that is not
+      // a session-scoped 404. (#5345)
+      const isMissingEndpoint = status === 404
+        && /(^|\b)not\s+found(\b|$)/i.test(msg)
+        && !isSessionScoped404;
+      if (isMissingEndpoint) {
+        if (!_clarifyMissingEndpointWarned) {
+          _clarifyMissingEndpointWarned = true;
+          setComposerStatus("Clarify unavailable on current server build. Restart server.");
+          if (typeof showToast === "function") {
+            showToast("Clarify endpoint unavailable. Please restart server.", 5000);
+          }
+          if (typeof console !== "undefined" && console.warn) {
+            console.warn("[clarify] pending poll endpoint unavailable", logDetails);
+          }
         }
         stopClarifyPolling();
+        return;
+      }
+      // Structured diagnostics: unexpected clarify poll failures should be
+      // inspectable without guessing from a toast. Expected stale-session 404s
+      // and the handled missing-endpoint route have already returned above.
+      if (typeof console !== "undefined" && console.warn) {
+        console.warn("[clarify] pending poll failed", logDetails);
       }
     } finally {
       _clarifyFallbackPollInFlight = false;
     }
-  }, 3000);
+  };
+  _clarifyFallbackTimer = setInterval(_tick, 3000);
+  _tick();
 }
 
 function stopClarifyPollingForSession(sid) {
@@ -3377,7 +7964,7 @@ function stopClarifyPollingForSession(sid) {
 }
 
 function stopClarifyPolling() {
-  if (_clarifyEventSource) { try { _clarifyEventSource.close(); } catch(_){} _clarifyEventSource = null; }
+  if (_clarifyEventSource) { try { if(_clarifyEventSource.readyState!==2)_clarifyEventSource.close(); } catch(_){} _clarifyEventSource = null; }
   if (_clarifyFallbackTimer) { clearInterval(_clarifyFallbackTimer); _clarifyFallbackTimer = null; }
   if (_clarifyHealthTimer) { clearInterval(_clarifyHealthTimer); _clarifyHealthTimer = null; }
   _clarifyFallbackPollInFlight = false;
@@ -3385,6 +7972,36 @@ function stopClarifyPolling() {
 }
 
 // ── Notifications and Sound ──────────────────────────────────────────────────
+
+function _completionNotificationPreviewText(lastAssistantMessage, options){
+  const opts=(options&&typeof options==='object')?options:{};
+  const sessionId=String(opts.sessionId||'').trim();
+  let text='';
+  if(lastAssistantMessage&&typeof lastAssistantMessage==='object'){
+    if(typeof _assistantTurnAnchorSettledFinalAnswer==='function'){
+      const anchorFinal=_assistantTurnAnchorSettledFinalAnswer(
+        lastAssistantMessage,
+        lastAssistantMessage.content,
+        {session_id:sessionId||undefined}
+      );
+      if(anchorFinal!==null&&anchorFinal!==undefined) text=String(anchorFinal||'').trim();
+    }
+    if(!text&&typeof msgContent==='function') text=String(msgContent(lastAssistantMessage)||'').trim();
+    if(!text){
+      let raw=lastAssistantMessage.content||'';
+      if(Array.isArray(raw)) raw=raw.filter(p=>p&&p.type==='text').map(p=>p.text||'').join('').trim();
+      text=String(raw||'').trim();
+    }
+    if(text&&typeof _extractInlineThinkingFromContent==='function'){
+      const split=_extractInlineThinkingFromContent(text, lastAssistantMessage.reasoning, {streaming:false});
+      if(split&&typeof split.content==='string') text=split.content.trim();
+    }
+  }
+  if(!text&&typeof opts.liveDisplayText==='string') text=opts.liveDisplayText.trim();
+  if(!text) return '';
+  const normalized=text.replace(/\s+/g,' ').trim();
+  return normalized.length>100?`${normalized.slice(0,100)}…`:normalized;
+}
 
 function playNotificationSound(){
   if(!window._soundEnabled) return;
@@ -3439,16 +8056,73 @@ function playAttentionSound(key){
   }catch(e){console.warn('Attention sound failed:',e);}
 }
 
-function sendBrowserNotification(title,body){
-  if(!window._notificationsEnabled||!document.hidden) return;
-  if(!('Notification' in window)) return;
+function _notificationOptions(body,options={}){
+  const sid=(options&&options.sid)||(S&&S.session&&S.session.session_id);
+  const url=sid?`${location.origin}${_sessionUrlForSid(sid)}`:location.href;
+  return {body:body||'',tag:sid?`hermes-${sid}`:'hermes-webui',renotify:false,icon:'static/favicon-192.png',badge:'static/favicon-32.png',data:{url}};
+}
+function _showPwaNotification(title,body,options={}){
   const botName=assistantDisplayName();
+  const opts=_notificationOptions(body,options);
+  const direct=()=>new Notification(title||botName,opts);
+  // Prefer the service worker (the only path that works in a standalone PWA,
+  // notably iOS). Use getRegistration() + a short timeout race rather than
+  // navigator.serviceWorker.ready, because `.ready` NEVER settles when no
+  // registration ever activates for the scope (e.g. a reverse proxy serving
+  // sw.js with the wrong MIME type, or SW disabled in the browser) — which
+  // would silently drop every notification instead of falling back.
+  if(navigator.serviceWorker&&navigator.serviceWorker.getRegistration){
+    const reg$=Promise.race([
+      navigator.serviceWorker.getRegistration().catch(()=>null),
+      new Promise(res=>setTimeout(()=>res(null),2000))
+    ]);
+    return reg$.then(reg=>(reg&&reg.active&&reg.showNotification)
+      ? reg.showNotification(title||botName,opts)
+      : direct());
+  }
+  return Promise.resolve(direct());
+}
+function requestNotificationPermission(){
+  if(!('Notification' in window)){
+    if(typeof showToast==='function') showToast(t('notifications_unsupported'),3000,'error');
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
+    return Promise.resolve('unsupported');
+  }
   if(Notification.permission==='granted'){
-    new Notification(title||botName,{body:body});
-  }else if(Notification.permission!=='denied'){
-    Notification.requestPermission().then(p=>{
-      if(p==='granted') new Notification(title||botName,{body:body});
-    });
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
+    if(typeof showToast==='function') showToast(t('notifications_enabled_toast'),3000);
+    return Promise.resolve('granted');
+  }
+  if(Notification.permission==='denied'){
+    if(typeof showToast==='function') showToast(t('notifications_denied'),3500,'error');
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
+    return Promise.resolve('denied');
+  }
+  return Notification.requestPermission().then(p=>{
+    if(typeof showToast==='function') showToast(p==='granted'?t('notifications_enabled_toast'):t('notifications_denied'),3000,p==='granted'?undefined:'error');
+    if(typeof updateNotificationPermissionStatus==='function') updateNotificationPermissionStatus();
+    return p;
+  });
+}
+function sendBrowserNotification(title,body,options={}){
+  const force=!!(options&&options.force);
+  // #4416: `forceHidden` means the caller already determined the tab was hidden
+  // during the relevant window (e.g. a stream that ran while backgrounded), so
+  // the live `document.hidden` visibility gate — which a late, throttled SSE
+  // makes unreliable — should be treated as satisfied. The user's
+  // notifications-enabled SETTING is still honored (unlike `force`, which is the
+  // explicit "Send test" override); only the visibility gate is bypassed.
+  const forceHidden=!!(options&&options.forceHidden);
+  if(!force&&!window._notificationsEnabled) return;
+  if(!force&&!forceHidden&&!_isBackgroundedForBrowserNotification()) return;
+  if(!('Notification' in window)) return;
+  if(Notification.permission==='granted'){
+    _showPwaNotification(title,body,options).catch(()=>{try{new Notification(title||assistantDisplayName(),_notificationOptions(body,options));}catch(_err){}});
+  }else if(Notification.permission==='denied'){
+    // Explicit "Send test" (force) deserves feedback instead of a silent no-op.
+    if(force&&typeof showToast==='function') showToast(t('notifications_denied'),3500,'error');
+  }else{
+    requestNotificationPermission().then(p=>{if(p==='granted') _showPwaNotification(title,body,options).catch(()=>{try{new Notification(title||assistantDisplayName(),_notificationOptions(body,options));}catch(_err){}});});
   }
 }
 

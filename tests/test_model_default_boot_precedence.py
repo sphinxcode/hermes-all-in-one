@@ -179,7 +179,8 @@ def test_boot_settings_applies_default_without_deleting_browser_model_state():
 
 
 def test_boot_model_dropdown_explicitly_requests_profile_default_precedence():
-    assert "populateModelDropdown({preferProfileDefaultOnFreshBoot:true})" in BOOT_JS
+    assert "const _hydrateModelDropdown=({redirectIfUnauth=null}={})=>populateModelDropdown({" in BOOT_JS
+    assert "preferProfileDefaultOnFreshBoot:true" in BOOT_JS
     # #2726 invariant: boot path must keep profile/server default ahead of stale
     # browser-persisted state when a default exists. Post-#2716 cherry-pick onto
     # post-stage-batch11 master uses `stateToApply` pattern rather than the
@@ -196,9 +197,16 @@ def test_populate_model_dropdown_reconciles_selection_after_rebuild():
     assert "_reconcileModelDropdownSelection(sel,data,previousSelection,opts);" in UI_JS
     snippet = _reconcile_selection_snippet()
     assert "preferProfileDefaultOnFreshBoot" in snippet
-    assert "return _applyModelToDropdown(data.default_model,sel,data.active_provider||null);" in snippet
-    assert "return _applyModelToDropdown(activeSession.model,sel,activeSession.model_provider||null);" in snippet
-    assert "return _applyModelToDropdown(previousState.model,sel,previousState.model_provider||null);" in snippet
+    # #4363: each branch now routes through _applyOrEnsure, which delegates to
+    # _ensureModelOptionInDropdown so a cross-provider model missing from a
+    # partially-rebuilt catalog is injected as a custom option instead of the
+    # browser silently snapping the <select> to its first <option>. The
+    # branch ORDER + per-branch model/provider arguments are unchanged.
+    assert "_applyOrEnsure(data.default_model, data.active_provider||null)" in snippet
+    assert "_applyOrEnsure(activeSession.model, activeSession.model_provider||null)" in snippet
+    assert "_applyOrEnsure(previousState.model, previousState.model_provider||null)" in snippet
+    # the helper must fall back to injecting the missing option, not return null
+    assert "_ensureModelOptionInDropdown(modelId, sel, providerId)" in snippet
     assert "_readPersistedModelState()" not in snippet
     assert "localStorage.getItem('hermes-webui-model')" not in snippet
 
@@ -300,7 +308,7 @@ def _run_populate_driver(
         [NODE, driver_path, str(REPO / "static" / "ui.js"), json.dumps(payload)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(f"node driver failed:\nSTDOUT={result.stdout}\nSTDERR={result.stderr}")

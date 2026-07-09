@@ -5,6 +5,9 @@ import threading
 import types
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from conftest import requires_fork
+
 
 def _install_fake_cron(monkeypatch, run_job, events):
     cron_pkg = types.ModuleType("cron")
@@ -57,7 +60,29 @@ def _write_spawn_fake_agent(root: Path, *, run_job_body: str):
 
 
 def _activate_spawn_fake_agent(fake_agent_root: Path):
+    """Repoint the agent at ``fake_agent_root`` and return a restore callable.
+
+    This mutates process-global state (``HERMES_WEBUI_AGENT_DIR``, ``PYTHONPATH``,
+    ``sys.path``) directly rather than via monkeypatch, because the callers run it
+    inside a spawned/forked child process. Leaving those mutations unrestored
+    poisons any later in-process consumer — a subsequent test that spawns
+    ``server.py`` as a subprocess would inherit a stale ``HERMES_WEBUI_AGENT_DIR``
+    / ``PYTHONPATH`` pointing at a torn-down fake dir and the child could not
+    import the real agent (the chronic full-suite
+    ``test_tls_support::test_tls_startup_failure_fallback_to_http`` failure).
+
+    We snapshot the original env vars + ``sys.path`` up front and return a
+    ``restore()`` the caller MUST invoke in a ``finally`` so the mutation never
+    outlives this activation. In the fork/spawn children this is belt-and-braces
+    (the child exits anyway); it also makes the helper safe for any in-process use.
+    """
     fake_path = str(fake_agent_root)
+    _saved_env = {
+        k: os.environ.get(k)
+        for k in ("HERMES_WEBUI_AGENT_DIR", "PYTHONPATH")
+    }
+    _saved_sys_path = list(sys.path)
+
     os.environ["HERMES_WEBUI_AGENT_DIR"] = fake_path
     existing = os.environ.get("PYTHONPATH", "")
     parts = [
@@ -82,6 +107,16 @@ def _activate_spawn_fake_agent(fake_agent_root: Path):
         "api.config",
     ):
         sys.modules.pop(module_name, None)
+
+    def _restore():
+        for _k, _v in _saved_env.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        sys.path[:] = _saved_sys_path
+
+    return _restore
 
 
 def _real_hermes_agent_editable_install_present() -> bool:
@@ -130,12 +165,15 @@ def _large_cron_payload_runner(profile_home, result_queue):
                 "    return True, payload, payload, None\n"
             ),
         )
-        _activate_spawn_fake_agent(fake_agent_root)
-        import api.routes as routes
+        _activate_restore = _activate_spawn_fake_agent(fake_agent_root)
+        try:
+            import api.routes as routes
 
-        success, output, final_response, error = routes._run_cron_job_in_profile_subprocess(
-            {"id": "large-payload"}, Path(profile_home)
-        )
+            success, output, final_response, error = routes._run_cron_job_in_profile_subprocess(
+                {"id": "large-payload"}, Path(profile_home)
+            )
+        finally:
+            _activate_restore()
         result_queue.put(("ok", success, len(output), len(final_response), error))
     except BaseException as exc:  # pragma: no cover - surfaced in parent process
         import traceback
@@ -153,12 +191,15 @@ def _selected_profile_home_runner(profile_home, result_queue):
                 "    return True, str(scheduler._hermes_home), 'final', None\n"
             ),
         )
-        _activate_spawn_fake_agent(fake_agent_root)
-        import api.routes as routes
+        _activate_restore = _activate_spawn_fake_agent(fake_agent_root)
+        try:
+            import api.routes as routes
 
-        success, output, final_response, error = routes._run_cron_job_in_profile_subprocess(
-            {"id": "job1574"}, Path(profile_home)
-        )
+            success, output, final_response, error = routes._run_cron_job_in_profile_subprocess(
+                {"id": "job1574"}, Path(profile_home)
+            )
+        finally:
+            _activate_restore()
         result_queue.put(("ok", success, output, final_response, error))
     except BaseException as exc:  # pragma: no cover - surfaced in parent process
         import traceback
@@ -193,6 +234,7 @@ def _run_lock_probe_with_context(context_name, target, result_queue):
     return process.exitcode, acquired
 
 
+@requires_fork
 def test_spawn_context_does_not_inherit_parent_thread_locks(tmp_path):
     """Spawn starts a fresh interpreter where fork would clone a held lock."""
     helper_dir = tmp_path / "spawn_helper"
@@ -244,6 +286,7 @@ def test_spawn_context_does_not_inherit_parent_thread_locks(tmp_path):
     assert spawn_acquired is True
 
 
+@requires_fork
 def test_manual_cron_subprocess_drains_large_result_before_join(tmp_path):
     """A >100 KB result must not deadlock the parent before it can persist output."""
     if _real_hermes_agent_editable_install_present():
@@ -349,6 +392,7 @@ def test_manual_cron_run_does_not_hold_profile_lock_for_job_duration(tmp_path, m
     assert routes._is_cron_running("job1574") == (False, 0.0)
 
 
+@requires_fork
 def test_cron_job_subprocess_executes_under_selected_profile_home(tmp_path, monkeypatch):
     if _real_hermes_agent_editable_install_present():
         import pytest as _pytest

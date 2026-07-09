@@ -272,12 +272,16 @@ class TestApprovalMessagesJS:
 
     def test_show_approval_card_re_enables_buttons(self):
         src = read(REPO / "static/messages.js")
-        assert "b.disabled = false" in src and "loading" in src, \
-            "showApprovalCard should re-enable buttons on each show"
+        assert "_approvalResponseMatches" in src and "_setApprovalControlsDisabled(" in src, \
+            "showApprovalCard should route button state through the shared approval helper"
+        assert "responding ? _approvalResponding.choice : null" in src, \
+            "showApprovalCard should preserve the active loading choice during rerenders"
 
     def test_respond_disables_buttons_immediately(self):
         src = read(REPO / "static/messages.js")
-        assert "b.disabled = true" in src, \
+        assert "_approvalResponding = {sid, approvalId: approvalId || null, choice};" in src, \
+            "respondApproval should record the in-flight approval before the API call"
+        assert "_setApprovalControlsDisabled(choice, true);" in src, \
             "respondApproval should disable buttons immediately to prevent double-submit"
 
     def test_respond_uses_i18n_for_error(self):
@@ -607,6 +611,17 @@ class TestClarifyCardTimerLogic:
             'preserved clarify drafts must append after existing composer text instead of replacing it'
         assert '\\n\\n${draft}' in body, \
             'preserved clarify drafts should be separated from existing composer text'
+
+    def test_stash_clarify_draft_skips_while_submit_in_flight(self):
+        src = self._get_js().read_text()
+        m = re.search(r'function _stashClarifyDraft.*?(?=\nfunction |\nasync function |\Z)',
+                      src, re.DOTALL)
+        assert m, '_stashClarifyDraft function not found'
+        body = m.group(0)
+        assert 'classList.contains("loading")' in body, \
+            'must not stash draft while a clarify submit is in flight (#3651)'
+        assert body.index('classList.contains("loading")') < body.index('clarifyInput'), \
+            'loading guard must short-circuit before reading the draft'
 
     def test_cancel_stream_does_not_preserve_clarify_draft(self):
         src = self._get_js().read_text()

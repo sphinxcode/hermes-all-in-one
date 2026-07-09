@@ -19,7 +19,7 @@ a user dogfooded the workspace panel:
     The `defaultValue` parameter was silently dropped; only the placeholder
     showed (the "ghost" name the user described).
 
-Run: /root/hermes-agent/venv/bin/python -m pytest tests/test_workspace_context_menu_and_rename.py -v
+Run: ./scripts/test.sh tests/test_workspace_context_menu_and_rename.py -v
 """
 
 from __future__ import annotations
@@ -184,6 +184,20 @@ class ShowPromptDialogPrefillTests(unittest.TestCase):
                     break
         return self.src[start:end]
 
+    def test_show_prompt_dialog_restores_hidden_cancel_button(self):
+        """#4581: the outside-symlink info dialog calls showConfirmDialog with
+        hideCancel:true, which sets the shared #appDialogCancel button to
+        display:none. showPromptDialog reuses the same button, so it must restore
+        the display before showing — otherwise the next rename/new-file prompt
+        opens with no Cancel button after a user clicks an external symlink."""
+        body = self._slice_show_prompt_dialog()
+        self.assertIn(
+            "cancelBtn.style.display=''", body.replace(" ", ""),
+            "showPromptDialog must reset cancelBtn.style.display so a prior "
+            "showConfirmDialog({hideCancel:true}) can't leave the Cancel button "
+            "hidden on a subsequent prompt (#4581 regression).",
+        )
+
     def test_show_prompt_dialog_accepts_default_value_alias(self):
         body = self._slice_show_prompt_dialog()
         # Must reference `opts.defaultValue` somewhere — the alias was the
@@ -257,6 +271,89 @@ class ShowPromptDialogPrefillTests(unittest.TestCase):
             "'report.txt' selects 'report' and the user can immediately type "
             "the new basename while preserving the extension.",
         )
+
+
+# ---------------------------------------------------------------------------
+# (c) Targeted workspace create actions from context menus
+# ---------------------------------------------------------------------------
+class WorkspaceTargetedCreateContextMenuTests(unittest.TestCase):
+    """Pin the target-aware create affordances for workspace root and tree rows.
+
+    The maintainers still have open product questions about whether file-row
+    context menus should create in the parent directory or whether create
+    actions should be dir/root only. The current proposal intentionally keeps
+    the decision isolated in target-dir helper wiring so changing course later
+    is cheap.
+    """
+
+    def setUp(self):
+        self.src = _read(UI_JS)
+
+    def _slice_function(self, name: str) -> str:
+        m = re.search(rf"function\s+{re.escape(name)}\b[^{{]*\{{", self.src)
+        self.assertIsNotNone(m, f"Could not find {name}()")
+        start = m.start()
+        depth = 0
+        end = start
+        for i, ch in enumerate(self.src[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        return self.src[start:end]
+
+    def test_prompt_new_file_signature_and_defaults(self):
+        body = self._slice_function("promptNewFile")
+        self.assertRegex(body, r"function\s+promptNewFile\(\s*targetDir\s*=\s*S\.currentDir\s*\|\|\s*'\.'\s*\)")
+
+    def test_prompt_new_folder_signature_and_defaults(self):
+        body = self._slice_function("promptNewFolder")
+        self.assertRegex(body, r"function\s+promptNewFolder\(\s*targetDir\s*=\s*S\.currentDir\s*\|\|\s*'\.'\s*\)")
+
+    def test_prompt_new_file_posts_to_create_endpoint(self):
+        body = self._slice_function("promptNewFile")
+        self.assertIn("showPromptDialog", body)
+        self.assertIn("/api/file/create", body)
+        self.assertIn("_workspaceCreateTargetLabel", body)
+        self.assertIn("_workspaceJoinTargetPath", body)
+        self.assertIn("delete S._dirCache[targetDir || '.'];", body)
+
+    def test_prompt_new_folder_posts_to_create_dir_endpoint(self):
+        body = self._slice_function("promptNewFolder")
+        self.assertIn("showPromptDialog", body)
+        self.assertIn("/api/file/create-dir", body)
+        self.assertIn("_workspaceCreateTargetLabel", body)
+        self.assertIn("_workspaceJoinTargetPath", body)
+        self.assertIn("delete S._dirCache[targetDir || '.'];", body)
+
+    def test_dead_workspace_session_helper_removed(self):
+        self.assertNotIn("function _ensureWorkspaceSessionForCreate", self.src)
+
+    def test_workspace_root_context_menu_wires_targeted_create_actions(self):
+        body = self._slice_function("_showWorkspaceRootContextMenu")
+        self.assertIn("promptNewFile('.')", body)
+        self.assertIn("promptNewFolder('.')", body)
+
+    def test_file_context_menu_computes_target_directory_for_create_actions(self):
+        body = self._slice_function("_showFileContextMenu")
+        # After the symlink PR, the guard changed from ``item.type==='dir'``
+        # to ``isDirLike`` (covers real dirs and directory-symlinks).
+        self.assertTrue(
+            re.search(
+                r"const\s+targetDir\s*=\s*item\.type===['\"]dir['\"]\s*\?\s*item\.path\s*:\s*_workspaceParentDir\(item\.path\)",
+                body,
+            ) or re.search(
+                r"const\s+targetDir\s*=\s*isDirLike\s*\?\s*item\.path\s*:\s*_workspaceParentDir\(item\.path\)",
+                body,
+            ),
+            "targetDir must be computed from item type (dir or isDirLike) "
+            "to determine the target directory for create actions",
+        )
+        self.assertIn("promptNewFile(targetDir)", body)
+        self.assertIn("promptNewFolder(targetDir)", body)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ They are static checks (no server needed) that catch common regressions:
   - No full-viewport overflow that would break scroll
 
 Run as part of the standard test suite:
-    pytest tests/test_mobile_layout.py -v
+    ./scripts/test.sh tests/test_mobile_layout.py -v
 """
 
 import pathlib
@@ -72,11 +72,48 @@ def _declarations(rule_body):
     return declarations
 
 
+def _js_function_body(source, function_name):
+    """Return a JavaScript function body using balanced braces."""
+    match = re.search(rf'function\s+{re.escape(function_name)}\s*\([^)]*\)\s*\{{', source)
+    if not match:
+        raise AssertionError(f"Missing JavaScript function {function_name}()")
+    open_brace = match.end() - 1
+    depth = 0
+    for idx in range(open_brace, len(source)):
+        if source[idx] == "{":
+            depth += 1
+        elif source[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_brace + 1:idx]
+    raise AssertionError(f"Could not parse JavaScript function {function_name}()")
+
+
 def _optional_declarations(css, selector):
     try:
         return _declarations(_rule_body(css, selector))
     except AssertionError:
         return {}
+
+
+def _js_function_body(src, name):
+    signature = f"function {name}("
+    start = src.find(signature)
+    if start == -1:
+        raise AssertionError(f"Missing JS function {name}()")
+    brace = src.find("{", start)
+    if brace == -1:
+        raise AssertionError(f"Missing function body for {name}()")
+    depth = 0
+    for idx in range(brace, len(src)):
+        char = src[idx]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return src[brace + 1:idx]
+    raise AssertionError(f"Unterminated JS function {name}()")
 
 
 def _display_hidden(declarations):
@@ -209,6 +246,26 @@ def test_rightpanel_mobile_slide_over_css():
         "mobile workspace header should keep comfortable row spacing"
 
 
+def test_mobile_sidebar_drawer_uses_transform_instead_of_left():
+    """Mobile sidebar drawer open/close must animate with transform not left offsets."""
+    mobile_640 = "\n".join(_max_width_media_blocks(640))
+    assert mobile_640, "Missing @media(max-width:640px) block in style.css"
+
+    sidebar_rule = _declarations(_rule_body(mobile_640, ".sidebar"))
+    sidebar_open_rule = _declarations(_rule_body(mobile_640, ".sidebar.mobile-open"))
+
+    assert sidebar_rule.get("left") == "0", \
+        "Mobile .sidebar should keep left:0 in the drawer rules"
+    assert sidebar_rule.get("transform") == "translateX(-100%)", \
+        "Closed mobile .sidebar should use transform:translateX(-100%)"
+    assert sidebar_rule.get("transition") == "transform .25s ease", \
+        "Mobile .sidebar should transition transform for drawer animation"
+    assert sidebar_rule.get("will-change") == "transform", \
+        "Mobile .sidebar should promote the transform layer before drawer animation"
+    assert sidebar_open_rule.get("transform") == "translateX(0)", \
+        "Open mobile .sidebar should use transform:translateX(0)"
+
+
 def test_workspace_panel_inline_width_is_desktop_only():
     """Persisted rightpanel width must only be restored above compact/mobile breakpoints."""
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
@@ -294,92 +351,89 @@ def _container_media_block(css: str, media_query: str):
     return ""
 
 
-def test_composer_controls_switch_to_icon_only_by_container_width():
-    """Composer controls should progressively compact based on footer width."""
+def test_composer_controls_switch_to_fit_stage_classes():
+    """Composer controls should progressively compact based on measured overflow."""
     assert re.search(r'\.composer-footer\s*\{[^}]*container-type:inline-size[^}]*container-name:composer-footer[^}]*\}', CSS), \
         ".composer-footer should define container-type:inline-size and container-name:composer-footer"
-    compact_700 = _container_query_block(CSS, "composer-footer (max-width: 700px)")
-    assert compact_700, "Expected composer mid-width compact rules at @container composer-footer (max-width: 700px)"
-    for selector in (
-        ".composer-workspace-label",
-        ".composer-model-label",
-        ".composer-model-chevron",
-        "#composerWorkspaceLabel",
-        "#composerModelLabel",
-        ".composer-workspace-chip",
-        ".composer-model-chip",
-        ".composer-divider",
-    ):
-        assert selector in compact_700, f"{selector} should be present in the 700px composer compact block"
-    assert "display:none" in compact_700
-    assert "max-width:52px" in compact_700
-    # Ensure this first stage does not prematurely remove profile/reasoning labels.
-    assert ".composer-profile-label" not in compact_700
-    assert ".composer-reasoning-label" not in compact_700
-    assert ".composer-profile-chevron" not in compact_700
-    assert ".composer-reasoning-chevron" not in compact_700
+    assert "@container composer-footer (max-width: 700px)" not in CSS
+    assert "@container composer-footer (max-width: 520px)" not in CSS
+    ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    fit_body = _js_function_body(ui_js, "_fitComposerFooter")
+    assert "scrollWidth" in fit_body and "clientWidth" in fit_body, \
+        "_fitComposerFooter() should measure actual left-cluster overflow"
+    assert "cf-icons" in fit_body and "cf-burger" in fit_body, \
+        "_fitComposerFooter() should toggle the compact stage classes"
 
-    compact_520 = _container_query_block(CSS, "composer-footer (max-width: 520px)")
-    assert compact_520, "Expected full composer icon-only rules at @container composer-footer (max-width: 520px)"
     for selector in (
-        ".composer-profile-label",
-        ".composer-workspace-label",
-        ".composer-model-label",
-        ".composer-reasoning-label",
-        ".composer-profile-chevron",
-        ".composer-workspace-chevron",
-        ".composer-model-chevron",
-        ".composer-reasoning-chevron",
-        "#composerProfileLabel",
-        "#composerWorkspaceLabel",
-        "#composerModelLabel",
-        "#composerReasoningLabel",
-        ".composer-model-chip",
-        ".composer-profile-chip",
-        ".composer-reasoning-chip",
+        ".composer-footer.cf-icons .composer-profile-label",
+        ".composer-footer.cf-icons .composer-profile-chevron",
+        ".composer-footer.cf-icons #composerProfileLabel",
+        ".composer-footer.cf-icons .composer-workspace-label",
+        ".composer-footer.cf-icons #composerWorkspaceLabel",
+        ".composer-footer.cf-icons .composer-model-label",
+        ".composer-footer.cf-icons #composerModelLabel",
+        ".composer-footer.cf-icons .composer-profile-chip",
+        ".composer-footer.cf-icons .composer-model-chip",
+        ".composer-footer.cf-icons .composer-divider",
     ):
-        assert selector in compact_520, f"{selector} should be present in the 520px composer compact block"
-    assert "width:44px" in compact_520
-    assert "display:none" in compact_520
-    assert ".composer-workspace-chip{display:none!important" in compact_520.replace(" ", ""), \
-        "520px container compact mode must remove the blank workspace switch slot"
-    assert ".composer-left>*{flex-shrink:0" in compact_520.replace(" ", ""), \
-        "520px container compact mode must stop controls from shrinking into each other"
-    assert ".composer-mobile-config-btn" in compact_520 and "display:inline-flex!important" in compact_520, \
-        "520px container compact mode must expose the mobile config button even when viewport is wider than 640px"
+        assert selector in CSS, f"{selector} should be present in the .cf-icons rules"
+    assert ".composer-footer.cf-icons .composer-profile-chip{box-sizing:border-box;width:44px" in CSS, \
+        ".cf-icons should collapse the profile chip to an icon-sized control"
+    assert ".composer-footer.cf-icons .composer-workspace-chip{display:none!important" not in CSS.replace(" ", ""), \
+        ".cf-icons should keep the workspace switch visible rather than blanking it"
+
+    for selector in (
+        ".composer-footer.cf-burger .composer-workspace-group",
+        ".composer-footer.cf-burger .composer-workspace-files-btn",
+        ".composer-footer.cf-burger .composer-workspace-chip",
+        ".composer-footer.cf-burger .composer-left > .composer-model-wrap",
+        ".composer-footer.cf-burger .provider-quota-chip",
+        ".composer-footer.cf-burger .composer-left > .composer-reasoning-wrap",
+        ".composer-footer.cf-burger .composer-left > .composer-toolsets-wrap",
+        ".composer-footer.cf-burger .composer-mobile-config-btn",
+        ".composer-footer.cf-burger .composer-mobile-config-panel.open",
+        ".composer-footer.cf-burger .composer-mobile-context-action",
+        ".composer-footer.cf-burger .ctx-indicator-wrap",
+    ):
+        assert selector in CSS, f"{selector} should be present in the .cf-burger rules"
+    assert ".composer-footer.cf-burger .composer-workspace-chip{display:none!important".replace(" ", "") in CSS.replace(" ", ""), \
+        ".cf-burger must remove the blank workspace switch slot"
+    assert ".composer-footer.cf-burger .provider-quota-chip" in CSS and ".composer-footer.cf-burger .composer-left > .composer-toolsets-wrap{display:none!important" in CSS, \
+        ".cf-burger must fold the inline quota chip into the shared config menu"
+    assert ".composer-footer.cf-burger .composer-mobile-config-btn{box-sizing:border-box;position:relative;display:inline-flex!important" in CSS, \
+        ".cf-burger must expose the config button even on wider viewports"
 
     # Regression intent:
-    # - this container rule should not depend on right-panel open/closed state.
+    # - this measured rule should not depend on right-panel open/closed state.
     # - left-sidebar-only constriction must still collapse composer controls together.
-    assert ".layout:not(.workspace-panel-collapsed)" not in compact_700, \
-        "composer-footer compact rule should be state-agnostic (left sidebar + closed right panel case included)"
-    assert ".layout:not(.workspace-panel-collapsed)" not in compact_520, \
-        "composer-footer compact rule should be state-agnostic (left sidebar + closed right panel case included)"
+    assert ".layout:not(.workspace-panel-collapsed)" not in CSS, \
+        "composer-footer compact stages should be state-agnostic"
 
 
-def test_composer_700px_workspace_switch_does_not_become_blank_chip():
-    """The 700px container state may hide the workspace label, but needs a switch affordance."""
-    compact_700 = _container_query_block(CSS, "composer-footer (max-width: 700px)")
-    assert compact_700, "Expected composer mid-width compact rules at @container composer-footer (max-width: 700px)"
-
-    workspace_label = _declarations(_rule_body(compact_700, ".composer-workspace-label"))
-    workspace_chip = _optional_declarations(compact_700, ".composer-workspace-chip")
-    workspace_chevron = _optional_declarations(compact_700, ".composer-workspace-chevron")
-    mobile_config = _optional_declarations(compact_700, ".composer-mobile-config-btn")
-
-    assert _display_hidden(workspace_label), \
-        "700px container state should hide the long workspace label before tighter mobile rules"
-    if not _display_hidden(workspace_chip) and not _display_inline_flex(mobile_config):
-        assert not _display_hidden(workspace_chevron), \
-            "700px container state must not leave the visible workspace switch chip without a label or chevron"
+def test_composer_icon_stage_workspace_switch_does_not_become_blank_chip():
+    """The icon stage may hide workspace text, but keeps a visible switch affordance."""
+    css_ns = CSS.replace(" ", "")
+    assert ".composer-footer.cf-icons .composer-workspace-label" in CSS
+    assert ".composer-footer.cf-icons #composerWorkspaceLabel" in CSS
+    assert ".composer-footer.cf-icons .composer-workspace-chip{display:none!important" not in css_ns, \
+        ".cf-icons must not hide the visible workspace switch chip"
+    assert ".composer-footer.cf-icons .composer-workspace-chevron{display:none" not in css_ns, \
+        ".cf-icons must not leave the visible workspace switch chip without its chevron"
 
 
 def test_composer_compact_switch_is_not_viewport_only():
-    """Compact controls should be container-triggered, not bound to viewport width alone."""
-    assert "composer-footer (max-width: 700px)" in CSS, \
-        "Container-query breakpoint should track composer footer width"
-    assert "composer-footer (max-width: 520px)" in CSS, \
-        "Container-query second-stage breakpoint should track composer footer width"
+    """Compact controls should be content-triggered, not bound to viewport width alone."""
+    assert ".composer-footer.cf-icons" in CSS, \
+        "Icon-chip stage should be expressed as the .cf-icons class"
+    assert ".composer-footer.cf-burger" in CSS, \
+        "Hamburger stage should be expressed as the .cf-burger class"
+    ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    assert "_fitComposerFooter" in ui_js and "scrollWidth" in ui_js, \
+        "Composer compacting should be driven by measured overflow"
+    assert "ResizeObserver" in ui_js and "MutationObserver" in ui_js, \
+        "Composer fitting should rerun when footer size or chip content changes"
+    assert "composer-footer (max-width: 700px)" not in CSS
+    assert "composer-footer (max-width: 520px)" not in CSS
     assert re.search(r'@container\s+composer-footer\s*\(max-width:\s*860px\)', CSS) is None, \
         "Full icon-only should not be tied to a 860px threshold any more"
     assert re.search(r'@container\s+composer-footer\s*\(max-width:\s*1000px\)', CSS) is None, \
@@ -392,11 +446,42 @@ def test_composer_compact_switch_is_not_viewport_only():
         "Composer compact breakpoint should use container queries, not viewport media at 900px"
 
 def test_mobile_overlay_present():
-    """Mobile overlay element must exist for tap-to-close sidebar behavior."""
+    """Legacy mobile overlay stays hidden because the phone sidebar is full-screen."""
     assert 'id="mobileOverlay"' in HTML, \
         "#mobileOverlay element missing from index.html"
     assert "mobile-overlay" in CSS, \
         ".mobile-overlay CSS rule missing from style.css"
+    mobile_css = "\n".join(_max_width_media_blocks(640))
+    assert re.search(r'\.mobile-overlay\.visible\{[^}]*display:\s*none', mobile_css), (
+        "Full-screen mobile sidebar must not dim the PWA status/safe-area with a backdrop"
+    )
+
+
+def test_mobile_sidebar_edge_guard_claims_body_edge_only():
+    """A narrow body-only edge guard helps iOS hand left swipes to WebUI."""
+    assert 'id="pwaSidebarEdgeGuard"' in HTML, (
+        "mobile sidebar edge guard missing from index.html"
+    )
+    assert ".pwa-sidebar-edge-guard{display:none;}" in CSS.replace(" ", ""), (
+        "edge guard should be hidden outside the phone layout"
+    )
+    mobile_css = "\n".join(_max_width_media_blocks(640))
+    guard = _declarations(_rule_body(mobile_css, ".pwa-sidebar-edge-guard"))
+    assert guard.get("display") == "block"
+    assert guard.get("position") == "fixed"
+    assert guard.get("left") == "0"
+    assert guard.get("top") == "calc(52px + var(--app-titlebar-safe-top))", (
+        "edge guard should start below the PWA titlebar so it does not block hamburger"
+    )
+    assert guard.get("width") == "24px"
+    assert guard.get("pointer-events") == "none", (
+        "edge guard must be pointer-events:none so taps/vertical scrolls starting in the "
+        "strip fall through to the .messages scroller; the edge-swipe gesture is handled by "
+        "window-level capture listeners, not by the guard intercepting hit-testing (#4660 review)"
+    )
+    assert guard.get("z-index") == "198", (
+        "edge guard should sit below the full-screen sidebar but above the page body"
+    )
 
 
 def test_sidebar_nav_present():
@@ -415,13 +500,8 @@ def test_mobile_keeps_panel_navigation_available():
         "Phone panel navigation must remain available in the hamburger drawer"
 
 
-def test_mobile_keeps_hamburger_drawer_with_vertical_44px_panel_targets():
-    """Phone panel navigation should be vertical inside the hamburger drawer.
-
-    Phones need to preserve horizontal space for the conversation. The titlebar
-    hamburger opens the session/sidebar drawer; inside that drawer, panel icons
-    should use a vertical strip with 44px targets instead of a cramped top row.
-    """
+def test_mobile_sidebar_opens_as_full_screen_surface_with_panel_rail():
+    """Phone sidebar should open full-screen while keeping the panel rail visible."""
     mobile_css = "\n".join(_max_width_media_blocks(640))
     assert re.search(r'\.app-titlebar-hamburger,\s*\.app-titlebar-spacer\{[^}]*display:\s*flex', mobile_css), (
         "Phone titlebar hamburger must stay visible"
@@ -429,8 +509,31 @@ def test_mobile_keeps_hamburger_drawer_with_vertical_44px_panel_targets():
     assert not re.search(r'\.rail\{[^}]*display:\s*flex[^}]*position:\s*fixed', mobile_css), (
         "Phone must not use a persistent left rail that consumes chat width"
     )
-    assert not re.search(r'\.sidebar\s*>\s*\.sidebar-nav\{[^}]*display:\s*none', mobile_css), (
-        "Phone hamburger drawer must keep the sidebar panel tabs visible"
+    sidebar_rule = _declarations(_rule_body(mobile_css, ".sidebar"))
+    sidebar_open_rule = _declarations(_rule_body(mobile_css, ".sidebar.mobile-open"))
+    assert sidebar_rule.get("left") == "0", (
+        "Mobile sidebar should stay at left:0 and move with transform"
+    )
+    assert sidebar_rule.get("width") == "100vw", (
+        "Mobile sidebar should fill the viewport like a session page"
+    )
+    assert sidebar_rule.get("max-width") == "none", (
+        "Mobile sidebar must not retain desktop/drawer max width"
+    )
+    assert sidebar_rule.get("transform") == "translateX(-100%)", (
+        "Closed mobile sidebar should sit fully offscreen"
+    )
+    assert sidebar_rule.get("transition") == "transform .25s ease", (
+        "Mobile sidebar should animate with transform"
+    )
+    assert sidebar_rule.get("will-change") == "transform", (
+        "Mobile sidebar should promote the transform layer before opening"
+    )
+    assert sidebar_open_rule.get("transform") == "translateX(0)", (
+        "Open mobile sidebar should slide the full session page into view"
+    )
+    assert not re.search(r'\.sidebar\s+\.sidebar-nav\{[^}]*display:\s*none', mobile_css), (
+        "Full-screen mobile sidebar should keep the panel rail visible"
     )
     assert re.search(r'\.sidebar-nav\{[^}]*position:\s*absolute', mobile_css), (
         "Phone drawer panel tabs should be laid out as an internal side strip"
@@ -447,8 +550,11 @@ def test_mobile_keeps_hamburger_drawer_with_vertical_44px_panel_targets():
     assert re.search(r'\.sidebar-nav\s+\.nav-tab\{[^}]*min-height:\s*44px', mobile_css), (
         "Phone drawer panel tabs must be at least 44px tall"
     )
-    assert re.search(r'\.sidebar\s+\.panel-view\{[^}]*margin-left:\s*52px', mobile_css), (
-        "Phone drawer panel content should start beside the vertical icon strip"
+    assert re.search(r'\.sidebar\s+\.panel-view\{[^}]*height:\s*100%[^}]*margin-left:\s*52px', mobile_css), (
+        "Full-screen mobile sidebar content should start beside the vertical icon strip"
+    )
+    assert re.search(r'\.mobile-sidebar-close\{[^}]*display:\s*inline-flex\s*!important', mobile_css), (
+        "Full-screen mobile session page needs a visible close affordance"
     )
     assert re.search(r'\.sidebar\s+\.panel-icon-btn\{[^}]*min-width:\s*44px', mobile_css), (
         "Sidebar panel buttons must min-width:44px on phone"
@@ -467,28 +573,177 @@ def test_mobile_keeps_hamburger_drawer_with_vertical_44px_panel_targets():
     )
 
 
-def test_mobile_rail_click_opens_sidebar_for_all_panels():
-    """Rail clicks on phone must reveal the selected sidebar panel."""
+def test_compact_titlebar_keeps_hamburger_available():
+    """Compact app chrome must keep the titlebar menu reachable."""
+    compact_css = "\n".join(_max_width_media_blocks(900))
+    assert re.search(r'\.app-titlebar-hamburger,\s*\.app-titlebar-spacer\{[^}]*display:\s*flex', compact_css), (
+        "Compact titlebar should expose the hamburger before true phone width"
+    )
+    assert ".rightpanel{display:none}" in compact_css.replace(" ", ""), (
+        "The compact titlebar breakpoint should match the hidden workspace-panel breakpoint"
+    )
+
+
+def test_mobile_rail_click_opens_full_screen_panel_drawer():
+    """Rail clicks on phone should keep the full-screen drawer open for panel switching."""
     panels_js = (REPO / "static" / "panels.js").read_text(encoding="utf-8")
     assert "opts.fromRailClick" in panels_js, (
         "switchPanel() should distinguish rail clicks from programmatic switches"
     )
     assert "!_isDesktopWidth()" in panels_js, (
-        "Rail-click sidebar opening must be limited to mobile widths"
+        "Mobile rail-click sidebar handling must be limited to mobile widths"
     )
-    mobile_click_block = re.search(
-        r'if\s*\(\s*opts\.fromRailClick[^{}]*!\s*_isDesktopWidth\(\)[\s\S]*?\n\s*\}',
-        panels_js,
+    switch_panel = panels_js.split("async function switchPanel", 1)[1].split("\n}\n\n// ── Cron panel", 1)[0]
+    assert "if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth())" in switch_panel, (
+        "Missing mobile rail-click sidebar handler"
     )
-    assert mobile_click_block, "Missing mobile rail-click sidebar handler"
-    assert "sidebar.classList.add('mobile-open')" in panels_js, (
-        "Phone rail clicks should open the sidebar panel"
+    assert "sidebar.classList.remove('mobile-session-page')" in switch_panel, (
+        "Phone rail clicks should leave the full-screen session page mode"
     )
-    assert "overlay.classList.add('visible')" in panels_js, (
-        "Phone rail clicks should show the overlay behind the opened sidebar"
+    assert "sidebar.classList.add('mobile-panel-drawer', 'mobile-open')" in switch_panel, (
+        "Phone rail clicks should open the panel drawer mode"
     )
-    assert "nextPanel === 'chat'" not in mobile_click_block.group(0), (
-        "Chat rail clicks must open the session list on phone, not close the sidebar"
+    rail_handler_idx = switch_panel.index("if (opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth())")
+    close_sidebar_idx = switch_panel.find("closeMobileSidebar();", rail_handler_idx)
+    assert close_sidebar_idx == -1, "Phone rail clicks should keep the full-screen drawer open for panel switching"
+    assert "overlay.classList.add('visible')" not in switch_panel[rail_handler_idx:], (
+        "Full-screen phone rail clicks should not show a backdrop that dims the PWA status bar"
+    )
+
+
+def test_mobile_switch_panel_non_chat_opens_sidebar():
+    """mobileSwitchPanel() non-chat path should open the full-screen panel drawer."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    fn_body = _js_function_body(boot_js, "mobileSwitchPanel")
+    assert "if(name==='chat')" in fn_body, (
+        "mobileSwitchPanel must close sidebar only on chat target"
+    )
+    assert "closeMobileSidebar();" in fn_body, (
+        "mobileSwitchPanel should still close sidebar on chat"
+    )
+    assert "sidebar.classList.add('mobile-panel-drawer','mobile-open')" in fn_body, (
+        "mobileSwitchPanel non-chat branch should keep adding mobile-open"
+    )
+    assert "overlay.classList.add('visible')" not in fn_body, (
+        "mobileSwitchPanel non-chat branch should not show a backdrop over the PWA status bar"
+    )
+
+
+def test_pwa_edge_swipe_opens_current_mobile_panel():
+    """Left-edge swipe should open the current sidebar panel, matching hamburger."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    body = _js_function_body(boot_js, "_openMobileSidebarFromGesture")
+    assert "switchPanel('chat',{bypassSettingsGuard:true})" not in body, (
+        "Left-edge gesture should not force Chat; it should preserve the active panel"
+    )
+    assert "sidebar.classList.remove('mobile-session-page')" in body, (
+        "Left-edge gesture should leave the rail-hiding session page mode"
+    )
+    assert "sidebar.classList.add('mobile-panel-drawer')" in body, (
+        "Left-edge gesture should open the full-screen sidebar with panel rail"
+    )
+    assert "sidebar.classList.add('mobile-open')" in body
+    assert "overlay.classList.add('visible')" not in body
+    assert "_syncMobileSidebarPanelFromMainView()" in body, (
+        "Left-edge gesture should sync sidebar panel from the visible detail view before opening"
+    )
+
+
+def test_mobile_sidebar_open_syncs_panel_from_visible_detail_view():
+    """The mobile sidebar should not fall back to Chat when a module detail is visible."""
+    panels_js = (REPO / "static" / "panels.js").read_text(encoding="utf-8")
+    assert "const MAIN_VIEW_PANELS =" in panels_js
+    main_view_panels = panels_js.split("const MAIN_VIEW_PANELS =", 1)[1].split("];", 1)[0]
+    assert "'todos'" not in main_view_panels, (
+        "Todos is a sidebar-only panel; adding showing-todos makes main-view sync ambiguous"
+    )
+    assert "const MAIN_VIEW_SIDEBAR_PANEL_FALLBACKS = { plugin: 'settings' }" in panels_js
+    for panel_id in [
+        "panelSettings",
+        "panelSkills",
+        "panelMemory",
+        "panelTasks",
+        "panelKanban",
+        "panelWorkspaces",
+        "panelProfiles",
+        "panelTodos",
+        "panelInsights",
+        "panelLogs",
+    ]:
+        assert f'id="{panel_id}"' in HTML, f"{panel_id} should exist for mobile sidebar sync"
+    assert 'id="panelPlugin"' not in HTML, (
+        "Plugin pages are main-view only and should sync back to the Settings sidebar list"
+    )
+    assert "MAIN_VIEW_PANELS.forEach" in panels_js
+    panel_from_view = _js_function_body(panels_js, "_panelFromCurrentMainView")
+    assert "mainEl.classList.contains('showing-'+panel)" in panel_from_view
+    assert "MAIN_VIEW_SIDEBAR_PANEL_FALLBACKS[panel]||panel" in panel_from_view
+    assert "$('panel'+_currentPanel.charAt(0).toUpperCase()+_currentPanel.slice(1))" in panel_from_view
+    assert "return 'chat'" in panel_from_view
+    sync_body = _js_function_body(panels_js, "_syncMobileSidebarPanelFromMainView")
+    assert "if(!panelEl)return _currentPanel||'chat'" in sync_body
+    assert "_currentPanel=panel" in sync_body
+    assert "document.querySelectorAll('[data-panel]')" in sync_body
+    assert "document.querySelectorAll('.panel-view')" in sync_body
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    toggle_body = _js_function_body(boot_js, "toggleMobileSidebar")
+    assert "_syncMobileSidebarPanelFromMainView()" in toggle_body, (
+        "Hamburger-opened mobile sidebar should also sync from the visible detail view"
+    )
+
+
+def test_mobile_skill_selection_closes_sidebar_after_detail_load():
+    """Selecting a skill on phone should reveal the newly-loaded detail view."""
+    panels_js = (REPO / "static" / "panels.js").read_text(encoding="utf-8")
+    helper = _js_function_body(panels_js, "_closeMobileSidebarAfterPanelSelection")
+    assert "if(typeof closeMobileSidebar!=='function')return" in helper
+    assert "if(typeof _isDesktopWidth==='function'&&_isDesktopWidth())return" in helper
+    assert "closeMobileSidebar()" in helper
+    body = _js_function_body(panels_js, "openSkill")
+    assert "_renderSkillDetail(name, data.content || '', data.linked_files || {})" in body
+    assert "_closeMobileSidebarAfterPanelSelection()" in body
+
+
+def test_mobile_sidebar_detail_selections_share_close_helper():
+    """Sidebar list commits should consistently reveal their main detail on phone."""
+    panels_js = (REPO / "static" / "panels.js").read_text(encoding="utf-8")
+    for name in [
+        "openCronDetail",
+        "loadKanbanTask",
+        "openMemorySection",
+        "openWorkspaceDetail",
+        "openProfileDetail",
+    ]:
+        body = _js_function_body(panels_js, name)
+        assert "_closeMobileSidebarAfterPanelSelection()" in body, (
+            f"{name} should close the full-screen mobile sidebar after opening detail"
+        )
+    settings_body = _js_function_body(panels_js, "switchSettingsSection")
+    assert "if(opts&&opts.fromSidebarItem)_closeMobileSidebarAfterPanelSelection()" in settings_body
+    assert "switchSettingsSection(_currentSettingsSection);" in panels_js
+    assert "mobile-panel-drawer', 'mobile-open'" in panels_js, (
+        "Opening Settings from the rail should keep the mobile drawer available"
+    )
+    for section in ["conversation", "appearance", "preferences", "providers", "plugins", "extensions", "system", "help"]:
+        assert f"switchSettingsSection('{section}',{{fromSidebarItem:true}})" in HTML, (
+            f"Settings sidebar item {section} should close after selecting its detail"
+        )
+
+
+def test_mobile_session_page_close_button_is_mobile_scoped():
+    """The full-screen session page close button should not appear on desktop."""
+    assert 'class="panel-head-btn mobile-sidebar-close' in HTML, (
+        "Sidebar needs a close button for the full-screen mobile session page"
+    )
+    assert 'onclick="closeMobileSidebar()"' in HTML, (
+        "Mobile session page close button should close the sidebar"
+    )
+    assert "mobile-sidebar-close{display:none" in CSS.replace(" ", ""), (
+        "Mobile sidebar close button should be hidden by default"
+    )
+    mobile_css = "\n".join(_max_width_media_blocks(640))
+    assert ".mobile-sidebar-close{display:inline-flex!important" in mobile_css.replace(" ", ""), (
+        "Mobile sidebar close button should be visible in phone layout"
     )
 
 
@@ -619,6 +874,94 @@ def test_new_conversation_shortcut_works_while_busy():
     )
 
 
+def test_mobile_titlebar_has_new_conversation_button():
+    """Mobile titlebar shows the New Conversation action and keeps it next to reload."""
+    header_match = re.search(
+        r'<header class="app-titlebar"[^>]*>(?P<body>.*?)</header>',
+        HTML,
+        re.S,
+    )
+    assert header_match, "app-titlebar header block missing"
+    header_html = header_match.group("body")
+
+    idx_btn = header_html.find('id="btnTitlebarNewChat"')
+    idx_reload = header_html.find('id="btnReload"')
+    idx_spacer = header_html.find('class="app-titlebar-spacer"')
+
+    assert idx_btn != -1, "titlebar mobile new chat button should exist"
+    assert idx_reload != -1, "titlebar reload button should remain present"
+    assert idx_spacer != -1, "titlebar spacer should remain present"
+    assert idx_spacer < idx_btn < idx_reload, (
+        "titlebar new chat button must sit left of the reload button on mobile"
+    )
+    assert "btnTitlebarNewChat" in header_html
+    assert "data-i18n-title=\"new_conversation\"" in header_html
+    assert "data-i18n-aria-label=\"new_conversation\"" in header_html
+    assert "aria-label=\"New conversation\"" in header_html
+    assert "title=\"New conversation\"" in header_html
+    assert "$('btnNewChat').click()" in header_html
+
+
+def test_titlebar_new_chat_button_mobile_visibility_css():
+    """Keep the titlebar new-chat control mobile-only and reuse reload button styling."""
+    base_rule = _declarations(_rule_body(CSS, ".app-titlebar-new-chat"))
+    assert base_rule.get("display") == "none", "app-titlebar new chat button must be hidden by default"
+    mobile_blocks = "".join(_max_width_media_blocks(640))
+    mobile_rule = _declarations(_rule_body(mobile_blocks, ".app-titlebar-new-chat"))
+    assert mobile_rule.get("display") == "inline-flex", (
+        "app-titlebar new chat button must be visible in mobile layout rules"
+    )
+    desktop_css = re.sub(
+        r"@media\(max-width:640px\).*",
+        "",
+        CSS,
+        flags=re.S,
+    )
+    assert ".app-titlebar-new-chat{display:inline-flex;}" not in desktop_css, (
+        "titlebar new chat button must not be exposed by desktop PWA/fullscreen rules"
+    )
+
+
+def test_titlebar_reload_button_visibility_css_contract():
+    """Keep reload hidden by default, keep standalone visibility, and expose it on mobile width."""
+    base_rule = _declarations(_rule_body(CSS, ".app-titlebar-reload"))
+    assert _display_hidden(base_rule), "app-titlebar reload button should stay hidden by default"
+
+    standalone_mode_pattern = re.compile(
+        r"@media\s*\(\s*display-mode:\s*standalone\s*\)\s*,\s*"
+        r"\(\s*display-mode:\s*fullscreen\s*\)\s*\{"
+    )
+    standalone_rule_body = None
+    for match in standalone_mode_pattern.finditer(CSS):
+        open_brace = match.end() - 1
+        depth = 0
+        for idx in range(open_brace, len(CSS)):
+            if CSS[idx] == "{":
+                depth += 1
+            elif CSS[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    block = CSS[open_brace + 1 : idx]
+                    if ".app-titlebar-reload" in block:
+                        standalone_rule_body = block
+                    break
+        if standalone_rule_body is not None:
+            break
+    assert standalone_rule_body is not None, (
+        "standalone/fullscreen media block for titlebar reload could not be parsed"
+    )
+    standalone_rule = _declarations(_rule_body(standalone_rule_body, ".app-titlebar-reload"))
+    assert standalone_rule.get("display") == "inline-flex", (
+        "titlebar reload should remain inline-flex in standalone/fullscreen"
+    )
+
+    mobile_blocks = "".join(_max_width_media_blocks(640))
+    mobile_rule = _declarations(_rule_body(mobile_blocks, ".app-titlebar-reload"))
+    assert _display_inline_flex(mobile_rule), (
+        "app-titlebar reload button should be visible in phone-width titlebar rules"
+    )
+
+
 # ── Viewport and scroll safety ────────────────────────────────────────────────
 
 def test_body_overflow_hidden():
@@ -705,7 +1048,7 @@ def test_safe_area_variables_available_for_pwa_shell():
     assert "--app-titlebar-safe-top:env(safe-area-inset-top" in CSS, (
         "CSS must expose env(safe-area-inset-top) through --app-titlebar-safe-top"
     )
-    assert "padding:8px 10px 12px!important" in CSS, (
+    assert "padding:8px 10px calc(12px + var(--keyboard-bottom-inset, 0px))!important" in CSS, (
         "Phone composer should keep the proven pre-cover-mode padding contract"
     )
 
@@ -882,6 +1225,8 @@ def test_model_and_reasoning_controls_live_in_mobile_overflow_panel():
     panel_html = HTML[panel_start:panel_end]
     assert 'id="composerMobileModelAction"' in panel_html, \
         "mobile model action must be inside the overflow panel"
+    assert 'id="composerMobileQuotaAction"' in panel_html, \
+        "mobile quota action must be inside the overflow panel"
     assert 'id="composerMobileReasoningAction"' in panel_html, \
         "mobile reasoning action must be inside the overflow panel"
     assert 'onclick="toggleModelDropdown()"' in panel_html, \
@@ -890,11 +1235,15 @@ def test_model_and_reasoning_controls_live_in_mobile_overflow_panel():
         "mobile reasoning action must reuse the existing reasoning dropdown"
     assert 'id="composerMobileModelLabel"' in panel_html, \
         "mobile model action must expose the selected model label"
+    assert 'id="composerMobileQuotaLabel"' in panel_html, \
+        "mobile quota action must expose the selected quota label"
     assert 'id="composerMobileReasoningLabel"' in panel_html, \
         "mobile reasoning action must expose the selected reasoning label"
     ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
     assert "composerMobileModelAction" in ui_js, \
         "model dropdown positioning/click handling must know the mobile model action"
+    assert "composerMobileQuotaAction" in ui_js, \
+        "quota sync must know the mobile quota action"
     assert "composerMobileReasoningAction" in ui_js, \
         "reasoning dropdown positioning/click handling must know the mobile reasoning action"
 
@@ -905,6 +1254,20 @@ def test_model_and_reasoning_controls_live_in_mobile_overflow_panel():
         "phone width must hide the footer reasoning chip behind overflow"
     assert ".composer-mobile-config-action" in mobile_css, \
         "mobile overflow panel must size the model/reasoning actions"
+
+
+def test_mobile_overflow_panel_quota_order_matches_desktop_sequence():
+    """The mobile overflow panel should keep the same shared control order as desktop."""
+    panel_start = HTML.index('id="composerMobileConfigPanel"')
+    panel_end = HTML.index('<div class="profile-dropdown"', panel_start)
+    panel_html = HTML[panel_start:panel_end]
+    workspace_idx = panel_html.index('id="composerMobileWorkspaceAction"')
+    model_idx = panel_html.index('id="composerMobileModelAction"')
+    quota_idx = panel_html.index('id="composerMobileQuotaAction"')
+    reasoning_idx = panel_html.index('id="composerMobileReasoningAction"')
+    context_idx = panel_html.index('id="composerMobileContextAction"')
+    assert workspace_idx < model_idx < quota_idx < reasoning_idx < context_idx, \
+        "mobile control order should mirror the desktop/shared control sequence"
 
 
 def test_model_and_reasoning_dropdowns_use_mobile_panel_anchors():
@@ -985,6 +1348,32 @@ def test_context_details_live_in_mobile_overflow_panel():
     context_button = _declarations(_rule_body(CSS, ".composer-mobile-context-compress"))
     assert context_button.get("width") == "auto", \
         "mobile compress affordance should be compact inside the context row"
+
+
+def test_context_indicator_click_opens_shared_mobile_config_menu():
+    """The desktop context ring should open the same menu used by phone mode."""
+    ui_js = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    assert "function openMobileComposerConfig()" in ui_js, \
+        "mobile config open path should be reusable outside the phone button"
+    assert "function openComposerContextMenu(e)" in ui_js, \
+        "context indicator needs a named click path into the shared config menu"
+
+    context_menu_body = _js_function_body(ui_js, "openComposerContextMenu")
+    for expected in (
+        "e.preventDefault()",
+        "e.stopPropagation()",
+        "ctxTooltip",
+        "openMobileComposerConfig()",
+    ):
+        assert expected in context_menu_body, \
+            f"context click should open the shared menu without leaving tooltip state behind ({expected})"
+
+    assert "btn.addEventListener('click',openComposerContextMenu)" in ui_js, \
+        "context indicator click must open the shared composer config menu"
+
+    panel_open = _declarations(_rule_body(CSS, ".composer-mobile-config-panel.open"))
+    assert panel_open.get("display") == "flex", \
+        "the shared composer config panel must be displayable when opened outside phone CSS"
 
 
 def test_workspace_control_lives_in_mobile_overflow_panel():
@@ -1080,6 +1469,7 @@ def test_mobile_config_kickers_have_i18n_fallbacks():
     for key, label in (
         ("composer_mobile_workspace", "Workspace"),
         ("composer_mobile_model", "Model"),
+        ("composer_mobile_quota", "Quota"),
         ("composer_mobile_reasoning", "Reasoning"),
         ("composer_mobile_context", "Context"),
     ):
@@ -1114,13 +1504,21 @@ def test_mobile_composer_primary_controls_keep_touch_friendly_sizing():
     assert ctx_wrap.get("display") == "none!important", \
         "context indicator must not add a late-appearing composer-right slot on phones"
 
-    ctx_badge = _declarations(_rule_body(CSS, ".composer-mobile-ctx-badge"))
-    assert ctx_badge.get("position") == "absolute", \
-        "mobile context usage should be shown as a badge on the config button, not a separate slot"
-    assert ctx_badge.get("pointer-events") == "none", \
-        "mobile context badge must not shrink or steal the config button touch target"
-    assert 'id="composerMobileCtxBadge"' in HTML, \
-        "mobile context badge element must exist in the composer config button"
+    # #3062 replaced the old text badge (composerMobileCtxBadge / .composer-mobile-ctx-badge)
+    # with an SVG context-usage ring overlaid on the config button. The invariant is the
+    # same: the ring is a visual indicator hosted ON the 44px config button (whose sizing is
+    # asserted above), and it must not steal/shrink that touch target. The ring SVG is
+    # aria-hidden and uses currentColor; it carries no pointer events of its own.
+    assert 'id="composerMobileCtxRing"' in HTML, \
+        "mobile context-usage ring element must exist in the composer config button"
+    assert 'id="composerMobileCtxBadge"' not in HTML, \
+        "old text badge should be fully replaced by the ring, not left dangling"
+    # Locate the ring's markup and confirm it does not become an interactive/sized control
+    # that would compete with the config button's 44px target.
+    _ring_idx = HTML.find('id="composerMobileCtxRing"')
+    _ring_tag = HTML[HTML.rfind("<", 0, _ring_idx):HTML.find(">", _ring_idx) + 1]
+    assert "aria-hidden" in _ring_tag, \
+        "the context ring is decorative overlay — it must be aria-hidden so it doesn't steal the config button's role/touch target"
 
     icon_btn = _declarations(_rule_body(mobile_css, ".icon-btn"))
     assert icon_btn.get("min-width") == "44px", \
@@ -1174,6 +1572,71 @@ def test_touch_device_inputs_meet_zoom_threshold():
     )
 
 
+def test_touch_keyboard_inset_uses_touch_primary_media_query():
+    """The keyboard inset path must key off touch-primary media queries."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "function _isTouchKeyboardViewport()" in boot_js, \
+        "boot.js must define a touch-keyboard viewport predicate"
+    assert "matchMedia('(hover:none) and (pointer:coarse)')" in boot_js or \
+        'matchMedia("(hover:none) and (pointer:coarse)")' in boot_js, \
+        "touch keyboard inset eligibility must use the hover:none + pointer:coarse media query"
+    assert "any-pointer:fine" in boot_js, \
+        "touch keyboard inset eligibility must exclude co-existing fine-pointer setups"
+    assert "!_hasFinePointerCoexisting()" in boot_js, \
+        "touch keyboard inset eligibility must skip hardware-keyboard/trackpad devices"
+
+
+def test_touch_keyboard_inset_writes_and_clears_css_variable():
+    """visualViewport geometry must write and clear the keyboard inset variable."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "setProperty('--keyboard-bottom-inset'" in boot_js, \
+        "boot.js must write --keyboard-bottom-inset on touch keyboard viewport changes"
+    assert "removeProperty('--keyboard-bottom-inset')" in boot_js, \
+        "boot.js must clear --keyboard-bottom-inset when the inset is zero or ineligible"
+    assert "Math.max(0,Math.ceil(window.innerHeight-(vv.height+vv.offsetTop)))" in boot_js, \
+        "boot.js must compute the bottom inset from innerHeight and visualViewport geometry"
+
+
+def test_touch_keyboard_inset_ignores_pinch_zoom_scale():
+    """A pinch-zoomed viewport (vv.scale != 1) must not be read as keyboard
+    occlusion — otherwise Chromium 'force enable zoom' produces a large spurious
+    inset that jitters on pan (#5738 UX-gate hardening)."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "vv.scale" in boot_js, \
+        "boot.js must consult visualViewport.scale before treating shrinkage as keyboard occlusion"
+    assert "Math.abs((vv.scale||1)-1)>0.05" in boot_js, \
+        "boot.js must bail out of the inset when the viewport is pinch-zoomed"
+
+
+def test_touch_keyboard_inset_primes_during_visual_viewport_setup():
+    """The existing visualViewport setup path must prime the inset immediately."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    setup_start = boot_js.index("if(window.visualViewport){")
+    setup_end = boot_js.index("window.visualViewport.addEventListener('resize'", setup_start)
+    setup_block = boot_js[setup_start:setup_end]
+    assert "_syncKeyboardBottomInset();" in setup_block, \
+        "boot.js must sync the keyboard inset once during visualViewport setup"
+
+
+def test_touch_keyboard_inset_primes_on_pageshow_restore():
+    """BFCache restore must resync the inset before restore work continues."""
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    pageshow_start = boot_js.index("window.addEventListener('pageshow'")
+    pageshow_end = boot_js.index("const _srch = document.getElementById('sessionSearch');", pageshow_start)
+    pageshow_block = boot_js[pageshow_start:pageshow_end]
+    assert "_syncKeyboardBottomInset();" in pageshow_block, \
+        "boot.js must sync the keyboard inset during pageshow restore"
+
+
+def test_touch_keyboard_inset_applies_to_composer_padding():
+    """Touch/coarse composer padding must consume the keyboard inset variable."""
+    css_ns = re.sub(r'\s+', '', CSS)
+    assert "@media(hover:none)and(pointer:coarse)" in css_ns, \
+        "style.css must scope the keyboard inset padding to touch-primary viewports"
+    assert ".composer-wrap{padding-bottom:calc(14px+var(--keyboard-bottom-inset,0px));}" in css_ns, \
+        "style.css must add the keyboard inset to composer bottom padding"
+
+
 
 # ── Sidebar tabs on mobile ───────────────────────────────────────────────────
 
@@ -1211,22 +1674,24 @@ def test_mobile_enter_newline_uses_match_media():
         "boot.js must use matchMedia('(pointer:coarse)') for mobile detection"
 
 
-def test_mobile_enter_newline_checks_virtual_keyboard_viewport():
-    """Touch devices should only force newline while the software keyboard is likely open."""
+def test_mobile_enter_newline_does_not_depend_on_viewport_heuristic():
+    """The viewport-shrink heuristic was unreliable on iOS/Android and must be gone."""
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
-    assert "function _isVirtualKeyboardLikelyOpen()" in boot_js, \
-        "boot.js must isolate the software-keyboard viewport heuristic"
-    assert "window.visualViewport" in boot_js and "window.innerHeight-vv.height>120" in boot_js, \
-        "software-keyboard detection must compare visualViewport height against window.innerHeight"
-    assert "&&_isVirtualKeyboardLikelyOpen()" in boot_js, \
-        "mobile Enter newline override must not apply when a hardware keyboard leaves the viewport unshrunk"
+    assert "function _isVirtualKeyboardLikelyOpen()" not in boot_js, \
+        "the unreliable visualViewport keyboard heuristic function must be removed"
+    assert "&&_isVirtualKeyboardLikelyOpen()" not in boot_js, \
+        "the mobile Enter override must no longer call the viewport heuristic"
+    assert "window.innerHeight-vv.height>120" not in boot_js, \
+        "the viewport height-delta probe must no longer gate the mobile Enter override"
 
 
-def test_mobile_enter_newline_preserves_legacy_fallback_without_visual_viewport():
-    """Browsers without visualViewport should keep the previous touch Enter=newline behavior."""
+def test_mobile_enter_newline_respects_hardware_keyboard_on_touch_devices():
+    """Touch devices with a co-existing fine pointer (hardware keyboard) keep desktop Enter=send."""
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
-    assert "if(!vv||!window.innerHeight)return true;" in boot_js, \
-        "missing visualViewport support must preserve the legacy touch-primary newline fallback"
+    assert "any-pointer:fine" in boot_js, \
+        "boot.js must use any-pointer:fine to detect a co-existing hardware keyboard/trackpad"
+    assert "!_hasFinePointerCoexisting()" in boot_js, \
+        "mobile Enter newline override must skip touch devices that also expose a fine pointer"
 
 
 def test_mobile_enter_newline_only_overrides_enter_default():

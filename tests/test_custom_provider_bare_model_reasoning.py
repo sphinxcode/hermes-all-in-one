@@ -143,3 +143,163 @@ def test_openrouter_slash_prefix_unaffected():
         provider_id="openrouter",
     )
     assert set(efforts) >= {"low", "medium", "high"}
+
+
+def test_generalized_model_families_and_suffixed_ids():
+    test_models = [
+        # GPT
+        ("gpt-5.5", "custom:newapi"),
+        ("gpt-6-ultra", "custom:newapi"),
+        # Claude
+        ("claude-sonnet-4-6-free", "opencode-zen"),
+        ("claude-opus-4-7:free", "kilocode"),
+        ("claude-sonnet-3-7-free", "opencode-zen"),
+        # Qwen
+        ("qwen-3-coder-free", "opencode-zen"),
+        ("qwen-4-coder:free", "opencode-zen"),
+        # Minimax
+        ("minimax-m2.5-free", "opencode-zen"),
+        ("minimax-m3-pro", "custom:newapi"),
+        # Mimo
+        ("mimo-v2.5-free", "opencode-zen"),
+        ("mimo-v3-pro", "custom:newapi"),
+        # GLM
+        ("glm-5.1:free", "kilocode"),
+        ("glm-6-pro", "custom:newapi"),
+        # Step
+        ("step-1.5:free", "kilocode"),
+        ("step-2-pro", "custom:newapi"),
+        # DeepSeek
+        ("deepseek-v5-free", "custom:newapi"),
+        ("deepseek-r3:free", "kilocode"),
+        # Kimi
+        ("kimi-k2.6-free", "opencode-zen"),
+        ("kimi-k3-pro:free", "kilocode")
+    ]
+
+    for model_id, provider_id in test_models:
+        efforts = cfg.resolve_model_reasoning_efforts(model_id, provider_id=provider_id)
+        assert set(efforts) >= {"low", "medium", "high"}, (
+            f"Failed: {model_id} via {provider_id} should resolve reasoning support"
+        )
+
+
+def test_unsupported_model_families_and_versions():
+    unsupported_models = [
+        # GPT: only 5+ supports reasoning_effort — gpt-4o/4.1/3.5 must be excluded
+        ("gpt-4o", "opencode-zen"),
+        ("gpt-4o-mini", "opencode-zen"),
+        ("gpt-4.1", "kilocode"),
+        ("gpt-4-turbo", "custom:newapi"),
+        ("gpt-3.5-turbo", "opencode-zen"),
+        # Claude
+        ("claude-sonnet-3.5", "opencode-zen"),
+        ("claude-opus-3-5-free", "kilocode"),
+        # Qwen
+        ("qwen-2.5-coder-free", "opencode-zen"),
+        ("qwen-2-7b-instruct", "custom:newapi"),
+    ]
+
+    for model_id, provider_id in unsupported_models:
+        efforts = cfg.resolve_model_reasoning_efforts(model_id, provider_id=provider_id)
+        assert efforts == [], (
+            f"Failed: {model_id} via {provider_id} should NOT resolve reasoning support"
+        )
+
+
+# ── position-independent DeepSeek version detection (#3650) ───────────────────
+#
+# The DeepSeek V/R-series check keys off the token immediately AFTER "deepseek"
+# rather than requiring "deepseek" to lead the string. This keeps detection
+# working when a provider slug is prepended (e.g. a custom aggregator rewriting
+# @custom:name:DeepSeek-V4-Flash → "my-provider-deepseek-v4-flash"), while a
+# provider slug that happens to start with "v"/"r" (e.g. "vertex") must NOT by
+# itself satisfy the version guard.
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "vertex-deepseek-v4-flash",
+        "my-provider-deepseek-r1",
+        "newapi-deepseek-v5",
+    ],
+)
+def test_deepseek_version_detected_after_provider_slug(model_id):
+    efforts = cfg.resolve_model_reasoning_efforts(model_id, provider_id="custom:newapi")
+    assert set(efforts) >= {"low", "medium", "high"}, (
+        f"{model_id}: DeepSeek V/R-series marker after a provider slug should "
+        "expose reasoning efforts (position-independent detection, #3650)"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "deepseek-chat",
+        "deepseek-coder",
+        "vertex-deepseek-chat",
+    ],
+)
+def test_deepseek_non_reasoning_variants_excluded(model_id):
+    efforts = cfg.resolve_model_reasoning_efforts(model_id, provider_id="custom:newapi")
+    assert efforts == [], (
+        f"{model_id}: non-reasoning DeepSeek variant must NOT resolve reasoning "
+        "support, and a 'v'/'r' provider slug must not falsely trigger it (#3650)"
+    )
+
+
+# ── custom provider nested Gemini routes (vertex/, gemini_cli/) ───────────────
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "vertex/gemini-3.1-pro-preview",
+        "vertex/gemini-3-pro-preview",
+        "gemini_cli/gemini-3-pro-preview",
+    ],
+)
+def test_custom_nested_gemini_routes_expose_reasoning(model_id):
+    efforts = cfg.resolve_model_reasoning_efforts(
+        model_id,
+        provider_id="custom:newapi",
+    )
+    assert set(efforts) >= {"low", "medium", "high"}, (
+        f"{model_id} via custom:newapi should expose reasoning efforts"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "vertex/gemini-embedding-001",
+        "vertex/gemini-3-pro-image-preview",
+    ],
+)
+def test_custom_nested_gemini_routes_exclude_non_reasoning(model_id):
+    assert cfg.resolve_model_reasoning_efforts(
+        model_id,
+        provider_id="custom:newapi",
+    ) == [], f"{model_id} must not expose reasoning efforts"
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "vertex/gemini-1.5-pro",
+        "vertex/gemini-1.5-flash",
+        "gemini_cli/gemini-1.5-pro",
+        "vertex/gemini-1.0-pro",
+    ],
+)
+def test_custom_nested_gemini_pre_2_5_routes_exclude_reasoning(model_id):
+    """Gemini thinking/reasoning controls are documented for the 2.5 series and
+    3-era models only — 1.5 (and earlier) have no thinking support, so the
+    nested-gateway detection must not expose a reasoning selector for them
+    (a user could otherwise pick an effort the route then rejects)."""
+    assert cfg.resolve_model_reasoning_efforts(
+        model_id,
+        provider_id="custom:newapi",
+    ) == [], f"{model_id} (pre-2.5 Gemini) must not expose reasoning efforts"
+
+

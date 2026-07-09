@@ -23,11 +23,24 @@ import urllib.parse
 import urllib.request
 
 from tests._pytest_port import BASE, TEST_STATE_DIR
+from tests.conftest import TEST_WORKSPACE
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 UI_JS = (REPO_ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 I18N_JS = (REPO_ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
 WORKSPACE_JS = (REPO_ROOT / "static" / "workspace.js").read_text(encoding="utf-8")
+
+
+def _media_fixture_dir() -> pathlib.Path:
+    # Dot-prefixed so the persistent fixture dir stays OUT of
+    # /api/workspaces/suggest's default (non-hidden) results — otherwise it
+    # pollutes the shared TEST_WORKSPACE and breaks sibling tests that assert an
+    # exact workspace-suggestion set (e.g. test_sprint5
+    # test_workspace_suggest_hidden_dirs_only_when_requested). Kept under
+    # TEST_WORKSPACE (a MEDIA_ALLOWED_ROOT) and Windows-portable (no /tmp).
+    fixture_dir = TEST_WORKSPACE / ".media-fixtures"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    return fixture_dir
 
 
 # ── Static analysis: renderMd MEDIA stash ────────────────────────────────────
@@ -279,11 +292,15 @@ class TestMediaEndpointUnit(unittest.TestCase):
         self.assertIn("image/svg+xml", routes_src,
                       "SVG MIME type must be handled (forced download) in _handle_media")
 
-    def test_non_image_forces_download(self):
-        """Non-image files should be forced to download, not served inline."""
+    def test_inline_preview_mime_whitelist_exists(self):
+        """Only the explicit safe preview whitelist should be eligible for inline display."""
         routes_src = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
         self.assertIn("_INLINE_IMAGE_TYPES", routes_src,
                       "_INLINE_IMAGE_TYPES whitelist must exist in _handle_media")
+        self.assertIn("_AUDIO_VIDEO_PDF_TYPES", routes_src,
+                      "shared audio/video/PDF preview MIME whitelist must exist in _handle_media")
+        self.assertIn('{"text/html"}', routes_src,
+                      "HTML must be added only to the session-token whitelist")
 
     def test_media_allowed_roots_env_var_referenced(self):
         """Handler must reference MEDIA_ALLOWED_ROOTS for configurable roots."""
@@ -519,6 +536,64 @@ class TestMediaEndpointUnit(unittest.TestCase):
                     h4.status, 403,
                     "profile webui_state/sessions/*.json must be denied")
 
+    def test_media_allowed_roots_env_var_serves_outside_hermes_root(self):
+        """MEDIA_ALLOWED_ROOTS must still allow legitimate outside-root media."""
+        from api import routes
+
+        class _Handler:
+            def __init__(self):
+                self.status = None
+            def send_response(self, code):
+                self.status = code
+            def send_header(self, *a, **k):
+                pass
+            def end_headers(self):
+                pass
+            class _W:
+                def write(self_inner, b):
+                    pass
+                def flush(self_inner):
+                    pass
+            wfile = _W()
+            headers = {}
+
+        png_bytes = (
+            b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+            b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00'
+            b'\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        )
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as extra:
+            hermes_home = pathlib.Path(home) / ".hermes"
+            hermes_home.mkdir(parents=True)
+            outside_root = pathlib.Path(extra).resolve()
+            image = outside_root / "settings_artifact.png"
+            image.write_bytes(png_bytes)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "MEDIA_ALLOWED_ROOTS": str(outside_root),
+                },
+            ), mock.patch.object(
+                routes, "get_last_workspace", lambda: str(hermes_home / "workspace")
+            ), mock.patch(
+                "api.auth.is_auth_enabled", lambda: False
+            ):
+                handler = _Handler()
+                routes._handle_media(
+                    handler,
+                    SimpleNamespace(
+                        query=f"path={urllib.parse.quote(str(image))}&inline=1",
+                        path="/api/media",
+                    ),
+                )
+
+            self.assertEqual(
+                handler.status, 200,
+                "MEDIA_ALLOWED_ROOTS media outside Hermes roots must still serve",
+            )
+
     def test_media_endpoints_advertise_byte_range_support(self):
         routes_src = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
         self.assertIn("Accept-Ranges", routes_src)
@@ -567,6 +642,102 @@ class TestMediaEndpointUnit(unittest.TestCase):
                     )
                 )
 
+    def test_session_media_token_allows_exact_html_path_when_mime_is_safe(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            html = pathlib.Path(tmpd) / "report.html"
+            html.write_text("<h1>Report</h1>", encoding="utf-8")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": f"MEDIA:{html}"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertTrue(
+                    routes._session_media_token_allows_path(
+                        "s-media", html, {"text/html"}
+                    )
+                )
+
+    def test_session_media_token_rejects_mentioned_html_when_mime_not_allowed(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            html = pathlib.Path(tmpd) / "report.html"
+            html.write_text("<h1>Report</h1>", encoding="utf-8")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": f"MEDIA:{html}"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertFalse(
+                    routes._session_media_token_allows_path(
+                        "s-media", html, {"image/png"}
+                    )
+                )
+
+    def test_session_media_token_rejects_user_authored_html_path(self):
+        from api import routes
+
+        with tempfile.TemporaryDirectory() as tmpd:
+            html = pathlib.Path(tmpd) / "report.html"
+            html.write_text("<h1>Report</h1>", encoding="utf-8")
+            session = SimpleNamespace(messages=[{"role": "user", "content": f"MEDIA:{html}"}])
+            with mock.patch.object(routes, "get_session", return_value=session):
+                self.assertFalse(
+                    routes._session_media_token_allows_path(
+                        "s-media", html, {"text/html"}
+                    )
+                )
+
+    def test_handle_media_session_authorizes_html_artifact_outside_roots(self):
+        from api import routes
+
+        class _Handler:
+            def __init__(self):
+                self.status = None
+                self.headers = {}
+                self.body = b""
+            def send_response(self, code):
+                self.status = code
+            def send_header(self, k, v):
+                self.headers[k.lower()] = v
+            def end_headers(self):
+                pass
+            class _W:
+                def __init__(self, owner):
+                    self.owner = owner
+                def write(self, b):
+                    self.owner.body += b
+                def flush(self):
+                    pass
+            @property
+            def wfile(self):
+                return self._W(self)
+
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            hermes_home = pathlib.Path(home) / ".hermes"
+            hermes_home.mkdir(parents=True)
+            ws = hermes_home / "workspace"
+            ws.mkdir()
+            html = pathlib.Path(outside) / "report.html"
+            html.write_text("<h1>Report</h1>", encoding="utf-8")
+            session = SimpleNamespace(messages=[{"role": "assistant", "content": f"MEDIA:{html}"}])
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home), "MEDIA_ALLOWED_ROOTS": ""}), \
+                 mock.patch.object(routes, "get_last_workspace", lambda: str(ws)), \
+                 mock.patch.object(routes, "get_session", return_value=session), \
+                 mock.patch("api.auth.is_auth_enabled", lambda: False):
+                handler = _Handler()
+                routes._handle_media(
+                    handler,
+                    SimpleNamespace(
+                        query=(
+                            f"path={urllib.parse.quote(str(html.resolve()))}"
+                            "&session_id=s-media&inline=1"
+                        ),
+                        path="/api/media",
+                    ),
+                )
+
+            self.assertEqual(handler.status, 200)
+            self.assertIn("text/html", handler.headers.get("content-type", ""))
+            self.assertIn("sandbox", handler.headers.get("content-security-policy", ""))
+            self.assertIn(b"Report", handler.body)
+
 
 # ── Integration tests: live server on TEST_PORT ───────────────────────────────
 # No collection-time skip guard — conftest.py starts the server via its
@@ -596,7 +767,10 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_nonexistent_file_returns_404(self):
-        _, status, _ = self._get("/api/media?path=/tmp/__hermes_nonexistent_12345.png")
+        missing = _media_fixture_dir() / "__hermes_nonexistent_12345.png"
+        _, status, _ = self._get(
+            "/api/media?path=" + urllib.parse.quote(str(missing))
+        )
         self.assertEqual(status, 404)
 
     def test_path_outside_allowed_root_rejected(self):
@@ -605,7 +779,7 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         self.assertIn(status, {403, 404})
 
     def test_valid_png_served_with_image_mime(self):
-        """Create a 1-pixel PNG in /tmp and verify it's served correctly."""
+        """Create a 1-pixel PNG in the isolated test workspace and verify it serves."""
         # Minimal valid 1x1 transparent PNG (67 bytes)
         png_bytes = (
             b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
@@ -613,13 +787,13 @@ class TestMediaEndpointIntegration(unittest.TestCase):
             b'\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
         )
         with tempfile.NamedTemporaryFile(
-            suffix=".png", prefix="hermes_test_", dir="/tmp", delete=False
+            suffix=".png", prefix="hermes_test_", dir=_media_fixture_dir(), delete=False
         ) as f:
             f.write(png_bytes)
             tmp_path = f.name
         try:
             body, status, headers = self._get(
-                f"/api/media?path={urllib.request.quote(tmp_path)}"
+                f"/api/media?path={urllib.parse.quote(tmp_path)}"
             )
             self.assertEqual(status, 200, f"Expected 200, got {status}")
             ct = headers.get("Content-Type", "")
@@ -632,12 +806,12 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         """MEDIA: audio paths stream inline and support byte ranges for playback."""
         audio_bytes = b"RIFF" + (b"\x00" * 256)
         with tempfile.NamedTemporaryFile(
-            suffix=".wav", prefix="hermes_test_", dir="/tmp", delete=False
+            suffix=".wav", prefix="hermes_test_", dir=_media_fixture_dir(), delete=False
         ) as f:
             f.write(audio_bytes)
             tmp_path = f.name
         try:
-            encoded = urllib.request.quote(tmp_path)
+            encoded = urllib.parse.quote(tmp_path)
             body, status, headers = self._get(f"/api/media?path={encoded}&inline=1")
             self.assertEqual(status, 200)
             self.assertIn("audio/wav", headers.get("Content-Type", ""))
@@ -659,12 +833,12 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         """HTML opens inline only when requested and always carries CSP sandbox."""
         html_bytes = b"<!doctype html><title>Hermes</title><script>window.ok=1</script>"
         with tempfile.NamedTemporaryFile(
-            suffix=".html", prefix="hermes_test_", dir="/tmp", delete=False
+            suffix=".html", prefix="hermes_test_", dir=_media_fixture_dir(), delete=False
         ) as f:
             f.write(html_bytes)
             tmp_path = f.name
         try:
-            encoded = urllib.request.quote(tmp_path)
+            encoded = urllib.parse.quote(tmp_path)
 
             body, status, headers = self._get(f"/api/media?path={encoded}")
             self.assertEqual(status, 200)
@@ -690,7 +864,7 @@ class TestMediaEndpointIntegration(unittest.TestCase):
 
     def test_path_traversal_rejected(self):
         _, status, _ = self._get(
-            "/api/media?path=" + urllib.request.quote("/tmp/../../etc/passwd")
+            "/api/media?path=" + urllib.parse.quote("/tmp/../../etc/passwd")
         )
         self.assertIn(status, {403, 404})
 
@@ -709,7 +883,7 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         settings.write_text('{"secret":"value"}', encoding="utf-8")
         try:
             _, status, _ = self._get(
-                "/api/media?path=" + urllib.request.quote(str(settings.resolve()))
+                "/api/media?path=" + urllib.parse.quote(str(settings.resolve()))
             )
             self.assertEqual(
                 status, 403,
@@ -725,7 +899,7 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         sess_file.write_text('{"messages":[]}', encoding="utf-8")
         try:
             _, status, _ = self._get(
-                "/api/media?path=" + urllib.request.quote(str(sess_file.resolve()))
+                "/api/media?path=" + urllib.parse.quote(str(sess_file.resolve()))
             )
             self.assertEqual(
                 status, 403,
@@ -734,34 +908,34 @@ class TestMediaEndpointIntegration(unittest.TestCase):
         finally:
             sess_file.unlink(missing_ok=True)
 
-    def test_deny_list_does_not_overblock_legitimate_media(self):
-        """#3234 follow-up: the state/secret deny-list must NOT block ordinary
-        media that merely shares a sensitive basename but lives OUTSIDE any
-        Hermes state root (e.g. a user artifact in /tmp named settings.json).
-
-        The deny is scoped to files under a Hermes root; a /tmp PNG named
-        settings.png — or even settings.json — is the user's own content and
-        must still be served (200), not 403.
+    def test_deny_list_does_not_overblock_active_workspace_media(self):
+        """#3234 follow-up: workspace media with a sensitive-looking basename must
+        still serve when it lives under the active workspace carve-out.
         """
         png_bytes = (
             b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
             b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00'
             b'\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
         )
-        # A /tmp artifact whose stem collides with a denied basename — must serve
-        # because /tmp is not a Hermes state root.
+        # A test-workspace artifact whose stem collides with a denied basename
+        # must still serve because the active workspace carve-out allows
+        # legitimate user media even when the test workspace lives under
+        # TEST_STATE_DIR.
         with tempfile.NamedTemporaryFile(
-            suffix=".png", prefix="settings_artifact_", dir="/tmp", delete=False
+            suffix=".png",
+            prefix="settings_artifact_",
+            dir=_media_fixture_dir(),
+            delete=False,
         ) as f:
             f.write(png_bytes)
             tmp_path = f.name
         try:
             body, status, headers = self._get(
-                f"/api/media?path={urllib.request.quote(tmp_path)}"
+                f"/api/media?path={urllib.parse.quote(tmp_path)}"
             )
             self.assertEqual(
                 status, 200,
-                f"a /tmp PNG outside any Hermes root must serve, got {status}",
+                f"a test-workspace PNG under the active workspace must serve, got {status}",
             )
             self.assertIn("image/png", headers.get("Content-Type", ""))
         finally:

@@ -35,8 +35,10 @@ def test_offline_banner_markup_styles_and_copy_exist():
 
 def test_offline_monitor_patches_fetch_and_auto_reloads_after_health_probe():
     assert "const OFFLINE_RECHECK_MS=2500" in UI_JS
+    assert "const OFFLINE_HEALTH_TIMEOUT_MS=10000" in UI_JS
+    assert "const OFFLINE_FETCH_FAILURES_BEFORE_BANNER=2" in UI_JS
     assert "window.fetch=async function(...args)" in UI_JS
-    assert "window.addEventListener('offline',()=>showOfflineBanner('browser'))" in UI_JS
+    assert "window.addEventListener('offline',()=>{void _showOfflineBannerIfProbeFails('browser',{requireConsecutiveFailures:false});});" in UI_JS
     assert "window.addEventListener('online',()=>{if(_offlineVisible)checkOfflineRecoveryNow();})" in UI_JS
     assert "setInterval(()=>{checkOfflineRecoveryNow();},OFFLINE_RECHECK_MS)" in UI_JS
     assert "new URL('health',document.baseURI||location.href)" in UI_JS
@@ -58,10 +60,10 @@ def test_offline_recovery_probe_is_serialized_and_stops_timer_before_reload():
 def test_fetch_typeerror_is_gated_by_health_probe_not_blind_banner():
     fetch_patch = UI_JS.split("window.fetch=async function(...args){", 1)[1].split("function initOfflineMonitor", 1)[0]
     assert "function _isAbortError(e)" in UI_JS
-    assert "e instanceof TypeError&&!_isAbortError(e)" in fetch_patch
-    assert "void _probeOfflineRecovery().then(ok=>{if(!ok)showOfflineBanner('network');})" in fetch_patch
-    assert "if(!_browserReportsOnline())showOfflineBanner('browser');" in fetch_patch
-    assert "e instanceof TypeError||!_browserReportsOnline()" not in fetch_patch
+    assert "!_isAbortError(e)&&(e instanceof TypeError||!_browserReportsOnline())" in fetch_patch
+    assert "void _showOfflineBannerIfProbeFails(_browserReportsOnline()?'network':'browser');" in fetch_patch
+    assert "_offlineFetchProbeFailures<OFFLINE_FETCH_FAILURES_BEFORE_BANNER" in UI_JS
+    assert "if(!_browserReportsOnline())showOfflineBanner('browser');" not in fetch_patch
 
 
 def test_sse_network_error_defers_to_offline_banner_instead_of_inline_error():
@@ -89,5 +91,5 @@ def test_deferred_hidden_stream_error_reattaches_or_restores_before_inline_error
     assert "api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`)" in recovery_block
     assert "if(st.active)" in recovery_block
     assert "_wireSSE(new EventSource" in recovery_block
-    assert "if(await _restoreSettledSession(source)) return;" in recovery_block
-    assert recovery_block.find("if(await _restoreSettledSession(source)) return;") < recovery_block.rfind("_handleStreamError(source)")
+    assert "if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;" in recovery_block
+    assert recovery_block.find("if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;") < recovery_block.rfind("_handleStreamError(source)")

@@ -30,7 +30,6 @@ Coverage:
    through).
 """
 import pathlib
-import re
 from unittest.mock import patch
 
 
@@ -175,6 +174,40 @@ class TestSlowPathStillFires:
             "cross-provider artifacts (#1253)."
         )
 
+    def test_configured_provider_qualified_model_skips_catalog(self):
+        """Configured providers already carry trusted routing context."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        old_cfg = dict(config.cfg)
+        config.cfg["model"] = {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+        }
+        config.cfg["providers"] = {
+            "local-llama": {
+                "base_url": "http://127.0.0.1:8088/v1",
+                "api_key": "test-key",
+            },
+        }
+        try:
+            with patch("api.routes.get_available_models") as mock_catalog:
+                mock_catalog.side_effect = AssertionError("catalog should not be called")
+                result = _resolve_compatible_session_model_state(
+                    "@local-llama:unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL",
+                    "local-llama",
+                )
+        finally:
+            config.cfg.clear()
+            config.cfg.update(old_cfg)
+
+        assert result == (
+            "@local-llama:unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL",
+            "local-llama",
+            False,
+        )
+        assert mock_catalog.call_count == 0
+
     def test_no_requested_provider_goes_to_slow_path(self):
         """When provider isn't supplied, slow path must repair from catalog."""
         from api.routes import _resolve_compatible_session_model_state
@@ -236,7 +269,12 @@ class TestFastPathSourceShape:
         """The fast-path return must come BEFORE the catalog lookup."""
         src = _read("api/routes.py")
         idx = src.find("def _resolve_compatible_session_model_state(")
-        body = src[idx:idx + 6000]
+        # Helper grew (profile_config, custom repair); 6k window no longer reaches
+        # the slow-path catalog call — use a bounded slice through the next def.
+        body = src[idx:idx + 12000]
+        next_def = body.find("\ndef ", 100)
+        if next_def != -1:
+            body = body[:next_def]
         fast_path_idx = body.find("if model and requested_provider:")
         catalog_idx = body.find("catalog = get_available_models()")
         assert fast_path_idx != -1 and catalog_idx != -1

@@ -90,6 +90,7 @@ class TestPluginsApi:
             "enabled": True,
             "kind": "standalone",
             "activation": "enabled",
+            "is_active_provider": False,
             "hooks": ["pre_tool_call", "post_tool_call"],
         }]
         serialized = repr(payload)
@@ -147,7 +148,7 @@ class TestPluginsApi:
             "noema": _FakeLoadedPlugin(
                 _FakeManifest(
                     name="noema",
-                    key="noema",
+                    key="memory/noema",
                     version="0.1.0",
                     description="Structured memory backed by a Noema Cortex",
                     kind="exclusive",
@@ -158,11 +159,13 @@ class TestPluginsApi:
             )
         })
 
-        payload = self._capture_plugins_response(manager)
+        with patch("api.config.get_config", return_value={"memory": {"provider": "noema"}}):
+            payload = self._capture_plugins_response(manager)
 
         plugin = payload["plugins"][0]
         assert plugin["kind"] == "exclusive"
         assert plugin["activation"] == "exclusive"
+        assert plugin["is_active_provider"] is True
         # `enabled` stays False for back-compat with older WebUI clients that
         # key off it directly; new clients must read `activation`.
         assert plugin["enabled"] is False
@@ -170,6 +173,54 @@ class TestPluginsApi:
         # The raw error string is intentionally NOT surfaced — it can contain
         # filesystem paths or other internals on other plugin kinds.
         assert "exclusive plugin" not in repr(payload)
+
+    def test_api_plugins_marks_unselected_exclusive_plugins_inactive(self):
+        manager = _FakePluginManager({
+            "honcho": _FakeLoadedPlugin(
+                _FakeManifest(
+                    name="honcho",
+                    key="memory/honcho",
+                    version="1.0.0",
+                    description="Honcho memory provider",
+                    kind="exclusive",
+                ),
+                enabled=False,
+                hooks_registered=[],
+            )
+        })
+
+        with patch("api.config.get_config", return_value={"memory": {"provider": "noema"}}):
+            payload = self._capture_plugins_response(manager)
+
+        plugin = payload["plugins"][0]
+        assert plugin["kind"] == "exclusive"
+        assert plugin["activation"] == "exclusive"
+        assert plugin["enabled"] is False
+        assert plugin["is_active_provider"] is False
+
+    def test_api_plugins_omits_active_provider_for_flat_key_exclusive_plugins(self):
+        manager = _FakePluginManager({
+            "noema": _FakeLoadedPlugin(
+                _FakeManifest(
+                    name="noema",
+                    key="noema",
+                    version="0.1.0",
+                    description="Flat-key memory provider",
+                    kind="exclusive",
+                ),
+                enabled=False,
+                hooks_registered=[],
+            )
+        })
+
+        with patch("api.config.get_config", return_value={"memory": {"provider": "noema"}}):
+            payload = self._capture_plugins_response(manager)
+
+        plugin = payload["plugins"][0]
+        assert plugin["kind"] == "exclusive"
+        assert plugin["activation"] == "exclusive"
+        assert plugin["enabled"] is False
+        assert "is_active_provider" not in plugin
 
     def test_api_plugins_marks_active_model_provider(self):
         # model-provider plugins that loaded successfully (loaded.enabled True)
@@ -194,6 +245,7 @@ class TestPluginsApi:
         plugin = payload["plugins"][0]
         assert plugin["kind"] == "model-provider"
         assert plugin["activation"] == "provider"
+        assert plugin["is_active_provider"] is True
         assert plugin["enabled"] is True
 
 
@@ -523,3 +575,23 @@ class TestPluginCollisionDetection:
 
         assert "plugins_active_provider:" in i18n
         assert "plugins_provider_no_hooks:" in i18n
+
+
+class TestAutoHidePluginsTab:
+    """Tests for issue #3457: auto-hide Plugins tab when no plugins installed."""
+
+    def test_loadPluginsPanel_hides_tab_when_empty(self):
+        js = read("static/panels.js")
+        segment = js[js.find("async function loadPluginsPanel"):js.find("function _buildPluginCard")]
+
+        assert "data-settings-section=\"plugins\"" in segment
+        assert ".empty" in segment
+        assert "style.display='none'" in segment
+
+    def test_switchSettingsSection_fallback_when_hidden(self):
+        js = read("static/panels.js")
+        segment = js[js.find("function switchSettingsSection"):js.find("function _syncHermesPanelSessionActions")]
+
+        assert "section==='plugins'" in segment
+        assert "display==='none'" in segment
+        assert "section='conversation'" in segment

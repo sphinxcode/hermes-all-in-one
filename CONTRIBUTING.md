@@ -17,8 +17,9 @@ Hermes WebUI is intentionally simple to work on: Python on the server, vanilla J
   and the relevant RFC listed there.
 
 Use those documents as review guardrails: keep the change scoped, preserve the
-no-build-step architecture, update docs/changelog when behavior changes, include
-UI evidence for UI changes, and add tests for behavior changes where practical.
+no-build-step architecture, update docs when behavior changes, put
+release-note-worthy details in the PR body, include UI evidence for UI changes,
+and add tests for behavior changes where practical.
 
 ### Contract-affecting PRs
 
@@ -71,10 +72,12 @@ Keep each PR focused. A small related group of fixes is fine. A bug fix plus a C
 
 ### 2. Local Verification
 
-Run the test suite locally:
+Run the test suite locally through the repo runner. It creates/uses a supported
+Python 3.11-3.13 `.venv` and installs missing dev test dependencies, avoiding
+unsupported system interpreters during collection:
 
 ```bash
-pytest tests/ -v --timeout=60
+./scripts/test.sh
 ```
 
 CI also runs this suite on Python `3.11`, `3.12`, and `3.13`.
@@ -93,6 +96,10 @@ There is currently no PR template in this repo, so include the important section
 - Model Used
 
 If the change is user-visible, include screenshots or a short video.
+
+If the change is release-note-worthy, include concise release-note wording in
+the PR body. Do not edit `CHANGELOG.md` directly in ordinary contributor PRs;
+the release workflow maintains it through release commits.
 
 For UI or UX changes, before/after images are required. PRs that change the interface or interaction flow without before/after images may not receive meaningful review until that evidence is added.
 
@@ -118,7 +125,9 @@ Common files:
 - [ROADMAP.md](ROADMAP.md) for shipped features and sprint history
 - [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and design constraints
 - [TESTING.md](TESTING.md) for manual and automated verification guidance
-- [CHANGELOG.md](CHANGELOG.md) when maintainers want release-note-ready entries
+- [CHANGELOG.md](CHANGELOG.md) for release history context. Do not edit it in
+  ordinary contributor PRs; include release-note-ready wording in the PR body
+  so maintainers can carry it into the release workflow.
 
 ## Project-Specific Guidelines
 

@@ -24,8 +24,9 @@ def test_session_list_refreshes_are_coalesced_while_in_flight():
     assert "_renderSessionListQueuedRequest={" in src
     assert "opts:_mergeRenderSessionListOptions" in src
     assert "if (_gen !== _renderSessionListGen) return" in src
-    assert "api('/api/sessions' + allProfilesQS,{timeoutToast:false})" in src
-    assert "api('/api/projects' + allProfilesQS,{timeoutToast:false})" in src
+    assert "const sessionRequestOpts={" in src
+    assert "api('/api/sessions' + sessionListQS,sessionRequestOpts)" in src
+    assert "api('/api/projects' + projectQS,{timeoutToast:false})" in src
 
 
 def test_approval_and_clarify_fallback_polls_do_not_overlap():

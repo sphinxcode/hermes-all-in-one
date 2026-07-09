@@ -11,9 +11,9 @@ from tests._pytest_port import BASE, TEST_STATE_DIR
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-ROUTES_PY = (ROOT / "api" / "routes.py").read_text()
-SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text()
-STYLE_CSS = (ROOT / "static" / "style.css").read_text()
+ROUTES_PY = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
+SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+STYLE_CSS = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
 
 
 def post(path, body=None):
@@ -163,10 +163,16 @@ def test_hidden_in_memory_snapshot_does_not_count_toward_pin_quota():
 
 
 def test_session_pin_cap_has_backend_and_frontend_guards():
-    assert 'pinned_ids = {' in ROUTES_PY
-    assert 'pinned_ids.update(' in ROUTES_PY
+    # #3288 renamed the in-LOCK pin counter to count visible lineages
+    # (pinned_lineage_ids) instead of raw session ids (pinned_ids), so a
+    # continuation lineage no longer consumes multiple pin slots. The guard
+    # behaviour (snapshot, merge under LOCK, compare against the limit, 400) is
+    # unchanged.
+    assert 'persisted_rows = [' in ROUTES_PY
+    assert 'candidate_rows.extend(' in ROUTES_PY
+    assert 'pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)' in ROUTES_PY
     assert 'pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)' in ROUTES_PY
-    assert 'if len(pinned_ids) >= pinned_sessions_limit:' in ROUTES_PY
+    assert 'if len(pinned_lineage_ids) >= pinned_sessions_limit:' in ROUTES_PY
     assert 'Up to {pinned_sessions_limit} sessions can be pinned' in ROUTES_PY
 
     assert 'function _pinnedSessionCount()' in SESSIONS_JS

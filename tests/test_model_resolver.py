@@ -159,6 +159,89 @@ def test_custom_provider_model_with_slash_routes_to_named_custom_provider():
     assert base_url == 'http://lmstudio.local:1234/v1'
 
 
+# ── #3872: bare ``custom`` provider is a vendor-routing proxy — preserve the
+#    full model id (the prefix is intrinsic). #433's redundant-prefix strip is
+#    scoped to real first-party providers (provider=openai + proxy base_url),
+#    which is covered by test_custom_endpoint_slash_model_routes_to_custom_not_openrouter.
+
+def test_custom_remote_preserves_intrinsic_vendor_prefix_3872():
+    """#3872: bedrock/opus-4-6 on a bare-custom remote proxy keeps its full id.
+
+    A bare ``custom`` provider with a remote base_url is a vendor-routing proxy
+    (LiteLLM, Bedrock gateway). ``bedrock/`` is an intrinsic routing segment the
+    proxy needs whole; stripping it to ``opus-4-6`` makes the proxy return 403
+    "model not allowed for your group".
+    """
+    model, provider, base_url = _resolve_with_config(
+        'bedrock/opus-4-6',
+        provider='custom',
+        base_url='https://router.example.com/v1',
+    )
+    assert model == 'bedrock/opus-4-6', f"intrinsic prefix must be preserved, got {model!r}"
+    assert provider == 'custom'
+    assert base_url == 'https://router.example.com/v1'
+
+
+def test_custom_remote_strips_redundant_first_party_prefix_433():
+    """#433: bare-custom remote proxy still strips a REDUNDANT first-party prefix.
+
+    ``gpt-5.4`` IS a first-party OpenAI model, so ``openai/`` is a redundant
+    leftover and the proxy expects the bare id. This is the behaviour pinned by
+    test_sprint40_ui_polish.py::test_prefixed_model_stripped_for_custom_endpoint;
+    the #3872 fix must keep it while preserving intrinsic vendor prefixes.
+    """
+    model, provider, base_url = _resolve_with_config(
+        'openai/gpt-5.4',
+        provider='custom',
+        base_url='https://router.example.com/v1',
+    )
+    assert model == 'gpt-5.4', f"redundant first-party prefix must be stripped, got {model!r}"
+    assert provider == 'custom'
+
+
+def test_custom_remote_preserves_unknown_prefix_548():
+    """#548: an unknown vendor prefix (zai-org/GLM-5.1) is always preserved."""
+    model, provider, base_url = _resolve_with_config(
+        'zai-org/GLM-5.1',
+        provider='custom',
+        base_url='https://api.deepinfra.com/v1/openai',
+    )
+    assert model == 'zai-org/GLM-5.1', f"unknown prefix must be preserved, got {model!r}"
+    assert provider == 'custom'
+
+
+def test_named_custom_slug_preserves_intrinsic_vendor_prefix_3872():
+    """#3872 (named-custom variant): provider=custom:<slug> + remote base_url also
+    preserves an intrinsic vendor prefix when the typed model isn't in the entry.
+
+    A model typed/selected that is not listed in the custom_providers[] entry
+    falls through to the base_url branch; a bare id NOT first-party of the prefix
+    (bedrock/opus-4-6) must still be kept whole, same as bare ``custom``.
+    """
+    model, provider, base_url = _resolve_with_config(
+        'bedrock/opus-4-6',
+        provider='custom:my-gateway',
+        base_url='https://router.example.com/v1',
+    )
+    assert model == 'bedrock/opus-4-6', f"intrinsic prefix must be preserved for custom:slug, got {model!r}"
+
+
+def test_first_party_provider_proxy_still_strips_prefix_433():
+    """#433/dc2334c5: provider=openai + remote proxy still strips the prefix.
+
+    This is the deliberate behaviour the #3872 fix must NOT regress: a real
+    first-party provider pointed at an OpenAI-compatible proxy expects the bare
+    id. (Mirrors the public-host branch of
+    test_custom_endpoint_slash_model_routes_to_custom_not_openrouter.)
+    """
+    model, provider, base_url = _resolve_with_config(
+        'openai/gpt-5.4',
+        provider='openai',
+        base_url='https://litellm.example.com/v1',
+    )
+    assert model == 'gpt-5.4', f"redundant first-party prefix must be stripped, got {model!r}"
+
+
 def test_custom_provider_models_dict_routes_to_named_custom_provider():
     """Models listed only under custom_providers[].models still route to that endpoint."""
     model, provider, base_url = _resolve_with_config(
@@ -626,3 +709,213 @@ def test_custom_endpoint_slash_model_routes_to_custom_not_openrouter():
     assert model_or == 'google/gemma-4-26b-a4b', (
         "Model name should be preserved for openrouter, got '{}'.".format(model_or)
     )
+
+
+# ── #4210: custom provider (no base_url) must not be hijacked to openrouter
+#    when the model id has a known-provider prefix (sibling of #3872, which
+#    only covered the base_url-set variant). Bug-report case 1.
+
+def test_custom_provider_no_base_url_with_known_prefix_keeps_custom_and_full_id_4210():
+    """#4210: provider=custom:llm-proxy (no base_url) + 'x-ai/grok-2' must NOT
+    be redirected to openrouter. The prefix is intrinsic to the custom proxy's
+    routing; the user did not pick anything from the OpenRouter dropdown."""
+    model, provider, base_url = _resolve_with_config(
+        'x-ai/grok-2',
+        provider='custom:llm-proxy',
+        default='x-ai/grok-2',
+    )
+    assert provider == 'custom:llm-proxy', (
+        "Custom provider must not be hijacked to openrouter when no base_url is "
+        "set; got provider={!r} model={!r}".format(provider, model)
+    )
+    assert model == 'x-ai/grok-2', (
+        "Custom provider must preserve the full model id; got model={!r}".format(model)
+    )
+    assert base_url is None
+
+
+def test_bare_custom_provider_no_base_url_with_known_prefix_keeps_custom_and_full_id_4210():
+    """#4210 sibling: bare 'custom' (no 'custom:<slug>') with no base_url
+    must also not be hijacked to openrouter for a known-prefix model id."""
+    model, provider, base_url = _resolve_with_config(
+        'google/gemma-2-9b',
+        provider='custom',
+        default='google/gemma-2-9b',
+    )
+    assert provider == 'custom', (
+        "Bare 'custom' provider must not be hijacked to openrouter when no "
+        "base_url is set; got provider={!r}".format(provider)
+    )
+    assert model == 'google/gemma-2-9b'
+    assert base_url is None
+
+
+# ── providers: (config.yaml user-defined provider) scan (#5511) ─────────────
+
+def _resolve_with_providers(model_id, providers_cfg, *, provider=None, default=None):
+    """Helper: temporarily set config.cfg['providers'] + model, call resolve, restore."""
+    old_cfg = dict(config.cfg)
+    model_cfg = {}
+    if provider:
+        model_cfg['provider'] = provider
+    if default:
+        model_cfg['default'] = default
+    config.cfg['model'] = model_cfg
+    config.cfg['providers'] = providers_cfg
+    try:
+        return config.resolve_model_provider(model_id)
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+
+
+def test_providers_scan_routes_user_defined_allowlist_5511():
+    """A user-defined providers.<slug>.models allowlist routes a bare model id
+    to that provider (the feature #5511 adds)."""
+    model, provider, base_url = _resolve_with_providers(
+        'my-model-1',
+        {'myprov': {'base_url': 'https://my.example/v1', 'models': ['my-model-1', 'my-model-2']}},
+        provider='openai',
+        default='gpt-5',
+    )
+    assert provider == 'myprov', f"user-defined provider allowlist must route; got {provider!r}"
+    assert model == 'my-model-1'
+    assert base_url == 'https://my.example/v1'
+
+
+def test_providers_scan_skips_copilot_settings_map_5511():
+    """providers.copilot.models is a per-model SETTINGS map, NOT a routable
+    allowlist — a Copilot per-model settings entry must NOT hijack routing away
+    from the model's real provider (#5511 gate-cert CORE finding)."""
+    model, provider, base_url = _resolve_with_providers(
+        'gpt-5',
+        {'copilot': {'models': {'gpt-5': {'reasoning_effort': 'high'}}}},
+        provider='openai',
+        default='gpt-5',
+    )
+    assert provider == 'openai', (
+        "Copilot settings-map entry must NOT hijack routing; "
+        f"gpt-5 must stay on openai, got {provider!r}"
+    )
+    assert model == 'gpt-5'
+
+
+def test_providers_scan_copilot_list_shape_also_skipped_5511():
+    """Defense in depth: even if providers.copilot.models is a list shape, the
+    Copilot exclusion still prevents a routing hijack."""
+    model, provider, base_url = _resolve_with_providers(
+        'gpt-5',
+        {'copilot': {'models': ['gpt-5', 'gpt-5-mini']}},
+        provider='openai',
+        default='gpt-5',
+    )
+    assert provider == 'openai', (
+        f"Copilot (list shape) must not hijack routing; got {provider!r}"
+    )
+    assert model == 'gpt-5'
+
+
+def test_providers_scan_honors_active_provider_ownership_5511():
+    """When the active provider owns the model (it's the configured default),
+    another provider's overlapping providers.<slug>.models entry must NOT hijack
+    routing away from the active provider (#5511 gate finding — active ai-gateway
+    + default gpt-5 was being pulled to providers.openai.models.gpt-5)."""
+    model, provider, base_url = _resolve_with_providers(
+        'gpt-5',
+        {'openai': {'models': ['gpt-5']}},
+        provider='ai-gateway',
+        default='gpt-5',
+    )
+    assert provider == 'ai-gateway', (
+        "active provider that owns the default model must keep routing; "
+        f"gpt-5 must stay on ai-gateway, got {provider!r}"
+    )
+    assert model == 'gpt-5'
+
+
+def test_providers_scan_active_provider_own_entry_still_matches_5511():
+    """The ownership guard still lets the ACTIVE provider's own providers: entry
+    match (e.g. active myprov + a model in providers.myprov.models resolves to
+    myprov with its base_url)."""
+    model, provider, base_url = _resolve_with_providers(
+        'gpt-5',
+        {'myprov': {'base_url': 'https://my.example/v1', 'models': ['gpt-5']}},
+        provider='myprov',
+        default='gpt-5',
+    )
+    assert provider == 'myprov', f"active provider's own entry must match; got {provider!r}"
+    assert base_url == 'https://my.example/v1'
+
+
+def test_providers_scan_ownership_guard_canonicalises_aliased_active_provider_5511():
+    """An ALIASED active provider (e.g. 'z-ai' → canonical 'zai') must still be
+    recognized as owning its catalog models, so another providers.<slug>.models
+    entry can't hijack an active-owned model (#5511 latent-bug gate finding —
+    _provider_models_set was built with the raw alias, missing the canonical
+    _PROVIDER_MODELS key, so the ownership guard silently failed)."""
+    import api.config as config
+    # Pick a real catalog model id owned by the canonical 'zai' provider.
+    zai_models = config._PROVIDER_MODELS.get('zai') or []
+    zai_ids = [m.get('id') for m in zai_models if isinstance(m, dict) and m.get('id')]
+    if not zai_ids:
+        import pytest
+        pytest.skip("no zai catalog models to exercise the alias ownership guard")
+    owned = zai_ids[0]
+    model, provider, base_url = _resolve_with_providers(
+        owned,
+        {'openai': {'models': [owned]}},
+        provider='z-ai',        # aliased form the user may write in config
+    )
+    assert config._canonicalise_provider_id('z-ai') == 'zai'
+    assert provider == 'z-ai', (
+        "aliased active provider (z-ai→zai) that owns the model must not be "
+        f"hijacked by providers.openai.models; got {provider!r}"
+    )
+
+
+def test_providers_scan_ownership_guard_canonicalises_gemini_alias_5511():
+    """A Gemini-family alias (google-gemini → gemini) must canonicalise so the
+    active provider is recognized as owning its catalog models (#5511 latent bug:
+    `gemini` is in _PROVIDER_MODELS but not _PROVIDER_DISPLAY, so the alias was
+    rejected and the ownership guard silently failed)."""
+    import api.config as config
+    assert config._canonicalise_provider_id('google-gemini') == 'gemini', (
+        "google-gemini must canonicalise to gemini"
+    )
+    gem_models = config._PROVIDER_MODELS.get('gemini') or []
+    gem_ids = [m.get('id') for m in gem_models if isinstance(m, dict) and m.get('id')]
+    if not gem_ids:
+        import pytest
+        pytest.skip("no gemini catalog models to exercise the alias ownership guard")
+    owned = gem_ids[0]
+    model, provider, base_url = _resolve_with_providers(
+        owned,
+        {'openai': {'models': [owned]}},
+        provider='google-gemini',
+    )
+    assert provider == 'google-gemini', (
+        "aliased active Gemini provider that owns the model must not be hijacked "
+        f"by providers.openai.models; got {provider!r}"
+    )
+
+
+def test_providers_scan_active_own_providers_entry_owns_over_other_slug_5511():
+    """An active provider defined purely via config.yaml `providers:` (no static
+    catalog entry) owns the models in its OWN providers.<active>.models allowlist,
+    so another provider's entry listing the same bare id (even earlier in config
+    order) must NOT hijack it (#5511 gate finding 5)."""
+    # 'openai' entry lists gpt-x first, but the ACTIVE provider (myprov) also
+    # declares gpt-x in its own providers.myprov.models — active must win.
+    model, provider, base_url = _resolve_with_providers(
+        'gpt-x',
+        {
+            'openai': {'models': ['gpt-x']},
+            'myprov': {'base_url': 'https://my.example/v1', 'models': ['gpt-x']},
+        },
+        provider='myprov',
+    )
+    assert provider == 'myprov', (
+        "active provider's own providers: allowlist must own its model over "
+        f"another slug's overlapping entry; got {provider!r}"
+    )
+    assert base_url == 'https://my.example/v1'

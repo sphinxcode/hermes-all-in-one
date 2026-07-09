@@ -15,6 +15,7 @@ If your symptom isn't listed and the diagnostics don't narrow it down, file a bu
 1. **Agent installed but not on `sys.path`.** Most common. The agent is checked out somewhere (e.g. `~/Programmes/hermes-agent`), the WebUI was launched with a Python that doesn't know about it, and there's no `pip install -e .` linking the two.
 2. **Symlink with a typo or wrong target.** A symlink to the agent looks correct on `ls`, but `readlink` resolves to a path that doesn't exist or doesn't contain `agent/__init__.py`.
 3. **`HERMES_WEBUI_AGENT_DIR` set to the wrong directory.** Override env var beats auto-discovery and points at a directory that has no agent code.
+4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), or set `HERMES_WEBUI_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python` and relaunch.
 
 ### Step 1 — confirm the agent location
 
@@ -117,6 +118,62 @@ The on-disk locations below assume the default `~/.hermes/webui` state directory
 **Caps.** The lazy retry path gives up after 12 failed attempts or 24h of wall-clock age, at which point the marker is demoted to a neutral *"Partial output may have been lost."* wording so the "reload to retry" prompt doesn't linger forever for genuinely lost journals.
 
 **When to file a bug.** If, after the fix, you see the lazy-retry wording (*"Recovering the partial output from the run journal — reload this session to retry."*) but reloading the session never promotes it to the recovered wording even though the `.jsonl` clearly contains `token` events, capture the marker JSON and the run-journal file and file a bug.
+
+---
+
+## "Context compression exhausted" after a long-running turn
+
+**Symptom.** A long-running session, often with many tool calls or a small
+context-window model, ends with a `Context compression exhausted` error instead
+of a final answer. The message includes a recovery action labeled `Start focused
+continuation`.
+
+**Why.** Automatic compression could not shrink the current conversation enough
+to continue safely in the same model-facing context. The exhausted session is
+terminal: sending a bare "continue", "go on", or "继续" would usually replay the
+same oversized state and fail again, so the WebUI points the user to a focused
+linked continuation instead.
+
+**Diagnostic.**
+
+1. Open the session JSON under your WebUI state directory, for example:
+   ```bash
+   jq '.recommended_recovery_action, .compression_recovery' \
+     ~/.hermes/webui/sessions/<session_id>.json
+   ```
+2. A recoverable exhausted turn should report:
+   - `recommended_recovery_action: "start_focused_continuation"`
+   - `compression_recovery.terminal_state: "compression_exhausted"`
+   - the final assistant error message carrying `_compressionRecovery`
+
+**Fix.** Use the `Start focused continuation` action in the exhausted message.
+The new linked session preserves the workspace, model, profile, project, and
+toolset lane, but intentionally starts with an empty model-facing transcript so
+the oversized exhausted tail is not replayed. After the new session opens,
+describe the next narrow task explicitly instead of sending a bare continuation.
+
+**When to file a bug.** File a bug if the exhausted message has no recovery
+action, the action creates a session with the old oversized context/messages
+replayed into the model-facing transcript, or a bare "continue" starts another
+turn in the exhausted session instead of being blocked with recovery guidance.
+
+---
+
+## Installed PWA opens to a blank screen after an update
+
+**Symptom.** The installed PWA or home-screen app opens to a blank screen after a WebUI update, while the same URL often works again in a normal browser tab.
+
+**Why.** Reverse proxies are supported, but proxy basic auth can challenge the same-origin `sw.js`, manifest, or versioned `static/*` fetches the installed app needs while its service worker updates the shell.
+
+**Diagnostic.**
+
+1. Open the same WebUI URL in a regular browser tab and confirm whether it loads there.
+2. Check reverse-proxy logs for `401` responses on `/sw.js`, `/manifest.json`, or versioned `/static/*` assets during the update.
+3. Temporarily remove proxy basic auth and use WebUI's built-in password. If the blank screen stops after the next update, the proxy auth challenge was the trigger.
+
+**Fix.** Prefer WebUI's own password for installed PWAs. If you keep proxy basic auth, configure it so the same-origin service-worker and shell update fetches can complete. If the installed shell is already blank, clear site data for the Hermes origin, then reopen or reinstall the PWA after that site-scoped cleanup.
+
+**When to file a bug.** File a WebUI bug if the blank screen still reproduces without proxy basic auth, or after the proxy allows the same-origin service-worker and shell update fetches through.
 
 ---
 

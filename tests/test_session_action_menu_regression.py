@@ -46,15 +46,32 @@ def test_archive_action_repaints_sidebar_before_full_refresh():
     assert helper_body.index(api_call) < helper_body.index(optimistic) < helper_body.index(cached_render) < helper_body.index(full_refresh)
 
 
+def test_archive_action_clears_saved_session_pointer_for_archived_current_session():
+    """Archiving the saved active session should not leave boot localStorage stale."""
+    helper_body = _function_block(SESSIONS_JS, "_archiveSession")
+    stale_saved_pointer_guard = (
+        "try{ if(archived&&session.session_id&&localStorage.getItem('hermes-webui-session')===session.session_id) "
+        "localStorage.removeItem('hermes-webui-session'); }catch(_){ }"
+    )
+
+    assert stale_saved_pointer_guard in helper_body
+    assert helper_body.index("if(S.session&&S.session.session_id===session.session_id) S.session.archived=archived;") < helper_body.index(stale_saved_pointer_guard)
+    assert helper_body.index(stale_saved_pointer_guard) < helper_body.index("showToast(session.archived?_sessionArchiveToast(response,session):t('session_restored'));")
+
+
 def test_delete_action_repaints_sidebar_before_loading_remaining_sessions():
     """Delete should remove the row locally before loading replacement session data."""
     body = _function_block(SESSIONS_JS, "deleteSession")
 
     api_call = "const deleteRequest=api('/api/session/delete'"
     optimistic = "_optimisticallyRemoveSessionFromList(sid);"
-    remaining_fetch = "const remaining=await api('/api/sessions');"
+    remaining_fetch = "const remaining=await api('/api/sessions'+_sessionListQueryString());"
     full_refresh = "await renderSessionList();"
 
     assert optimistic in body
     assert body.index(api_call) < body.index(optimistic) < body.index(full_refresh)
     assert body.index(optimistic) < body.index(remaining_fetch)
+
+def test_batch_delete_remaining_session_fetch_uses_sidebar_query_string():
+    """Batch delete must reload the default sidebar through the same query builder."""
+    assert SESSIONS_JS.count("const remaining=await api('/api/sessions'+_sessionListQueryString());") >= 2

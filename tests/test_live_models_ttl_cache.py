@@ -43,7 +43,7 @@ def test_live_models_cache_hits_within_ttl(monkeypatch):
 
     assert calls == ["openai"]
     assert first == second
-    assert first["models"] == [{"id": "openai/gpt-test", "label": "GPT Test"}]
+    assert first["models"] == [{"id": "openai/gpt-test", "label": "GPT Test", "supports_fast_tier": True}]
 
 
 def test_live_models_cache_expires(monkeypatch):
@@ -111,4 +111,23 @@ def test_live_models_cache_returns_deep_copies(monkeypatch):
     second = routes._handle_live_models(object(), parsed)
 
     assert second["provider"] == "openai"
-    assert second["models"] == [{"id": "openai/gpt-test", "label": "GPT Test"}]
+    assert second["models"] == [{"id": "openai/gpt-test", "label": "GPT Test", "supports_fast_tier": True}]
+
+
+def test_live_models_endpoint_respects_picker_visibility_budget(monkeypatch):
+    import api.config as config
+    import api.routes as routes
+
+    _install_provider_model_ids(
+        monkeypatch,
+        lambda provider: [f"{provider}/model-{idx}" for idx in range(40)],
+    )
+    _patch_live_models_basics(monkeypatch, routes)
+
+    parsed = urlparse("/api/models/live?provider=openai")
+    payload = routes._handle_live_models(object(), parsed)
+
+    assert payload["count"] == config._MODEL_PICKER_VISIBLE_TARGET
+    assert [m["id"] for m in payload["models"]] == [
+        f"openai/model-{idx}" for idx in range(config._MODEL_PICKER_VISIBLE_TARGET)
+    ]

@@ -9,9 +9,9 @@ next ``loadSession()`` before ``syncTopbar()`` projects server metadata.
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BOOT_JS = (ROOT / "static" / "boot.js").read_text()
-SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text()
-UI_JS = (ROOT / "static" / "ui.js").read_text()
+BOOT_JS = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
+SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+UI_JS = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 
 
 def _body_between(src: str, start: str, end: str) -> str:
@@ -30,12 +30,19 @@ def test_model_selection_records_pending_state_before_async_session_update():
 
     assert pending_idx < update_idx
     assert local_model_idx < update_idx
-    assert "_clearPendingSessionModel" in body
+    # onchange must NOT clear the pending marker after the session-update round-trip.
+    # The marker has to survive until the next send() consumes it, otherwise the normal
+    # pick→update→send flow loses the explicit-pick signal and the server re-reverts a
+    # cross-family pick (#3737). The consume-clear now lives in send(), not here.
+    assert "_clearPendingSessionModel" not in body, (
+        "modelSelect.onchange must not clear the pending explicit-pick marker (#3737); "
+        "send() consumes it instead"
+    )
 
 
 def test_load_session_applies_pending_model_before_first_topbar_sync():
     """Reload should project the pending selection before server old metadata wins."""
-    body = _body_between(SESSIONS_JS, "async function loadSession", "const activeStreamId=")
+    body = _body_between(SESSIONS_JS, "async function loadSession", "activeStreamId=S.session.active_stream_id")
 
     apply_idx = body.index("_applyPendingSessionModelForSession")
     sync_idx = body.index("syncTopbar()")

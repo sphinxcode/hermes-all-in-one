@@ -47,19 +47,31 @@ Follow that checklist's safety rules:
 - Keep one logical change per PR; split unrelated refactors or cleanup.
 - Read `docs/CONTRACTS.md` and the linked contract/RFC for the touched
   subsystem before editing.
+- For local pytest runs, use `./scripts/test.sh` instead of bare `python3`,
+  `python -m pytest`, or `pytest`. The script creates/uses the repo `.venv`,
+  pins execution to Python 3.11-3.13, and installs missing dev test dependencies.
+  `HERMES_WEBUI_TEST_PYTHON` selects the supported base interpreter used to
+  create or rebuild `.venv`; it must not install test dependencies into a
+  system/Homebrew interpreter directly.
+  If a direct pytest invocation reports an unsupported interpreter, rerun through
+  `./scripts/test.sh` before debugging product code.
 - Prefer the existing Python + vanilla JavaScript structure. Do not add
   dependencies, build tools, frameworks, or long-lived processes without clear
   justification and a rollback story.
 - Update docs when changing setup, onboarding, runtime behavior, architecture,
   testing guidance, or user-facing workflows.
-- Update `CHANGELOG.md` for user-visible behavior, setup, workflow, or
-  documentation changes that should be release-note ready.
+- Do not edit `CHANGELOG.md` in ordinary contributor PRs. The release workflow
+  owns changelog updates through release commits. If a change is release-note
+  worthy, include concise release-note wording in the PR body instead.
 - For UI or UX changes, include before/after evidence and test relevant
   desktop, narrow, and mobile states.
 - For behavior changes, add or update automated tests where practical and list
   the manual verification performed.
 - For runtime, streaming, recovery, replay, compression, or sidebar metadata
   changes, name the state layer being mutated and prove the relevant invariant.
+- For Docker build changes in `docker_init.bash`, mirror directory exclusions
+  in both the `rsync` and `cp -a` paths — `/opt/hermes` may contain subdirectories
+  with restricted permissions (e.g. `.playwright/`).
 
 ## Local state and secrets
 

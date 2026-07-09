@@ -20,13 +20,96 @@ import sys
 import os
 import io
 import json
+import subprocess
 import types
+
+import pytest
 
 REPO = pathlib.Path(__file__).parent.parent
 
 
 def read(rel):
     return (REPO / rel).read_text(encoding='utf-8')
+
+
+def extract_js_function(src: str, name: str) -> str:
+    match = re.search(rf'(async\s+)?function\s+{re.escape(name)}\b', src)
+    assert match, f"{name}() not found"
+    open_paren = src.index("(", match.start())
+    paren_depth = 1
+    idx = open_paren + 1
+    while paren_depth > 0 and idx < len(src):
+        ch = src[idx]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        idx += 1
+    brace = src.index("{", idx)
+    depth = 0
+    end = None
+    for idx in range(brace, len(src)):
+        ch = src[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    assert end is not None, f"{name}() body was not balanced"
+    return src[match.start():end]
+
+
+@pytest.fixture(autouse=True)
+def _stub_pycache_purge(monkeypatch):
+    """No-op the __pycache__ purge for the update/restart tests in this module.
+
+    _schedule_restart() purges __pycache__ before os.execv() (#3774) so the
+    re-exec'd process recompiles freshly-pulled source. The real purge walks
+    REPO_ROOT + _AGENT_DIR on disk — slow (~0.4 s on the agent repo's ~17k
+    files) and destructive — which blows these tests' tight restart-timing
+    budgets and, worse, can delay the daemon thread past monkeypatch teardown
+    so it fires the REAL os.execv and corrupts the pytest worker. These tests
+    exercise restart coordination/locking, not the purge (which has dedicated
+    coverage in test_pycache_purge.py), so stub it to a no-op. The wiring
+    (purge happens before execv) is pinned by
+    test_schedule_restart_purges_pycache_before_execv, which re-patches with a
+    recording spy.
+    """
+    import api.updates as upd
+    monkeypatch.setattr(upd, "_purge_agent_pycache", lambda *a, **k: None)
+
+
+def _extract_summary_cache_js():
+    src = read('static/ui.js')
+    function_names = [
+        '_summaryStorageByteLength',
+        '_summaryCacheEntriesSortedByRecency',
+        '_loadStoredUpdateSummaries',
+        '_persistGeneratedSummaries',
+        '_rememberGeneratedSummary',
+    ]
+    declarations = [
+        line.strip()
+        for line in src.splitlines()
+        if line.startswith('const WHATS_NEW_SUMMARY_STORAGE_KEY')
+        or line.startswith('const WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES')
+    ]
+    functions = [extract_js_function(src, name) for name in function_names]
+    return '\n'.join(declarations + functions)
+
+
+def _parse_byte_expr(expr):
+    expr = expr.strip()
+    if re.fullmatch(r"\d+", expr):
+        return int(expr)
+    if re.fullmatch(r"(?:\d+\s*\*\s*)+\d+", expr):
+        result = 1
+        for piece in re.split(r"\s*\*\s*", expr):
+            result *= int(piece)
+        return result
+    return None
 
 
 # ── api/updates.py ────────────────────────────────────────────────────────────
@@ -357,6 +440,8 @@ class TestScheduleRestart:
         import os as _os
         original_execv = _os.execv
 
+        monkeypatch.setattr(sys, 'platform', 'linux')
+        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
         monkeypatch.setattr(_os, 'execv', fake_execv)
 
         start = time.monotonic()
@@ -367,6 +452,41 @@ class TestScheduleRestart:
         # Give the thread time to call execv
         time.sleep(0.2)
         assert execv_called, "_schedule_restart must eventually call os.execv"
+
+    def test_schedule_restart_purges_pycache_before_execv(self, monkeypatch):
+        """The restart thread must purge __pycache__ before re-exec (#3774).
+
+        Pins the fix wiring: os.execv() replaces the process image without
+        touching on-disk .pyc files, so stale bytecode could otherwise serve
+        an old class definition after a self-update. Records the call order of
+        _purge_agent_pycache vs os.execv and asserts the purge runs first.
+        """
+        import api.updates as upd
+
+        events = []
+
+        def spy_purge(repo_dir):
+            events.append(("purge", repo_dir))
+
+        def fake_execv(exe, args):
+            events.append(("execv", exe))
+
+        # Override the autouse no-op stub with a recording spy.
+        monkeypatch.setattr(sys, 'platform', 'linux')
+        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
+        monkeypatch.setattr(upd, "_purge_agent_pycache", spy_purge)
+        monkeypatch.setattr(os, "execv", fake_execv)
+
+        upd._schedule_restart(delay=0.05)
+        time.sleep(0.3)
+
+        kinds = [kind for kind, _ in events]
+        assert "purge" in kinds, "_schedule_restart must purge __pycache__"
+        assert "execv" in kinds, "_schedule_restart must call os.execv"
+        assert kinds.index("purge") < kinds.index("execv"), (
+            "__pycache__ purge must happen BEFORE os.execv so the re-exec'd "
+            "process recompiles from fresh source"
+        )
 
 
 class TestApplyUpdateRestartSafety:
@@ -607,6 +727,10 @@ class TestSuccessfulUpdateReturnsRestartScheduled:
         monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
         monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
         monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+        monkeypatch.setattr(
+            'api.updates.restart_active_profile_gateway',
+            lambda: {'status': 'completed', 'message': 'Gateway service restarted successfully'},
+        )
 
         result = upd.apply_update('agent')
         assert result['ok'] is True
@@ -647,12 +771,283 @@ class TestApplyForceUpdate:
         assert 'reset' in git_cmds, "force update must call git reset --hard"
         assert 'checkout' in git_cmds, "force update must call git checkout . to clear conflicts"
 
+    def test_apply_force_update_proceeds_when_clean_fails(self, tmp_path, monkeypatch):
+        """#4914 — a `git clean -fd` failure must NOT abort the force update.
+
+        On Windows a reserved-device-name file (nul/con/prn/aux/com1-9/lpt1-9)
+        can land in the working tree (e.g. `> nul` under Git Bash) and git can't
+        delete it, so `clean -fd` exits non-zero. The reset --hard still applies
+        the update, so clean failure must be non-fatal.
+        """
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+        ran = []
+
+        def fake_run(args, cwd, timeout=10):
+            ran.append(args)
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[0] == 'checkout':
+                return '', True
+            if args[0] == 'clean':
+                # Simulate the Windows reserved-name failure.
+                return "warning: failed to remove nul: Invalid argument", False
+            if args[0] == 'reset':
+                return '', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+
+        result = upd.apply_force_update('webui')
+
+        # Clean failed, but reset --hard succeeded → the force update must STILL
+        # succeed (clean failure is non-fatal, #4914).
+        assert result['ok'] is True, (
+            f"force update must not abort on git clean failure (#4914): {result}"
+        )
+        assert result.get('restart_scheduled') is True
+        git_cmds = [r[0] for r in ran]
+        assert 'clean' in git_cmds, "force update should still attempt git clean"
+        assert 'reset' in git_cmds, (
+            "force update must proceed to git reset --hard even after clean failed"
+        )
+
     def test_apply_force_update_rejects_unknown_target(self, tmp_path, monkeypatch):
         import api.updates as upd
         monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
         monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
         result = upd.apply_force_update('invalid')
         assert result['ok'] is False
+
+
+class TestAgentUpdateRequiresGatewayRestart:
+    """Agent updates must prove gateway restart before returning ok=True."""
+
+    def test_apply_update_agent_requires_gateway_restart(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+        ran = []
+        gateway_restarts = []
+
+        def fake_run(args, cwd, timeout=10):
+            ran.append(args)
+            if args[0] == 'fetch':
+                return '', True
+            if args[0] == 'tag':
+                return '', True
+            if args[:2] == ['status', '--porcelain']:
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[0] == 'pull':
+                return 'Already up to date.', True
+            return '', True
+
+        def fake_gateway_restart():
+            gateway_restarts.append('called')
+            return {'status': 'completed', 'message': 'Gateway service restarted successfully'}
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+        monkeypatch.setattr('api.updates.restart_active_profile_gateway', fake_gateway_restart)
+
+        result = upd.apply_update('agent')
+        assert result['ok'] is True
+        assert result['target'] == 'agent'
+        assert result['restart_scheduled'] is True
+        assert result['gateway_restart'] == 'completed'
+        assert gateway_restarts == ['called']
+
+    def test_apply_update_agent_stash_conflict_success_invokes_gateway_restart(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+        gateway_restarts = []
+        ran = []
+
+        def fake_run(args, cwd, timeout=10):
+            ran.append(args)
+            if args[0] == 'fetch':
+                return '', True
+            if args[0] == 'tag':
+                return '', True
+            if args[:2] == ['status', '--porcelain']:
+                return 'M file', True
+            if args[:2] == ['status', '--porcelain', '--untracked-files=no']:
+                return 'M file', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[:2] == ['rev-parse', '--short']:
+                return 'abc1234', True
+            if args[:2] == ['stash', 'push']:
+                return '', True
+            if args[:2] == ['stash', 'apply']:
+                return '', False
+            if args[0] == 'stash':
+                return '', True
+            if args[:3] == ['reset', '--hard', 'HEAD']:
+                return '', True
+            if args[0] == 'pull':
+                return 'Updating', True
+            return '', True
+
+        def fake_gateway_restart():
+            gateway_restarts.append('called')
+            return {'status': 'in_progress', 'message': 'Gateway service restart initiated (in progress)'}
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+        monkeypatch.setattr('api.updates.restart_active_profile_gateway', fake_gateway_restart)
+
+        result = upd.apply_update('agent')
+        assert result['ok'] is True
+        assert result['stash_conflict'] is True
+        assert result['target'] == 'agent'
+        assert result['restart_scheduled'] is True
+        assert result['gateway_restart'] == 'in_progress'
+        assert gateway_restarts == ['called']
+
+    def test_apply_update_agent_without_gateway_restart_result_fails(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[0] == 'tag':
+                return '', True
+            if args[:2] == ['status', '--porcelain']:
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[:2] == ['rev-parse', '--short', 'origin/master']:
+                return 'abc1234', True
+            if args[0] == 'pull':
+                return 'Already up to date.', True
+            return '', True
+
+        restart_calls = []
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: (_ for _ in ()).throw(AssertionError('must not restart')))
+        monkeypatch.setattr('api.updates.restart_active_profile_gateway', lambda: (
+            restart_calls.append('called'),
+            {'status': 'busy', 'message': 'Restart already in progress. Please wait a moment and try again.'},
+        )[1])
+
+        result = upd.apply_update('agent')
+        assert result['ok'] is False
+        assert 'restart_scheduled' not in result
+        assert result['target'] == 'agent'
+        assert result['gateway_restart'] == 'busy'
+        assert 'hermes gateway restart' in result['message']
+        assert restart_calls == ['called']
+
+    def test_apply_force_update_agent_uses_gateway_restart_status(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+        ran = []
+
+        def fake_run(args, cwd, timeout=10):
+            ran.append(args)
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[0] == 'checkout':
+                return '', True
+            if args[0] == 'reset':
+                return '', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+        monkeypatch.setattr('api.updates.restart_active_profile_gateway', lambda: {'status': 'completed', 'message': 'Gateway service restarted successfully'})
+
+        result = upd.apply_force_update('agent')
+        assert result['ok'] is True
+        assert result['target'] == 'agent'
+        assert result['restart_scheduled'] is True
+        assert result['gateway_restart'] == 'completed'
+
+    def test_apply_force_update_agent_fails_when_gateway_restart_busy(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[0] == 'checkout':
+                return '', True
+            if args[0] == 'reset':
+                return '', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: (_ for _ in ()).throw(AssertionError('must not restart')))
+        monkeypatch.setattr(
+            'api.updates.restart_active_profile_gateway',
+            lambda: {'status': 'busy', 'message': 'Restart already in progress. Please wait a moment and try again.'},
+        )
+
+        result = upd.apply_force_update('agent')
+        assert result['ok'] is False
+        assert result['target'] == 'agent'
+        assert result['gateway_restart'] == 'busy'
+        assert 'hermes gateway restart' in result['message']
+
+    def test_apply_update_webui_does_not_call_gateway_restart(self, tmp_path, monkeypatch):
+        import api.updates as upd
+
+        (tmp_path / '.git').mkdir()
+        monkeypatch.setattr(
+            'api.updates.restart_active_profile_gateway',
+            lambda: (_ for _ in ()).throw(AssertionError('helper must not run for webui updates')),
+        )
+
+        def fake_run(args, cwd, timeout=10):
+            if args[0] == 'fetch':
+                return '', True
+            if args[0] == 'tag':
+                return '', True
+            if args[:2] == ['status', '--porcelain']:
+                return '', True
+            if args[:2] == ['rev-parse', '--abbrev-ref']:
+                return 'origin/master', True
+            if args[0] == 'pull':
+                return 'Already up to date.', True
+            return '', True
+
+        monkeypatch.setattr(upd, '_run_git', fake_run)
+        monkeypatch.setattr(upd, 'REPO_ROOT', tmp_path)
+        monkeypatch.setattr(upd, '_AGENT_DIR', tmp_path)
+        monkeypatch.setattr(upd, '_schedule_restart', lambda delay=2.0: None)
+
+        result = upd.apply_update('webui')
+        assert result['ok'] is True
+        assert result['target'] == 'webui'
+        assert result['restart_scheduled'] is True
 
 
 # ── api/routes.py ─────────────────────────────────────────────────────────────
@@ -667,6 +1062,21 @@ class TestForceUpdateRoute:
         )
         assert 'apply_force_update' in src, (
             "routes.py must import and call apply_force_update"
+        )
+
+
+class TestHealthRouteContract:
+    def test_health_payload_includes_server_started_at(self):
+        src = read('api/routes.py')
+        health_start = src.index('def _handle_health')
+        payload_start = src.index('payload = {', health_start)
+        payload_end = src.index('if "oldest_run_age_seconds" in run_check:', payload_start)
+        payload = src[payload_start:payload_end]
+        assert '"server_started_at": SERVER_START_TIME' in payload, (
+            "/health must expose server_started_at sourced from SERVER_START_TIME"
+        )
+        assert '"uptime_seconds": round(time.time() - SERVER_START_TIME, 1)' in payload, (
+            "/health must keep exposing uptime_seconds alongside server_started_at"
         )
 
 
@@ -931,6 +1341,388 @@ class TestUiJsUpdateBanner:
             "_waitForServerThenReload must call location.reload() once the server is ready"
         )
 
+    def test_wait_for_server_requires_new_process_identity(self):
+        src = read('static/ui.js')
+        fn = extract_js_function(src, '_waitForServerThenReload')
+        assert 'baselineServerIdentity' in fn, (
+            "_waitForServerThenReload() should capture and compare a baseline process identity"
+        )
+        compact = re.sub(r'\s+', '', fn)
+        assert 'baselineServerIdentity.serverStartedAt!==null&&nextServerIdentity.serverStartedAt!==null&&nextServerIdentity.serverStartedAt!==baselineServerIdentity.serverStartedAt' in compact, (
+            "_waitForServerThenReload() should compare server_started_at when it is available"
+        )
+        assert 'baselineServerIdentity.uptimeSeconds!==null&&nextServerIdentity.uptimeSeconds!==null&&nextServerIdentity.uptimeSeconds<baselineServerIdentity.uptimeSeconds' in compact, (
+            "_waitForServerThenReload() should fall back to uptime_seconds when server_started_at is unavailable"
+        )
+        assert 'baselineServerIdentity===null' in compact, (
+            "_waitForServerThenReload() should fallback to existing behavior when baseline is unavailable"
+        )
+
+    def test_wait_for_server_reloads_on_outage_when_uptime_only_not_lower(self):
+        """Codex regression (#3713): when BOTH baseline and replacement expose only
+        uptime_seconds (server_started_at stripped) and the replacement's uptime is
+        NOT strictly lower than a very-low baseline, the `uptime < baseline` check
+        never fires. A SUSTAINED restart outage (>=2 consecutive failed/non-OK probes)
+        followed by a healthy response is the reliable restart signal in that case —
+        without it the user is stranded on the restart banner until they manually
+        reload. The >=2 threshold + outage reset on a healthy old-server response
+        prevent a single transient network blip from reloading onto the old process."""
+        src = read('static/ui.js')
+        fn = extract_js_function(src, '_waitForServerThenReload')
+        compact = re.sub(r'\s+', '', fn)
+        # Outage counter incremented on thrown fetch errors AND non-OK responses.
+        assert '_consecutiveOutages++' in compact, (
+            "the /health probe must count failed/non-OK responses as outage evidence"
+        )
+        # Sustained-outage threshold (>=2) gates the uptime-only fallback — not a single blip.
+        assert '_consecutiveOutages>=2' in compact, (
+            "the outage fallback must require >=2 consecutive outages so a single "
+            "transient blip can't trigger a premature reload onto the old server"
+        )
+        assert '_restartOutageObserved()&&' in compact, (
+            "_waitForServerThenReload() must gate the uptime-only reload on a sustained outage"
+        )
+        # Outage evidence resets when the OLD server answers healthy (blip, not restart).
+        assert '_consecutiveOutages=0' in compact, (
+            "a healthy pre-restart-process response must reset the outage counter so "
+            "unrelated blips can't accumulate into a false positive"
+        )
+        assert ('baselineServerIdentity.serverStartedAt===null&&nextServerIdentity.serverStartedAt===null'
+                in compact), (
+            "the outage fallback must be scoped to the uptime-only-on-both-sides case"
+        )
+
+
+    def test_wait_for_server_fallbacks_to_ready_on_missing_baseline(self):
+        """Healthy /health should reload immediately when baseline identity is missing."""
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: 120 }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 10, baselineServerIdentity: null }});
+  if (fetches !== 1) throw new Error('expected fallback baseline to reload on first healthy probe, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload on first healthy probe, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_ignores_old_identity_and_reloads_on_new_identity(self):
+        """Healthy /health from the old process should not reload until identity changes."""
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: '1001.234', uptime_seconds: 1000 }} }},
+  {{ ok: true, data: {{ status: 'ok', server_started_at: '1001.234', uptime_seconds: 2000 }} }},
+  {{ ok: true, data: {{ status: 'ok', server_started_at: '1001.235', uptime_seconds: 2010 }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: '1001.234', uptimeSeconds: 999 }} }});
+  if (fetches !== 3) throw new Error('expected old-process health to be ignored before identity changes, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload after new identity, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_falls_back_to_uptime_when_started_at_is_missing(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: 120 }} }},
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: 2 }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: null, uptimeSeconds: 120 }} }});
+  if (fetches !== 2) throw new Error('expected uptime fallback to wait for a lower uptime, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload after uptime fallback identified a new process, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_accepts_new_started_at_when_baseline_lacked_one(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: '1001.300', uptime_seconds: 120 }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: null, uptimeSeconds: 120 }} }});
+  if (fetches !== 1) throw new Error('expected new server_started_at to trigger reload on first healthy probe, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload when replacement server exposes server_started_at, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_reloads_when_replacement_health_has_no_identity_fields(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: null }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: '1001.234', uptimeSeconds: null }} }});
+  if (fetches !== 1) throw new Error('expected identity-less healthy replacement to trigger reload on first probe, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload when replacement health exposes no identity fields, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_reloads_when_full_baseline_loses_all_identity_fields(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: null }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: '1001.234', uptimeSeconds: 120 }} }});
+  if (fetches !== 1) throw new Error('expected full-baseline identity loss to trigger reload on first probe, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload when replacement health drops all identity fields after a full baseline, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_wait_for_server_reloads_when_baseline_started_at_degrades_to_uptime_only(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+        wait_fn = extract_js_function(src, '_waitForServerThenReload')
+
+        script = f"""
+let now = 0;
+let reloads = 0;
+let fetches = 0;
+const responses = [
+  {{ ok: true, data: {{ status: 'ok', server_started_at: null, uptime_seconds: 12 }} }},
+];
+global.window = {{}};
+global.document = {{ baseURI: 'http://127.0.0.1:8788/' }};
+global.location = {{ reload: () => {{ reloads += 1; }} }};
+global.$ = () => null;
+global.Date = {{ now: () => now }};
+global.setTimeout = (cb, ms) => {{ now += ms || 0; cb(); return 0; }};
+global.fetch = async () => {{
+  fetches += 1;
+  const next = responses.shift();
+  if (!next) throw new Error('unexpected extra fetch');
+  return {{
+    ok: next.ok,
+    json: async () => next.data,
+  }};
+}};
+{normalize_fn}
+{identity_fn}
+{wait_fn}
+(async () => {{
+  await _waitForServerThenReload({{ interval: 1, maxMs: 20, baselineServerIdentity: {{ serverStartedAt: '1001.234', uptimeSeconds: 120 }} }});
+  if (fetches !== 1) throw new Error('expected uptime-only healthy replacement to trigger reload on first probe, got '+fetches);
+  if (reloads !== 1) throw new Error('expected exactly one reload when started_at degrades to uptime-only health, got '+reloads);
+}})().catch(err => {{ console.error(err.stack || err.message); process.exit(1); }});
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_apply_and_force_updates_capture_identity(self):
+        src = read('static/ui.js')
+        apply_fn = re.search(r'function\s+applyUpdates\b.*?\n\}', src, re.DOTALL)
+        force_fn = re.search(r'function\s+forceUpdate\b.*?\n\}', src, re.DOTALL)
+        assert apply_fn, "applyUpdates() not found"
+        assert force_fn, "forceUpdate() not found"
+        apply_body = apply_fn.group(0)
+        force_body = force_fn.group(0)
+        assert '_readHealthServerIdentity()' in apply_body, (
+            "applyUpdates() must call _readHealthServerIdentity() before reload wait"
+        )
+        assert '_readHealthServerIdentity()' in force_body, (
+            "forceUpdate() must call _readHealthServerIdentity() before reload wait"
+        )
+        assert '_waitForServerThenReload({baselineServerIdentity})' in apply_body, (
+            "applyUpdates() must pass baselineServerIdentity to _waitForServerThenReload()"
+        )
+        assert '_waitForServerThenReload({baselineServerIdentity})' in force_body, (
+            "forceUpdate() must pass baselineServerIdentity to _waitForServerThenReload()"
+        )
+        assert apply_body.index('_readHealthServerIdentity()') < apply_body.index('_waitForServerThenReload({baselineServerIdentity})'), (
+            "applyUpdates() must capture baseline before reload scheduling"
+        )
+        assert force_body.index('_readHealthServerIdentity()') < force_body.index("const res=await api('/api/updates/force'"), (
+            "forceUpdate() must capture baseline before force POST"
+        )
+
+    def test_health_identity_helper_prefers_server_started_at_and_keeps_uptime_fallback(self):
+        src = read('static/ui.js')
+        normalize_fn = extract_js_function(src, '_normalizeHealthServerIdentity')
+        identity_fn = extract_js_function(src, '_healthResponseServerIdentity')
+
+        script = f"""
+{normalize_fn}
+{identity_fn}
+const preferred = _healthResponseServerIdentity({{ server_started_at: '1001.234', uptime_seconds: 900 }});
+if (!preferred || preferred.serverStartedAt !== '1001.234') {{
+  throw new Error('expected server_started_at to be the preferred identity field');
+}}
+if (preferred.uptimeSeconds !== 900) {{
+  throw new Error('expected uptime_seconds to remain available for fallback comparisons');
+}}
+const fallback = _healthResponseServerIdentity({{ server_started_at: null, uptime_seconds: 120 }});
+if (!fallback || fallback.serverStartedAt !== null || fallback.uptimeSeconds !== 120) {{
+  throw new Error('expected uptime_seconds fallback identity when server_started_at is unavailable');
+}}
+if (_healthResponseServerIdentity({{ server_started_at: null, uptime_seconds: null }}) !== null) {{
+  throw new Error('expected null identity when /health exposes neither started_at nor uptime');
+}}
+"""
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
     def test_refresh_session_handles_restart_mode(self):
         """When _restartingForUpdate flag is set, refreshSession() must do a
         full page reload rather than hit /api/session (which will 502 while
@@ -1013,6 +1805,39 @@ class TestIndexHtmlBanner:
         )
 
 
+class TestClearLockButton:
+    """PR #5688 follow-up: clear-lock button must exist in index.html and be
+    hidden by default. Without this, the v2 frontend recovery path is dead --
+    $('btnClearUpdateLock') returns null at runtime so the lock-only error
+    branch in _showUpdateError() never reveals a clickable affordance (P1).
+    """
+
+    def test_clear_lock_button_exists(self):
+        src = read('static/index.html')
+        assert 'id="btnClearUpdateLock"' in src, (
+            "index.html must have #btnClearUpdateLock button (hidden by "
+            "default) -- PR #5688 v2 frontend path"
+        )
+
+    def test_clear_lock_button_hidden_by_default(self):
+        src = read('static/index.html')
+        m = re.search(r'id="btnClearUpdateLock"[^>]*>', src)
+        assert m, "#btnClearUpdateLock not found"
+        tag = m.group(0)
+        assert 'display:none' in tag, (
+            "#btnClearUpdateLock must be hidden by default (display:none)"
+        )
+
+    def test_clear_lock_button_calls_applyClearUpdateLock_handler(self):
+        src = read('static/index.html')
+        m = re.search(r'id="btnClearUpdateLock"[^>]*>', src)
+        assert m, "#btnClearUpdateLock not found"
+        tag = m.group(0)
+        assert 'applyClearUpdateLock(this)' in tag, (
+            "#btnClearUpdateLock onclick must invoke applyClearUpdateLock"
+        )
+
+
 # ── Regression: sequential webui+agent update — restart coordination ──────────
 
 class TestSequentialUpdateRestartCoordination:
@@ -1041,6 +1866,8 @@ class TestSequentialUpdateRestartCoordination:
             execv_time.append(_t.monotonic())
             execv_called.set()
 
+        monkeypatch.setattr(sys, 'platform', 'linux')
+        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
         monkeypatch.setattr(os, 'execv', fake_execv)
 
         # Hold _apply_lock from another thread (simulating an in-flight
@@ -1088,6 +1915,8 @@ class TestSequentialUpdateRestartCoordination:
         execv_called = []
         def fake_execv(exe, args):
             execv_called.append(True)
+        monkeypatch.setattr(sys, 'platform', 'linux')
+        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
         monkeypatch.setattr(os, 'execv', fake_execv)
 
         upd._schedule_restart(delay=0.05)
@@ -1201,6 +2030,183 @@ class TestWhatsNewSummaryToggle:
         assert 'target:target||null' in src
         assert '_renderUpdateWhatsNewLinks(data,{mode' in src
         assert 'window._whatsNewSummaryEnabled' in src
+
+    def test_update_banner_summary_cache_has_byte_cap_constant_within_bounds(self):
+        src = read('static/ui.js')
+        assert "const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';" in src
+        cap_match = re.search(r"const WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES\s*=\s*([^;\n]+)", src)
+        assert cap_match, "cap constant should be declared in static/ui.js"
+        key_index = src.find("const WHATS_NEW_SUMMARY_STORAGE_KEY='hermes-whats-new-generated-summaries';")
+        cap_index = src.find("const WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES", key_index)
+        assert cap_index != -1 and cap_index > key_index and cap_index - key_index < 200
+        cap_value = _parse_byte_expr(cap_match.group(1))
+        assert cap_value is not None
+        assert 200 * 1024 <= cap_value <= 256 * 1024
+
+    def test_summary_storage_byte_length_fallback_counts_utf8_bytes(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+{runtime}
+global.TextEncoder = undefined;
+if(_summaryStorageByteLength('abc') !== 3) throw new Error('ASCII byte count should match length');
+if(_summaryStorageByteLength('é') !== 2) throw new Error('Latin-1 should count as two UTF-8 bytes');
+if(_summaryStorageByteLength('漢') !== 3) throw new Error('BMP CJK should count as three UTF-8 bytes');
+if(_summaryStorageByteLength('😀') !== 4) throw new Error('astral symbols should count as four UTF-8 bytes');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_summary_cache_recency_sort_does_not_mutate_input_entries(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+{runtime}
+const entries = [
+  ['zeta', {{ updatedAt: 1 }}],
+  ['webui', {{}}],
+  ['agent', {{}}],
+];
+const sorted = _summaryCacheEntriesSortedByRecency(entries);
+if(entries[0][0] !== 'zeta' || entries[1][0] !== 'webui' || entries[2][0] !== 'agent') throw new Error('sort helper must not mutate caller entries');
+if(sorted[0][0] !== 'zeta') throw new Error('updated entries should sort before legacy fallback entries');
+if(sorted[1][0] !== 'webui' || sorted[2][0] !== 'agent') throw new Error('legacy fallback order should prefer webui then agent');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_persist_generated_summaries_bounds_aggregate_cache_size(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+const store = {{}};
+{runtime}
+global.window = {{}};
+global.sessionStorage = {{
+  getItem: (key) => {{
+    return Object.prototype.hasOwnProperty.call(store,key)?store[key]:null;
+  }},
+  setItem: (key, value) => {{
+    store[key] = value;
+  }},
+  removeItem: (key) => {{
+    delete store[key];
+  }},
+}};
+const summarySize = Math.floor(WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES * 0.5);
+window._whatsNewGeneratedSummaries = {{
+  webui: {{
+    signature: 'abc|def|1|https://example.test/webui',
+    payload: {{ summary: 'w'.repeat(summarySize) }},
+    updatedAt: 200,
+  }},
+  agent: {{
+    signature: 'abc|def|1|https://example.test/agent',
+    payload: {{ summary: 'a'.repeat(summarySize) }},
+    updatedAt: 100,
+  }},
+}};
+_persistGeneratedSummaries();
+const stored = sessionStorage.getItem(WHATS_NEW_SUMMARY_STORAGE_KEY);
+if(!stored) throw new Error('expected persisted summary cache');
+if(_summaryStorageByteLength(stored) > WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES) throw new Error('summary cache exceeds max bytes');
+const parsed = JSON.parse(stored);
+if(!parsed.webui) throw new Error('expected most recent summary to persist');
+if(Object.keys(parsed).length !== 1) throw new Error('expected cap-pruned aggregate cache to retain one entry');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_persist_generated_summaries_skips_single_oversized_summary(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+const store = {{}};
+{runtime}
+global.window = {{}};
+global.sessionStorage = {{
+  getItem: (key) => {{
+    return Object.prototype.hasOwnProperty.call(store,key)?store[key]:null;
+  }},
+  setItem: (key, value) => {{
+    store[key] = value;
+  }},
+  removeItem: (key) => {{
+    delete store[key];
+  }},
+}};
+window._whatsNewGeneratedSummaries = {{
+  webui: {{
+    signature: 'abc|def|1|https://example.test/webui',
+    payload: {{ summary: 'z'.repeat(WHATS_NEW_SUMMARY_STORAGE_MAX_BYTES + 1000) }},
+    updatedAt: 200,
+  }},
+}};
+_persistGeneratedSummaries();
+const stored = sessionStorage.getItem(WHATS_NEW_SUMMARY_STORAGE_KEY);
+if(stored === null) throw new Error('expected persist to run');
+const parsed = JSON.parse(stored);
+if(parsed && Object.keys(parsed).length) throw new Error('expected oversized entry to be skipped');
+if(window._whatsNewGeneratedSummaries && Object.keys(window._whatsNewGeneratedSummaries).length) throw new Error('expected oversized entry removed from memory');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_persist_generated_summaries_keeps_small_webui_and_agent_summaries(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+const store = {{}};
+{runtime}
+global.window = {{}};
+global.sessionStorage = {{
+  getItem: (key) => {{
+    return Object.prototype.hasOwnProperty.call(store,key)?store[key]:null;
+  }},
+  setItem: (key, value) => {{
+    store[key] = value;
+  }},
+  removeItem: (key) => {{
+    delete store[key];
+  }},
+}};
+window._whatsNewGeneratedSummaries = {{
+  webui: {{
+    signature: 'abc|def|1|https://example.test/webui',
+    payload: {{ summary: 'webui summary' }},
+    updatedAt: 300,
+  }},
+  agent: {{
+    signature: 'abc|def|1|https://example.test/agent',
+    payload: {{ summary: 'agent summary' }},
+    updatedAt: 200,
+  }},
+}};
+_persistGeneratedSummaries();
+const loaded = _loadStoredUpdateSummaries();
+if(!loaded.webui || !loaded.agent) throw new Error('expected both small summaries');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+    def test_persist_generated_summaries_tolerates_setitem_failure(self):
+        runtime = _extract_summary_cache_js()
+        script = f"""
+const store = {{}};
+{runtime}
+global.window = {{}};
+global.sessionStorage = {{
+  getItem: (key) => {{
+    return Object.prototype.hasOwnProperty.call(store,key)?store[key]:null;
+  }},
+  setItem: () => {{
+    throw new Error('quota exceeded');
+  }},
+  removeItem: (key) => {{
+    delete store[key];
+  }},
+}};
+window._whatsNewGeneratedSummaries = {{
+  webui: {{
+    signature: 'abc|def|1|https://example.test/webui',
+    payload: {{ summary: 'ok' }},
+    updatedAt: 100,
+  }},
+}};
+_persistGeneratedSummaries();
+if(!window._whatsNewGeneratedSummaries || !window._whatsNewGeneratedSummaries.webui) throw new Error('expected in-memory cache to remain after storage failure');
+""".strip()
+        subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
     def test_summary_endpoint_and_prompt_are_human_readable_not_technical(self):
         routes = read('api/routes.py')
@@ -1355,7 +2361,8 @@ class TestWhatsNewSummaryToggle:
     def test_update_summary_panel_is_scrollable_for_long_summaries(self):
         style = read('static/style.css')
 
-        assert '#updateSummaryPanel{max-height:min(34vh,260px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:var(--accent) transparent;}' in style
+        assert '#updateSummaryScroll{max-height:min(34vh,260px);overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:var(--accent) transparent;}' in style
+        assert '#updateSummaryPanel.update-summary-expanded #updateSummaryScroll{max-height:min(75vh,560px);}' in style
 
     def test_update_summary_many_updates_caps_commit_input_and_discloses_scope(self, monkeypatch):
         import api.updates as upd
@@ -1533,6 +2540,18 @@ class TestForceButtonResetOnRetry:
         assert "display='none'" in setup or "display = 'none'" in setup, (
             "applyUpdates setup must hide btnForceUpdate via display:none"
         )
+
+
+def test_force_update_confirm_discloses_untracked_file_deletion():
+    """#4310: destructive force-update copy must include untracked files."""
+    src = read('static/ui.js')
+    m = re.search(r'async function forceUpdate\b.*?\n\}', src, re.DOTALL)
+    assert m, "forceUpdate() not found"
+    fn = m.group(0)
+    assert 'delete untracked files' in fn, (
+        "forceUpdate confirmation must disclose that git clean -fd deletes "
+        "untracked files before the hard reset"
+    )
 
 
 # ── #785: Manual 'Check for Updates' button ───────────────────────────────────
