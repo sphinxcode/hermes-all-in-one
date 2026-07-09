@@ -38,6 +38,16 @@ if [ -d "/app/vendor/hermes-agent/optional-skills" ]; then
   cp -rn /app/vendor/hermes-agent/optional-skills/. "${HERMES_HOME}/optional-skills/" 2>/dev/null || true
 fi
 
+# Patch the webui's model list from hermes-agent's on every boot, directly on
+# this container's filesystem -- never committed to git. Keeps
+# vendor/hermes-webui/api/config.py byte-identical to upstream in the repo
+# forever, so the daily sync's subtree pull never conflicts against our own
+# patch again (see docs/plans in repo-watchdog for the incident this fixes).
+# Idempotent: re-running against an already-patched copy is a no-op.
+if [ -f "/app/scripts/patch-vendor-models.py" ]; then
+  python3 /app/scripts/patch-vendor-models.py || echo "[start] model-list patch failed (non-fatal)" >&2
+fi
+
 echo "[start] launching Hermes control plane on 0.0.0.0:${PORT:-8787}"
 echo "[start] internal WebUI target ${CONTROL_PLANE_INTERNAL_WEBUI_HOST}:${CONTROL_PLANE_INTERNAL_WEBUI_PORT}"
 echo "[start] gateway autostart mode ${HERMES_GATEWAY_AUTOSTART}"

@@ -55,13 +55,14 @@ run git fetch "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF"
 run git subtree pull --prefix="$AGENT_PREFIX" "$AGENT_REMOTE_NAME" "$AGENT_REMOTE_REF" --squash
 run git subtree pull --prefix="$WEBUI_PREFIX" "$WEBUI_REMOTE_NAME" "$WEBUI_REMOTE_REF" --squash
 
-echo
-echo "[sync] patching vendor model lists from hermes-agent..."
-python3 "${ROOT_DIR}/scripts/patch-vendor-models.py"
-if ! git diff --quiet vendor/hermes-webui/api/config.py; then
-  git add vendor/hermes-webui/api/config.py
-  git commit -m "chore(sync): patch webui model list from hermes-agent"
-fi
+# NOTE: the webui model-list patch (scripts/patch-vendor-models.py) is no
+# longer run or committed here. Committing its diff into this path caused a
+# recurring, unresolvable subtree conflict every subsequent sync (upstream
+# and our own patch kept editing the same lines). It now runs at container
+# boot instead (see start.sh), directly on the deployed filesystem, never
+# touching git history -- so vendor/hermes-webui/api/config.py stays
+# byte-identical to upstream here, and this pull never conflicts on that
+# file's account again.
 
 echo "[sync] upstream refresh complete"
 echo "[sync] next steps:"

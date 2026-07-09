@@ -16,6 +16,7 @@ COPY vendor/hermes-webui /app/vendor/hermes-webui
 COPY control_plane /app/control_plane
 COPY requirements-control-plane.txt /app/requirements-control-plane.txt
 COPY start.sh /app/start.sh
+COPY scripts/patch-vendor-models.py /app/scripts/patch-vendor-models.py
 
 ARG HERMES_WEBUI_VERSION=unknown
 
