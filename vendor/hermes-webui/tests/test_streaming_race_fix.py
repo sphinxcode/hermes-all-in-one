@@ -42,7 +42,7 @@ class TestStreamFinalized:
 
     def test_schedule_render_guards_on_stream_finalized(self):
         src = read('static/messages.js')
-        m = re.search(r'function _scheduleRender\(\)\{.*?\n  \}', src, re.DOTALL)
+        m = re.search(r'function _scheduleRender\([^)]*\)\{.*?\n  \}', src, re.DOTALL)
         assert m, "_scheduleRender not found"
         fn = m.group(0)
         assert '_streamFinalized' in fn, (
@@ -51,7 +51,9 @@ class TestStreamFinalized:
 
     def test_raf_handle_stored_in_schedule_render(self):
         src = read('static/messages.js')
-        assert '_pendingRafHandle=requestAnimationFrame' in src or \
+        assert '_pendingRafHandle=_pendingRafFrameHandle' in src or \
+               '_pendingRafHandle = _pendingRafFrameHandle' in src or \
+               '_pendingRafHandle=requestAnimationFrame' in src or \
                '_pendingRafHandle = requestAnimationFrame' in src, (
             "rAF handle must be stored in _pendingRafHandle for cancellation"
         )

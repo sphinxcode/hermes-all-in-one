@@ -3,9 +3,9 @@
 Mirrors the structure of test_1003_appearance_autosave.py to verify the
 preferences-panel autosave pattern is wired correctly:
 
-- All 15 preference fields use _schedulePreferencesAutosave (not _markSettingsDirty)
-- Password field MUST still call _markSettingsDirty (security: never autosave)
-- _preferencesPayloadFromUi covers all 14 fields
+  - All preference fields use _schedulePreferencesAutosave (not _markSettingsDirty)
+  - Password field MUST still call _markSettingsDirty (security: never autosave)
+  - _preferencesPayloadFromUi covers all fields
 - _setPreferencesAutosaveStatus uses the shared i18n keys
 - Status div exists in static/index.html
 - _autosavePreferencesSettings clears the dirty flag and hides the unsaved bar
@@ -38,9 +38,10 @@ PREFERENCE_FIELDS_AUTOSAVE = [
     ("settingsSendKey", "send_key"),
     ("settingsLanguage", "language"),
     ("settingsShowTokenUsage", "show_token_usage"),
+    ("settingsShowConversationOutline", "show_conversation_outline"),
     ("settingsShowTps", "show_tps"),
-    ("settingsSimplifiedToolCalling", "simplified_tool_calling"),
     ("settingsShowCliSessions", "show_cli_sessions"),
+    ("settingsShowClaudeCodeSessions", "show_claude_code_sessions"),
     ("settingsShowPreviousMessagingSessions", "show_previous_messaging_sessions"),
     ("settingsSyncInsights", "sync_to_insights"),
     ("settingsCheckUpdates", "check_for_updates"),
@@ -49,13 +50,14 @@ PREFERENCE_FIELDS_AUTOSAVE = [
     ("settingsNotificationsEnabled", "notifications_enabled"),
     ("settingsSidebarDensity", "sidebar_density"),
     ("settingsAutoTitleRefresh", "auto_title_refresh_every"),
-    ("settingsBusyInputMode", "busy_input_mode"),
+    ("settingsDefaultMessageMode", "default_message_mode"),
+    ("settingsShowBusyPlaceholderHint", "show_busy_placeholder_hint"),
     ("settingsBotName", "bot_name"),
 ]
 
 
-def test_all_15_preference_fields_have_autosave_payload_entries():
-    """_preferencesPayloadFromUi must include all 15 preference fields."""
+def test_all_preference_fields_have_autosave_payload_entries():
+    """_preferencesPayloadFromUi must include every autosaved preference field."""
     block = _function_block(PANELS_JS, "_preferencesPayloadFromUi")
     for dom_id, field in PREFERENCE_FIELDS_AUTOSAVE:
         assert f"$('{dom_id}')" in block, \
@@ -65,7 +67,7 @@ def test_all_15_preference_fields_have_autosave_payload_entries():
 
 
 def test_preference_fields_use_schedule_autosave_not_mark_dirty():
-    """All 14 listener attachments (excluding bot_name's debounce wrapper) must
+    """All listener attachments (excluding bot_name's debounce wrapper) must
     use _schedulePreferencesAutosave. bot_name uses a wrapper but still
     eventually calls _schedulePreferencesAutosave."""
     panel = _load_settings_panel_block()

@@ -270,6 +270,34 @@ def test_recover_all_sessions_on_startup_restores_orphan_bak(temp_session_dir):
     assert len(restored["messages"]) == 293
 
 
+def test_recover_all_sessions_on_startup_skips_tombstoned_orphan_bak(temp_session_dir):
+    """A deleted WebUI session must NOT be resurrected from its surviving .bak.
+
+    Regression for #5498 / #5504: the double-failure delete (backup unlink +
+    state.db delete both fail) leaves a surviving <sid>.json.bak plus the
+    durable deleted-WebUI tombstone. Startup recovery must honor the tombstone
+    and NOT recreate the sidecar (otherwise the deleted transcript reappears in
+    the sidebar on the next boot — the literal ghost the fix exists to kill).
+    """
+    import api.models as _m
+
+    sid = _make_session_on_disk(temp_session_dir, n_msgs=42)
+    live_path = temp_session_dir / f"{sid}.json"
+    bak_path = temp_session_dir / f"{sid}.json.bak"
+    bak_path.write_text(live_path.read_text(encoding="utf-8"), encoding="utf-8")
+    live_path.unlink()
+    # Simulate the delete route's durable tombstone for this deleted sid.
+    _m._record_webui_deleted_session_tombstone(sid)
+    try:
+        from api.session_recovery import recover_all_sessions_on_startup
+        result = recover_all_sessions_on_startup(temp_session_dir)
+
+        assert result["restored"] == 0, "tombstoned orphan .bak must not be restored"
+        assert not live_path.exists(), "deleted session sidecar must not be recreated on boot"
+    finally:
+        _m._clear_webui_deleted_session_tombstone(sid)
+
+
 def test_recover_all_sessions_on_startup_rebuilds_missing_index_without_restores(temp_session_dir, monkeypatch):
     """Startup recovery must rebuild a missing index even when no .bak restore runs."""
     import api.models as _m
@@ -346,6 +374,37 @@ def test_recover_all_sessions_on_startup_is_idempotent_no_op_on_clean_state(temp
 
     live_after = (temp_session_dir / f"{sid}.json").read_text(encoding="utf-8")
     assert live_before == live_after
+
+
+def test_recover_all_sessions_on_startup_does_not_read_live_files_without_backup(temp_session_dir, monkeypatch):
+    """Clean live sidecars without .bak are not recovery candidates at startup."""
+    clean_sid = _make_session_on_disk(temp_session_dir, sid="clean_no_bak", n_msgs=500)
+    backed_sid = _make_session_on_disk(temp_session_dir, sid="backed_candidate", n_msgs=4)
+    clean_path = temp_session_dir / f"{clean_sid}.json"
+    backed_path = temp_session_dir / f"{backed_sid}.json"
+    backed_path.with_suffix('.json.bak').write_text(
+        backed_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    import api.session_recovery as sr
+
+    real_msg_count = sr._msg_count
+    msg_count_paths = []
+
+    def tracking_msg_count(path):
+        msg_count_paths.append(path)
+        return real_msg_count(path)
+
+    monkeypatch.setattr(sr, "_msg_count", tracking_msg_count)
+
+    result = sr.recover_all_sessions_on_startup(temp_session_dir)
+
+    assert result["restored"] == 0
+    assert result["scanned"] == 2
+    assert clean_path not in msg_count_paths
+    assert backed_path in msg_count_paths
+    assert backed_path.with_suffix('.json.bak') in msg_count_paths
 
 
 def test_recover_all_sessions_on_startup_skips_non_session_index_json(temp_session_dir):

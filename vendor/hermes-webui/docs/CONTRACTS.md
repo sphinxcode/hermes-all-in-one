@@ -6,8 +6,8 @@ source documents and it does not mark proposals as implemented. Follow each
 linked document's status and scope.
 
 Use this file when starting a change so the relevant public contract is visible
-before code is edited. This first version focuses on documentation routing; it
-does not change runtime behavior, maintainer policy, bot behavior, or CI gates.
+before code is edited. This index focuses on documentation routing and
+contributor guidance; it does not change runtime behavior or CI gates.
 
 ## Start here
 
@@ -17,8 +17,9 @@ does not change runtime behavior, maintainer policy, bot behavior, or CI gates.
   PR description expectations, UI evidence, and project-specific constraints.
 - [`README.md`](../README.md): product overview, quick start, architecture map,
   feature inventory, and docs index.
-- [`CHANGELOG.md`](../CHANGELOG.md): release-note-ready history. Update it when
-  maintainers should carry the change into release notes.
+- [`CHANGELOG.md`](../CHANGELOG.md): release history maintained by the release
+  workflow. Read it for context, but do not edit it in ordinary contributor PRs;
+  put release-note-ready wording in the PR body instead.
 
 ## Runtime, durability, and state contracts
 
@@ -27,6 +28,14 @@ does not change runtime behavior, maintainer policy, bot behavior, or CI gates.
   model-context reconstruction, compression, UI scene/cache, and sidebar metadata
   repairs. Start here for narrow fixes that keep the existing WebUI execution
   path.
+- [`docs/rfcs/live-to-final-assistant-replies.md`](rfcs/live-to-final-assistant-replies.md):
+  proposed product model for long-running assistant replies, live process text,
+  tool activity, recovery, terminal outcomes, and final-answer boundaries. Start
+  here for UI/UX changes to running-session assistant reply rendering.
+- [`docs/architecture/stable-assistant-turn-anchor-phase0.md`](architecture/stable-assistant-turn-anchor-phase0.md):
+  current Phase 0 inventory for the Stable Assistant Turn Anchors work under
+  #3926. Use this before wiring anchor helpers into live SSE, replay,
+  settlement, `INFLIGHT`, or `renderMessages()` paths.
 - [`docs/rfcs/canonical-session-resolution.md`](rfcs/canonical-session-resolution.md):
   proposed contract for resolving URL routes, query parameters, localStorage,
   sidebar rows, and compression-lineage IDs to one canonical visible session
@@ -38,9 +47,26 @@ does not change runtime behavior, maintainer policy, bot behavior, or CI gates.
   execution behind an adapter boundary. Use this for adapter-seam, control-plane,
   runner, sidecar, or execution-ownership work; do not treat it as authorization
   to implement those slices.
+- [`docs/architecture/agent-api-contract.md`](architecture/agent-api-contract.md):
+  current audit of WebUI dependencies on the hermes-agent source checkout and
+  the replacement API/client surfaces needed before source mounts can be removed.
+  Start here for issue #2491 and Docker/source-boundary migration slices.
 - [`docs/rfcs/turn-journal.md`](rfcs/turn-journal.md): proposed crash-safe
   write-ahead journal for browser-originated chat turns.
+- [`docs/rfcs/webui-pending-intent-controls.md`](rfcs/webui-pending-intent-controls.md):
+  proposed control-surface companion to the long-running-session reply model for
+  Queue, Steer, Stop-and-send, Interrupt, and leftover-steer inputs submitted
+  while an agent run is active. Start here for busy-composer behavior, pending
+  queued messages, interrupt replacement, steer visibility, or leftover-steer
+  recovery changes.
 - [`docs/rfcs/README.md`](rfcs/README.md): RFC conventions and current RFC index.
+- [`docs/rfcs/session-sse-contract-v1.md`](rfcs/session-sse-contract-v1.md):
+  proposed contract vocabulary, cursor/resume semantics, replay identity, snapshot
+  fallback, event taxonomy, and implementation gates for the per-session SSE
+  stream `GET /api/sessions/{session_id}/events` (#4812). Distinct from the
+  existing global session-list stream `GET /api/sessions/events`. Start here for
+  any work that touches per-session SSE, `Last-Event-ID` replay, or session
+  lifecycle event delivery. Proposed RFCs do not authorize implementation.
 
 When a change touches streaming, recovery, replay, compression, context
 reconstruction, cancellation, approval/clarify, session metadata, or run state,
@@ -150,7 +176,8 @@ Required checks:
 - Onboarding/setup validation used isolated `HERMES_HOME` and
   `HERMES_WEBUI_STATE_DIR`, unless the human operator explicitly requested real
   state.
-- Docs and `CHANGELOG.md` updates are either included or explicitly not needed.
+- Docs updates are included or explicitly not needed, and release-note-worthy
+  changes are described in the PR body rather than by editing `CHANGELOG.md`.
 - After the GitHub write, read the PR back and verify the headings rendered as
   intended.
 
@@ -182,7 +209,8 @@ Before opening a change for review, confirm:
 - `AGENTS.md`, this index, and any linked contract for the touched subsystem were
   read before editing.
 - Behavior, setup, architecture, testing, or workflow changes update the relevant
-  docs; release-note-ready changes update `CHANGELOG.md`.
+  docs; release-note-ready changes include PR-body release-note wording while
+  `CHANGELOG.md` is left to release commits.
 - UI/UX changes include before/after evidence and cover relevant desktop,
   narrow, and mobile states.
 - Runtime, streaming, recovery, replay, compression, or sidebar changes state

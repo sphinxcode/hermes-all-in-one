@@ -94,7 +94,7 @@ def test_sessions_api_includes_attention_summary_for_sidebar_rows(monkeypatch):
     try:
         routes.submit_pending(sid, {"command": "sudo service restart", "description": "Restart"})
 
-        monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [{
+        monkeypatch.setattr(routes, "all_sessions", lambda diag=None, **_kwargs: [{
             "session_id": sid,
             "title": "Needs approval",
             "profile": "default",
@@ -148,6 +148,13 @@ def test_session_sidebar_renders_attention_badge_and_semantic_classes():
     assert ".session-item.attention-clarify" in style_css
     # The text-badge styles were removed; the dot now carries the color.
     assert ".session-attention-badge" not in style_css
+    assert "is-attention-clarify" in sessions_js, (
+        "renderSessionList must tag the state indicator with is-attention-clarify."
+    )
     assert ".session-state-indicator.is-attention-approval" in style_css
     assert ".session-state-indicator.is-attention-clarify" in style_css
+    assert ".session-state-indicator.is-attention-generic{visibility:visible;}" in style_css
+    assert ".session-state-indicator.is-attention-approval{color:var(--error);}" in style_css
+    assert ".session-state-indicator.is-attention-clarify{color:var(--warning);}" in style_css
+    assert ".session-state-indicator.is-attention-generic{color:var(--warning);}" in style_css
     assert "prefers-reduced-motion" in style_css

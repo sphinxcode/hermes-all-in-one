@@ -3,8 +3,8 @@
 from pathlib import Path
 
 
-SESSIONS_JS = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text()
-STYLE_CSS = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text()
+SESSIONS_JS = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+STYLE_CSS = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
 
 
 def test_pinned_indicator_renders_inside_title_row():
@@ -103,14 +103,21 @@ def test_timestamp_hidden_when_attention_state_is_present():
     # Timestamp now uses margin-left:auto inside the flex row instead of
     # absolute positioning. This stops the title's flex:1 bound from running
     # underneath the timestamp and lets the project dot sit beside it.
+    # Anchor on the canonical UNSCOPED `.session-time{` rule (start-of-line) —
+    # a skin-scoped variant like `:root[data-skin="graphite"] .session-item.active
+    # .session-time{` can precede it and would otherwise widen the slice into
+    # unrelated skin rules that legitimately use position:absolute.
+    import re as _re
+    _m = _re.search(r"(?m)^\s*\.session-time\{", STYLE_CSS)
+    assert _m, "canonical unscoped .session-time{ rule not found"
     session_time_block = STYLE_CSS[
-        STYLE_CSS.find(".session-time{"):
-        STYLE_CSS.find(".session-time.is-hidden")
+        _m.start():
+        STYLE_CSS.find("}", _m.start())
     ]
-    assert "position:absolute;" not in session_time_block, (
+    assert "position:absolute" not in session_time_block, (
         "Timestamp must live in flex flow (margin-left:auto), not absolute"
     )
-    assert "margin-left:auto;" in session_time_block
+    assert "margin-left:auto" in session_time_block
     assert ".session-item:hover .session-time" in STYLE_CSS
     assert ".session-item.streaming:not(:hover):not(:focus-within):not(.menu-open) .session-actions" in STYLE_CSS
     assert ".session-item.unread:not(:hover):not(:focus-within):not(.menu-open) .session-actions" in STYLE_CSS
@@ -126,14 +133,14 @@ def test_plain_mouse_hover_does_not_mark_session_row_dragging():
 
 
 def test_sidebar_uses_local_inflight_state_for_immediate_spinner():
-    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text()
+    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text(encoding="utf-8")
 
     assert "function _isSessionLocallyStreaming(s)" in SESSIONS_JS
     assert "isActive && Boolean(S.busy)" in SESSIONS_JS
     assert "function _purgeStaleInflightEntries()" in SESSIONS_JS
     assert "delete INFLIGHT[sid];" in SESSIONS_JS
     assert "function _isSessionEffectivelyStreaming(s)" in SESSIONS_JS
-    assert "const isStreaming=_isSessionEffectivelyStreaming(s);" in SESSIONS_JS
+    assert "const ownStreaming=_isSessionEffectivelyStreaming(s)" in SESSIONS_JS
     assert "if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();" in messages_js
 
 
@@ -151,7 +158,7 @@ def test_date_group_caret_expanded_down_collapsed_right():
 def test_apperror_path_calls_render_session_list():
     """apperror handler must call renderSessionList() to clear the streaming indicator
     immediately rather than waiting for the 5s streaming poll interval."""
-    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text()
+    messages_js = (Path(__file__).resolve().parent.parent / "static" / "messages.js").read_text(encoding="utf-8")
     apperror_idx = messages_js.find("source.addEventListener('apperror'")
     assert apperror_idx != -1, "apperror handler not found in messages.js"
     warning_idx = messages_js.find("source.addEventListener('warning'", apperror_idx)

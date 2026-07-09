@@ -11,12 +11,21 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
+import secrets
+import shutil
 import stat
 import subprocess
 import concurrent.futures
-from pathlib import Path
+import threading
+import time
+from pathlib import Path, PurePosixPath
 
 logger = logging.getLogger(__name__)
+
+_ESCAPE_AUTH_TTL_SECONDS = 300
+_ESCAPE_AUTH_LOCK = threading.Lock()
+_ESCAPE_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
 
 from api.config import (
     WORKSPACES_FILE as _GLOBAL_WS_FILE,
@@ -57,6 +66,131 @@ def _last_workspace_file() -> Path:
     return _profile_state_dir() / 'last_workspace.txt'
 
 
+def _expanduser_path(path: str | Path) -> Path:
+    """Return *path* after shell-style home expansion.
+
+    ``Path.expanduser()`` on Windows does not consistently honor a monkeypatched
+    ``HOME`` in tests, which makes host-native replay diverge from the repo's
+    portability expectations. Use ``os.path.expanduser`` as the expansion source,
+    then wrap it back into ``Path``.
+    """
+    raw = str(path)
+    if raw.startswith('~'):
+        home = (
+            os.environ.get('HOME')
+            or os.environ.get('USERPROFILE')
+            or (
+                (os.environ.get('HOMEDRIVE') or '') + (os.environ.get('HOMEPATH') or '')
+            )
+            or str(Path.home())
+        )
+        if raw in ('~', '~/', '~\\'):
+            return Path(home)
+        if raw.startswith('~/') or raw.startswith('~\\'):
+            return Path(home) / raw[2:]
+        # NOTE: ``~user`` / ``~root`` forms are intentionally NOT expanded here.
+        # Master deliberately does not block ``/root`` (#510/#521 — Hermes commonly
+        # runs as root, where ``/root`` is the legitimate home and is allowed via
+        # the home carve-out). Expanding ``~root`` -> ``/root`` for a NON-root
+        # deployment would let it register root's home; leaving the literal form
+        # (resolved relative to cwd, then rejected if it escapes) is the safer
+        # behavior and matches the current security model.
+    return Path(raw)
+
+
+def _resolve_path(path: str | Path) -> Path:
+    """Resolve *path* after env-aware home expansion, without raising."""
+    return _safe_resolve(_expanduser_path(path))
+
+
+def _home_path() -> Path:
+    """Return the current effective home directory with env-aware expansion."""
+    return _resolve_path("~")
+
+
+def _as_posix_path(path: str | Path | None) -> PurePosixPath | None:
+    if path in (None, ""):
+        return None
+    raw = _strip_surrounding_quotes(str(path)).strip().replace('\\', '/')
+    # Reject embedded null bytes here rather than letting them survive normpath
+    # and crash later at .resolve() with an uncaught ValueError (surfaces as a
+    # 500). Fail-closed: treat as an invalid path.
+    if '\x00' in raw:
+        return None
+    if not raw.startswith('/'):
+        return None
+    return PurePosixPath(posixpath.normpath(raw))
+
+
+def _posix_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalize_posix_path(path: str | Path | None) -> str | None:
+    candidate = _as_posix_path(path)
+    if candidate is None:
+        return None
+    return candidate.as_posix()
+
+
+def _is_remote_terminal_backend(terminal_cfg: dict | None) -> bool:
+    """Return True when the active terminal backend runs outside this WebUI host."""
+    if not isinstance(terminal_cfg, dict):
+        return False
+    backend = str(terminal_cfg.get('backend') or '').strip().lower()
+    return backend not in ('', 'local')
+
+
+def _remote_terminal_cwd() -> str | None:
+    """Return target-side terminal cwd for remote profiles, without local stat()."""
+    try:
+        from api.config import get_config
+
+        terminal_cfg = get_config().get('terminal', {})
+        if not _is_remote_terminal_backend(terminal_cfg):
+            return None
+        cwd = str(terminal_cfg.get('cwd') or '').strip()
+        if not cwd or cwd == '.':
+            return None
+        return cwd
+    except Exception:
+        logger.debug("Failed to read remote terminal cwd", exc_info=True)
+        return None
+
+
+def _remote_terminal_workspace_candidate(path: str | Path) -> Path | None:
+    """Return a non-stat'ed target-side Path when it is under terminal.cwd."""
+    cwd = _remote_terminal_cwd()
+    if not cwd:
+        return None
+    raw = _strip_surrounding_quotes(str(path)).strip()
+    if not raw:
+        return None
+    if '\x00' in raw or '\x00' in cwd:
+        return None
+    normalized_raw = _normalize_posix_path(raw)
+    normalized_cwd = _normalize_posix_path(cwd)
+    if normalized_raw is not None and normalized_cwd is not None:
+        posix_candidate = PurePosixPath(normalized_raw)
+        posix_base = PurePosixPath(normalized_cwd)
+        if _is_blocked_workspace_path(Path(normalized_raw), normalized_raw) or _is_blocked_workspace_path(Path(normalized_cwd), normalized_cwd):
+            return None
+        if posix_candidate == posix_base or _posix_is_within(posix_candidate, posix_base):
+            return _resolve_path(normalized_raw)
+        return None
+    candidate = _resolve_path(raw)
+    base = _resolve_path(cwd)
+    if _is_blocked_workspace_path(candidate, raw) or _is_blocked_workspace_path(base, cwd):
+        return None
+    if candidate == base or _is_within(candidate, base):
+        return candidate
+    return None
+
+
 def _profile_default_workspace() -> str:
     """Read the profile's default workspace from its config.yaml.
 
@@ -65,34 +199,44 @@ def _profile_default_workspace() -> str:
       2. 'default_workspace' — alternate explicit key
       3. 'terminal.cwd'      — hermes-agent terminal working dir (most common)
 
+    For remote/SSH terminal profiles, ``terminal.cwd`` lives on the target
+    machine, not on the WebUI server. In that case return it without a
+    server-local existence check so WebUI can send the correct workspace hint
+    to the agent/tool backend.
+
     Falls back to the live DEFAULT_WORKSPACE from api.config.
     """
     try:
         from api.config import get_config
         cfg = get_config()
+        terminal_cfg = cfg.get('terminal', {})
+        remote_terminal = _is_remote_terminal_backend(terminal_cfg)
         # Explicit webui workspace keys first
         for key in ('workspace', 'default_workspace'):
             ws = cfg.get(key)
             if ws:
-                p = Path(str(ws)).expanduser().resolve()
-                if p.is_dir():
+                if remote_terminal:
+                    return str(ws).strip()
+                p = _resolve_path(str(ws))
+                if remote_terminal or p.is_dir():
                     return str(p)
         # Fall through to terminal.cwd — the agent's configured working directory
-        terminal_cfg = cfg.get('terminal', {})
         if isinstance(terminal_cfg, dict):
             cwd = terminal_cfg.get('cwd', '')
             if cwd and str(cwd) not in ('.', ''):
-                p = Path(str(cwd)).expanduser().resolve()
-                if p.is_dir():
+                if remote_terminal:
+                    return str(cwd).strip()
+                p = _resolve_path(str(cwd))
+                if remote_terminal or p.is_dir():
                     return str(p)
     except (ImportError, Exception):
         logger.debug("Failed to load profile default workspace config")
     try:
         from api.config import DEFAULT_WORKSPACE as _LIVE_DEFAULT_WORKSPACE
 
-        return str(Path(_LIVE_DEFAULT_WORKSPACE).expanduser().resolve())
+        return str(_resolve_path(_LIVE_DEFAULT_WORKSPACE))
     except Exception:
-        return str(Path(_BOOT_DEFAULT_WORKSPACE).expanduser().resolve())
+        return str(_resolve_path(_BOOT_DEFAULT_WORKSPACE))
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -107,14 +251,14 @@ def _clean_workspace_list(workspaces: list) -> list:
       confusion with the 'default' profile name).
     Returns the cleaned list (may be empty).
     """
-    hermes_profiles = (Path.home() / '.hermes' / 'profiles').resolve()
+    hermes_profiles = (_home_path() / '.hermes' / 'profiles').resolve()
     result = []
     for w in workspaces:
         path = w.get('path', '')
         name = w.get('name', '')
         if not path:
             continue
-        p = _safe_resolve(Path(path).expanduser())
+        p = _safe_resolve(_expanduser_path(path))
         # Skip paths inside a DIFFERENT profile's directory (cross-profile leak).
         # Allow paths inside the CURRENT profile's own directory (e.g. test workspaces
         # created under ~/.hermes/profiles/webui/webui-mvp-test/).
@@ -150,6 +294,11 @@ def _workspace_access_error(candidate: Path, *, missing_label: str = "Path does 
         st = candidate.stat()
     except FileNotFoundError:
         return f"{missing_label}: {candidate}"
+    except ValueError as exc:
+        # Embedded null byte (or similar invalid path) — .stat() raises ValueError,
+        # not OSError. Report as an access error rather than letting it surface as
+        # an uncaught 500.
+        return f"Cannot access path: {candidate!r}. Invalid path ({exc})."
     except PermissionError as exc:
         return (
             f"Cannot access path: {candidate}. The server process could not inspect "
@@ -224,20 +373,75 @@ def save_workspaces(workspaces: list) -> None:
     ws_file.write_text(json.dumps(workspaces, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
-def get_last_workspace() -> str:
+def get_profile_default_workspace() -> str:
+    """Resolve the ACTIVE PROFILE's default workspace, never the global file.
+
+    Like get_last_workspace() but WITHOUT the global ``_GLOBAL_LW_FILE``
+    fallback: for a named profile that has not yet written its own
+    profile-scoped ``last_workspace.txt``, that global fallback would leak the
+    *global* last-workspace instead of the profile's configured workspace —
+    which is exactly the #5169 bug (the composer chip on a blank new-chat page
+    showing the wrong/global workspace for a named profile). Used by
+    ``GET /api/profile/active`` so a cold boot under a profile cookie reflects
+    the profile's own configured working directory.
+
+    Priority: profile-scoped ``last_workspace.txt`` -> profile ``config.yaml``
+    ``workspace``/``default_workspace`` -> ``terminal.cwd`` -> process default.
+    """
+    remote_cwd = _remote_terminal_cwd()
+
+    def _valid(raw: str) -> str | None:
+        if not raw:
+            return None
+        if remote_cwd:
+            if _remote_terminal_workspace_candidate(raw) is not None:
+                return raw
+            return None
+        if Path(raw).is_dir():
+            return raw
+        return None
+
     lw_file = _last_workspace_file()
     if lw_file.exists():
         try:
-            p = lw_file.read_text(encoding='utf-8').strip()
-            if p and Path(p).is_dir():
+            p = _valid(lw_file.read_text(encoding='utf-8').strip())
+            if p:
+                return p
+        except Exception:
+            logger.debug("Failed to read profile last workspace from %s", lw_file)
+    return _profile_default_workspace()
+
+
+def get_last_workspace() -> str:
+    remote_cwd = _remote_terminal_cwd()
+
+    def valid_last_workspace(raw: str) -> str | None:
+        if not raw:
+            return None
+        if remote_cwd:
+            # For remote/SSH profiles, last_workspace is target-side state. Do
+            # not accept stale server-local paths merely because they exist on
+            # the WebUI host; require the value to stay under terminal.cwd.
+            if _remote_terminal_workspace_candidate(raw) is not None:
+                return raw
+            return None
+        if Path(raw).is_dir():
+            return raw
+        return None
+
+    lw_file = _last_workspace_file()
+    if lw_file.exists():
+        try:
+            p = valid_last_workspace(lw_file.read_text(encoding='utf-8').strip())
+            if p:
                 return p
         except Exception:
             logger.debug("Failed to read last workspace from %s", lw_file)
     # Fallback: try global file
     if _GLOBAL_LW_FILE.exists():
         try:
-            p = _GLOBAL_LW_FILE.read_text(encoding='utf-8').strip()
-            if p and Path(p).is_dir():
+            p = valid_last_workspace(_GLOBAL_LW_FILE.read_text(encoding='utf-8').strip())
+            if p:
                 return p
         except Exception:
             logger.debug("Failed to read global last workspace")
@@ -257,7 +461,10 @@ def _safe_resolve(p: Path) -> Path:
     """Path.resolve() that never raises — falls back to the input path on error."""
     try:
         return p.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
+        # ValueError covers embedded-null-byte paths, which .resolve() raises on
+        # — fail-closed to the raw path so the downstream block-list gate rejects
+        # it cleanly instead of surfacing a 500.
         return p
 
 
@@ -317,6 +524,46 @@ def _workspace_blocked_roots() -> tuple[Path, ...]:
     return tuple(_out)
 
 
+def _is_blocked_posix_workspace_path(raw_path: str | Path | None) -> bool:
+    """Detect blocked POSIX-style system roots even on non-POSIX hosts."""
+    candidate = _as_posix_path(raw_path)
+    if candidate is None:
+        return False
+    if candidate == PurePosixPath('/'):
+        return True
+    carveouts = (
+        PurePosixPath('/var/folders'),
+        PurePosixPath('/private/var/folders'),
+        PurePosixPath('/var/tmp'),
+        PurePosixPath('/private/var/tmp'),
+    )
+    for tmp in carveouts:
+        if _posix_is_within(candidate, tmp):
+            return False
+    blocked_roots = (
+        PurePosixPath('/etc'),
+        PurePosixPath('/usr'),
+        PurePosixPath('/var'),
+        PurePosixPath('/bin'),
+        PurePosixPath('/sbin'),
+        PurePosixPath('/boot'),
+        PurePosixPath('/proc'),
+        PurePosixPath('/sys'),
+        PurePosixPath('/dev'),
+        PurePosixPath('/lib'),
+        PurePosixPath('/lib64'),
+        PurePosixPath('/opt/homebrew'),
+        PurePosixPath('/System'),
+        PurePosixPath('/Library'),
+        PurePosixPath('/private/etc'),
+        PurePosixPath('/private/var'),
+    )
+    for blocked in blocked_roots:
+        if _posix_is_within(candidate, blocked):
+            return True
+    return False
+
+
 def _is_blocked_system_path(candidate: Path) -> bool:
     """Return True if *candidate* falls under a blocked system root.
 
@@ -370,9 +617,14 @@ def _is_blocked_workspace_path(candidate: Path, raw_path: str | Path | None = No
     raw = None
     if raw_path not in (None, ""):
         try:
-            raw = Path(raw_path).expanduser()
+            normalized_posix = _normalize_posix_path(raw_path)
+            raw = Path(normalized_posix) if normalized_posix is not None else _expanduser_path(raw_path)
         except Exception:
             raw = None
+
+    posix_probe = raw_path if raw_path not in (None, "") else candidate.as_posix()
+    if _is_blocked_posix_workspace_path(posix_probe):
+        return True
 
     exact = _workspace_blocked_exact_roots()
     if candidate in exact or (raw is not None and raw in _workspace_blocked_roots()):
@@ -422,7 +674,7 @@ def _trusted_workspace_roots() -> list[Path]:
         if candidate in (None, ""):
             return
         try:
-            p = Path(candidate).expanduser().resolve()
+            p = _resolve_path(candidate)
         except Exception:
             return
         if not p.exists() or not p.is_dir():
@@ -432,7 +684,7 @@ def _trusted_workspace_roots() -> list[Path]:
         if p not in roots:
             roots.append(p)
 
-    add(Path.home())
+    add(_home_path())
     add(_BOOT_DEFAULT_WORKSPACE)
     for w in load_workspaces():
         add(w.get("path"))
@@ -460,19 +712,24 @@ def list_workspace_suggestions(prefix: str = "", limit: int = 12) -> list[str]:
         return [str(p) for p in roots[:limit]]
 
     if raw.startswith("~"):
-        target = Path(raw).expanduser()
+        target = _expanduser_path(raw)
     elif Path(raw).is_absolute():
         target = Path(raw)
     else:
-        target = Path.home() / raw
+        target = _home_path() / raw
 
-    normalized = str(target)
+    try:
+        match_target = _resolve_path(target)
+    except Exception:
+        match_target = target
+
+    normalized = str(match_target)
     normalized_lower = normalized.lower()
     preserve_tilde = raw.startswith("~")
     home_root: Path | None = None
     if preserve_tilde:
         try:
-            home_root = Path.home().expanduser().resolve()
+            home_root = _home_path()
         except Exception:
             home_root = None
     suggestions: list[str] = []
@@ -514,7 +771,7 @@ def list_workspace_suggestions(prefix: str = "", limit: int = 12) -> list[str]:
     show_hidden = leaf.startswith('.')
 
     try:
-        parent_resolved = parent.expanduser().resolve()
+        parent_resolved = _resolve_path(parent)
     except Exception:
         return suggestions[:limit]
 
@@ -564,17 +821,26 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
     trusted (it was validated at server startup).
     """
     if path in (None, ""):
-        return Path(_BOOT_DEFAULT_WORKSPACE).expanduser().resolve()
+        return _resolve_path(_BOOT_DEFAULT_WORKSPACE)
 
-    candidate = Path(path).expanduser().resolve()
+    candidate = _resolve_path(path)
 
     access_error = _workspace_access_error(candidate)
+    remote_candidate = _remote_terminal_workspace_candidate(path)
     if access_error:
-        raise ValueError(access_error)
+        # For remote terminal profiles, workspace paths belong to the target
+        # machine. Allow paths under terminal.cwd so session switching can
+        # update the workspace hint even though this WebUI host cannot stat
+        # the target-side path.
+        if remote_candidate is None:
+            raise ValueError(access_error)
+
+    if remote_candidate is not None:
+        return remote_candidate
 
     # (A) Trusted if under the user's home directory — cross-platform via Path.home()
     # Must be checked before system roots to allow symlinks like /var/home.
-    _home = Path.home().resolve()
+    _home = _home_path()
     if _home != Path("/"):
         try:
             candidate.relative_to(_home)
@@ -582,14 +848,13 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
         except ValueError:
             pass
 
-    # Block known system roots and their children.
     if _is_blocked_workspace_path(candidate, path):
         raise ValueError(f"Path points to a system directory: {candidate}")
 
     # (B) Trusted if already in the saved workspace list — covers non-home installs
     try:
         saved = load_workspaces()
-        saved_paths = {Path(w["path"]).resolve() for w in saved if w.get("path")}
+        saved_paths = {_resolve_path(w["path"]) for w in saved if w.get("path")}
         if candidate in saved_paths:
             return candidate
     except Exception:
@@ -601,7 +866,7 @@ def resolve_trusted_workspace(path: str | Path | None = None) -> Path:
     #     was already validated at server startup, so any sub-path of it is safe
     #     without requiring the user to add it to the workspace list manually.
     try:
-        boot_default = Path(_BOOT_DEFAULT_WORKSPACE).expanduser().resolve()
+        boot_default = _resolve_path(_BOOT_DEFAULT_WORKSPACE)
         candidate.relative_to(boot_default)
         return candidate
     except ValueError:
@@ -650,19 +915,26 @@ def validate_workspace_to_add(path: str) -> Path:
     and users routinely paste those into the Add Space input.
     """
     path = _strip_surrounding_quotes(path)
-    candidate = Path(path).expanduser().resolve()
+    candidate = _resolve_path(path)
 
     access_error = _workspace_access_error(candidate)
+    remote_candidate = _remote_terminal_workspace_candidate(path)
     if access_error:
-        raise ValueError(access_error)
+        # Remote terminal profiles validate workspace existence on the target
+        # machine, not on the WebUI server. Permit target-side paths under
+        # terminal.cwd.
+        if remote_candidate is None:
+            raise ValueError(access_error)
+
+    if remote_candidate is not None:
+        return remote_candidate
 
     # Home directory is always trusted regardless of where it lives on disk
     # (e.g. /var/home/... on systemd-homed Fedora/RHEL).
-    _home = Path.home().resolve()
+    _home = _home_path()
     if _home != Path("/") and _is_within(candidate, _home):
         return candidate
 
-    # Block known system roots and their immediate children.
     if _is_blocked_workspace_path(candidate, path):
         raise ValueError(f"Path points to a system directory: {candidate}")
 
@@ -671,33 +943,292 @@ def validate_workspace_to_add(path: str) -> Path:
 def safe_resolve_ws(root: Path, requested: str) -> Path:
     """Resolve a relative path inside a workspace root, raising ValueError on traversal.
 
-    Symlinks whose *unresolved* path is within the workspace root are allowed —
-    the user placed them there intentionally.  Only raw ``..`` traversal outside
-    the root is blocked.
+    Both raw ``..`` traversal and symlink escapes are blocked.  Workspace file
+    APIs can be reached by browser UI actions and agent/tool calls, so a symlink
+    inside the workspace must not expand the trusted workspace boundary to an
+    arbitrary host path.
     """
-    import os
-    unresolved = root / requested
-    resolved = unresolved.resolve()
-    # Fast path: resolved path is inside root (covers most cases)
+    root_resolved = root.resolve()
+    resolved = (root / requested).resolve()
     try:
-        resolved.relative_to(root.resolve())
-        return resolved
-    except ValueError:
-        pass
-    # Symlink path: normalize '..' (without following symlinks) and check
-    # os.path.normpath collapses '..' but does NOT follow symlinks.
-    norm = Path(os.path.normpath(str(unresolved)))
-    try:
-        norm.relative_to(root)
+        resolved.relative_to(root_resolved)
     except ValueError:
         raise ValueError(f"Path traversal blocked: {requested}")
-    # Symlink points outside workspace root — additionally block system directories.
-    # Even if the user placed the symlink intentionally, prevent reads from
-    # /etc, /proc, /sys, /dev and other blocked roots (LLM agents can call
-    # read_file_content via tool calls, not just human users).
-    if _is_blocked_system_path(resolved):
-        raise ValueError(f"Path traversal blocked (system dir): {requested}")
     return resolved
+
+
+# ── Race-safe (TOCTOU) anchored open ─────────────────────────────────────────
+# safe_resolve_ws() validates a path, but if callers then re-open by pathname a
+# symlink swapped in AFTER the check could still escape the workspace. To close
+# that window we open the (already symlink-resolved) target component-by-component
+# from the workspace root using openat (dir_fd) + O_NOFOLLOW: every component must
+# be a real, non-symlink entry, so a component swapped to a symlink mid-flight is
+# refused. Legit in-workspace symlinks still work because safe_resolve_ws() has
+# already collapsed them to their real in-workspace target, and we walk that real
+# (symlink-free) path. Portable: uses os.supports_dir_fd where available (Linux,
+# macOS); on platforms without dir_fd support (Windows — where creating symlinks
+# also requires admin) we fall back to a plain pathname open, matching the prior
+# behaviour with no regression.
+
+_DIR_FD_OK = os.open in getattr(os, "supports_dir_fd", set())
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+def open_anchored_fd(workspace: Path, target: Path, *, want_dir: bool) -> int:
+    """Open ``target`` race-safely and return an owned file descriptor.
+
+    ``target`` must be the symlink-resolved path returned by safe_resolve_ws()
+    (i.e. already verified to live under the workspace). Raises FileNotFoundError
+    if a component is missing / wrong-type, or ValueError if a component was
+    swapped to a symlink (escape attempt). Caller owns and must close the fd.
+    """
+    root_resolved = workspace.resolve()
+    # Relative, symlink-free component list (resolve() already collapsed any links).
+    try:
+        rel_parts = target.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {target}") from None
+
+    if not _DIR_FD_OK:
+        # Windows / no openat: fall back to a plain pathname open. No new race
+        # protection, but no regression vs the prior path-based behaviour, and
+        # symlink creation needs admin on Windows anyway.
+        flags = os.O_RDONLY | (_O_DIRECTORY if want_dir else 0) | _O_NOFOLLOW
+        try:
+            return os.open(str(target), flags)
+        except OSError:
+            raise FileNotFoundError(f"Not found: {target}") from None
+
+    # Open the (trusted) workspace root. root_resolved is canonical (resolve()
+    # collapsed any symlinks to REACH it, e.g. macOS /tmp -> /private/tmp), so its
+    # final component is legitimately a real directory — O_NOFOLLOW here only fires
+    # if the root itself was raced into a symlink after resolve() (escape attempt).
+    fd = os.open(str(root_resolved), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    try:
+        for i, part in enumerate(rel_parts):
+            is_last = i == len(rel_parts) - 1
+            want_directory = (not is_last) or want_dir
+            flags = os.O_RDONLY | _O_NOFOLLOW | (_O_DIRECTORY if want_directory else 0)
+            try:
+                nfd = os.open(part, flags, dir_fd=fd)
+            except OSError:
+                # ELOOP (component is a symlink — swapped in) or missing/wrong type.
+                raise FileNotFoundError(f"Not found: {target}") from None
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def open_anchored_create_fd(root: Path, dest: Path) -> int:
+    """Create ``dest`` for exclusive writing race-safely, anchored under ``root``.
+
+    Walks from ``root`` via openat + O_NOFOLLOW (creating missing intermediate
+    directories with mkdir(dir_fd=...)), then creates the leaf with
+    O_CREAT|O_EXCL|O_NOFOLLOW so a symlink raced into any component cannot
+    redirect the write outside ``root``. ``dest`` must be the resolved path and
+    must not already exist (callers dedup first). Raises ValueError if ``dest``
+    is not under ``root``, FileExistsError if it exists, FileNotFoundError if a
+    component was swapped to a symlink. Caller owns and must close the returned
+    write fd. On platforms without dir_fd support (Windows) falls back to a plain
+    exclusive create — no new race protection but no regression.
+    """
+    root_resolved = root.resolve()
+    try:
+        rel_parts = dest.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {dest}") from None
+    if not rel_parts:
+        raise ValueError(f"Invalid destination: {dest}")
+
+    if not _DIR_FD_OK:
+        # Windows / no openat: create parent dirs then exclusively create the leaf.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o644)
+
+    fd = os.open(str(root_resolved), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    try:
+        for part in rel_parts[:-1]:
+            try:
+                nfd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                # ELOOP — component swapped to a symlink (escape attempt).
+                raise FileNotFoundError(f"Not found: {dest}") from None
+            os.close(fd)
+            fd = nfd
+        return os.open(
+            rel_parts[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+            0o644,
+            dir_fd=fd,
+        )
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def make_anchored_dir(root: Path, dest: Path) -> None:
+    """Create directory ``dest`` (and any missing parents) race-safely under ``root``.
+
+    Walks from ``root`` via openat + O_NOFOLLOW, creating each missing component
+    with mkdir(dir_fd=...), so a symlink raced into any component cannot make the
+    server create directories outside ``root``. Idempotent (existing dirs are
+    fine). Raises ValueError if ``dest`` is not under ``root``, FileNotFoundError
+    if a component was swapped to a symlink. On platforms without dir_fd support
+    (Windows) falls back to a plain Path.mkdir — no regression.
+    """
+    root_resolved = root.resolve()
+    dest_resolved = dest.resolve()
+    if dest_resolved == root_resolved:
+        return
+    try:
+        rel_parts = dest_resolved.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {dest}") from None
+
+    if not _DIR_FD_OK:
+        dest.mkdir(parents=True, exist_ok=True)
+        return
+
+    fd = os.open(str(root_resolved), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    try:
+        for part in rel_parts:
+            try:
+                nfd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                # ELOOP — component swapped to a symlink (escape attempt).
+                raise FileNotFoundError(f"Not found: {dest}") from None
+            os.close(fd)
+            fd = nfd
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def open_anchored_write_fd(root: Path, target: Path) -> int:
+    """Open existing ``target`` for truncating writes anchored under ``root``."""
+    root_resolved = root.resolve()
+    target_resolved = target.resolve()
+    try:
+        rel_parts = target_resolved.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {target}") from None
+    if not rel_parts:
+        raise ValueError(f"Invalid target: {target}")
+
+    flags = os.O_WRONLY | os.O_TRUNC | _O_NOFOLLOW
+    if not _DIR_FD_OK:
+        return os.open(str(target_resolved), flags)
+
+    parent_fd = open_anchored_fd(root_resolved, target_resolved.parent, want_dir=True)
+    try:
+        return os.open(rel_parts[-1], flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def unlink_anchored(root: Path, target: Path) -> None:
+    """Unlink an existing file anchored under ``root``."""
+    root_resolved = root.resolve()
+    target_resolved = target.resolve()
+    try:
+        rel_parts = target_resolved.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {target}") from None
+    if not rel_parts:
+        raise ValueError(f"Invalid target: {target}")
+
+    if not _DIR_FD_OK:
+        target_resolved.unlink()
+        return
+
+    parent_fd = open_anchored_fd(root_resolved, target_resolved.parent, want_dir=True)
+    try:
+        os.unlink(rel_parts[-1], dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def rmtree_anchored(root: Path, target: Path) -> None:
+    """Remove a directory tree anchored under ``root`` without following symlink swaps."""
+    root_resolved = root.resolve()
+    target_resolved = target.resolve()
+    try:
+        rel_parts = target_resolved.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {target}") from None
+    if not rel_parts:
+        raise ValueError(f"Invalid target: {target}")
+
+    if not _DIR_FD_OK:
+        shutil.rmtree(target_resolved)
+        return
+
+    parent_fd = open_anchored_fd(root_resolved, target_resolved.parent, want_dir=True)
+    try:
+        shutil.rmtree(rel_parts[-1], dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def rename_anchored(root: Path, source: Path, dest: Path) -> None:
+    """Rename ``source`` to ``dest`` using anchored parent directory fds."""
+    root_resolved = root.resolve()
+    source_resolved = source.resolve()
+    dest_parent_resolved = dest.parent.resolve()
+    try:
+        source_parts = source_resolved.relative_to(root_resolved).parts
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {source}") from None
+    try:
+        dest_parent_resolved.relative_to(root_resolved)
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {dest}") from None
+    if not source_parts:
+        raise ValueError(f"Invalid source: {source}")
+    dest_leaf = dest.name
+    if not dest_leaf:
+        raise ValueError(f"Invalid destination: {dest}")
+
+    if not _DIR_FD_OK:
+        source_resolved.rename(dest)
+        return
+
+    src_parent_fd = open_anchored_fd(root_resolved, source_resolved.parent, want_dir=True)
+    try:
+        dst_parent_fd = open_anchored_fd(root_resolved, dest_parent_resolved, want_dir=True)
+        try:
+            try:
+                os.stat(dest_leaf, dir_fd=dst_parent_fd, follow_symlinks=False)
+                raise FileExistsError(dest_leaf)
+            except FileNotFoundError:
+                pass
+            os.rename(
+                source_parts[-1],
+                dest_leaf,
+                src_dir_fd=src_parent_fd,
+                dst_dir_fd=dst_parent_fd,
+            )
+        finally:
+            os.close(dst_parent_fd)
+    finally:
+        os.close(src_parent_fd)
 
 
 def list_dir(workspace: Path, rel: str='.'):
@@ -705,75 +1236,197 @@ def list_dir(workspace: Path, rel: str='.'):
     if not target.is_dir():
         raise FileNotFoundError(f"Not a directory: {rel}")
     ws_resolved = workspace.resolve()
+    target_resolved = target.resolve()
     entries = []
-    for item in sorted(target.iterdir(), key=lambda p: (not p.is_symlink(), p.is_file(), p.name.lower())):
-        if item.is_symlink():
-            # Resolve the symlink target and check if it stays within workspace
+
+    def _process(name, is_symlink, raw_link, lstat_result, reachable):
+        """Append one directory entry. ``raw_link`` is the os.readlink() result
+        for symlinks (else None); ``lstat_result`` is an os.stat_result obtained
+        with follow_symlinks=False (else None); ``reachable`` is False when a
+        follow_symlinks=True stat raised (broken target or symlink loop)."""
+        if is_symlink:
+            if raw_link is None:
+                return
+            # A symlink whose follow-stat raised (ELOOP / broken target) can never
+            # be opened — filter it. This catches mutual/self loops portably across
+            # Python versions where Path.resolve() loop handling differs (3.11
+            # raises RuntimeError, 3.13 can return a path), so do not rely on
+            # resolve() raising for cycle detection.
+            if not reachable:
+                return
             try:
-                link_target = item.resolve()
-            except OSError:
-                continue
-            # Cycle detection: skip if symlink points back to current dir,
-            # workspace root, or any ancestor of current dir.
-            # This must run REGARDLESS of whether target is inside workspace.
-            if (link_target == target.resolve() or link_target == target
-                    or link_target == ws_resolved):
-                continue
+                link_target = (target_resolved / raw_link).resolve()
+            except (OSError, RuntimeError):
+                return
+            # Cycle detection: skip if symlink points back to current dir or root.
+            if link_target == target_resolved or link_target == ws_resolved:
+                return
             try:
-                target.resolve().relative_to(link_target)
-                # target is under link_target — link_target is an ancestor → cycle
-                continue
+                target_resolved.relative_to(link_target)
+                return  # target is under link_target — ancestor → cycle
             except ValueError:
                 pass
-            # Block symlinks that resolve to system directories.
+            # Tag symlinks whose resolved target escapes the workspace root.
+            # Previously silently dropped; now emitted with target_outside_workspace=True
+            # so the workspace tree can show the link exists (display-only — the
+            # read/list gate in safe_resolve_ws / open_anchored_fd still blocks
+            # navigation through it).
+            target_outside_workspace = False
+            try:
+                link_target.relative_to(ws_resolved)
+            except ValueError:
+                target_outside_workspace = True
             if _is_blocked_system_path(link_target):
-                continue
-            is_dir = link_target.is_dir()
-            # Keep the display path relative to workspace (don't follow the link)
-            display_path = str(Path(item.name))
+                return
+            display_path = name
             if rel and rel != '.':
                 display_path = rel + '/' + display_path
-            try:
-                item_stat = item.lstat()
-                mtime_ns = item_stat.st_mtime_ns
-            except OSError:
-                mtime_ns = None
-            entry = {
-                'name': item.name,
-                'path': display_path,
-                'type': 'symlink',
-                'target': str(link_target),
-                'is_dir': is_dir,
-                'mtime_ns': mtime_ns,
-            }
-            if not is_dir:
-                try:
-                    entry['size'] = link_target.stat().st_size
-                except OSError:
-                    entry['size'] = None
-            entries.append(entry)
+            mtime_ns = lstat_result.st_mtime_ns if lstat_result is not None else None
+            if target_outside_workspace:
+                # #4581 hardening: a display-only escape-target symlink must NOT
+                # disclose where it points. Emit ONLY display-safe fields — never
+                # the resolved outside path, target-derived is_dir, or target size
+                # (the row exists to show the link is present; navigation/read
+                # through it stays blocked by safe_resolve_ws/open_anchored_fd).
+                entry = {
+                    'name': name,
+                    'path': display_path,
+                    'type': 'symlink',
+                    'is_dir': False,
+                    'target_outside_workspace': True,
+                    'mtime_ns': mtime_ns,
+                }
+                entries.append(entry)
+            else:
+                is_dir = link_target.is_dir()
+                entry = {
+                    'name': name,
+                    'path': display_path,
+                    'type': 'symlink',
+                    'target': str(link_target),
+                    'is_dir': is_dir,
+                    'target_outside_workspace': False,
+                    'mtime_ns': mtime_ns,
+                }
+                if not is_dir:
+                    try:
+                        entry['size'] = link_target.stat().st_size
+                    except OSError:
+                        entry['size'] = None
+                entries.append(entry)
         else:
-            # Use rel-based path so entries under symlink targets (outside
-            # the workspace root) still get a valid workspace-relative path.
-            entry_path = item.name
+            entry_path = name
             if rel and rel != '.':
-                entry_path = rel + '/' + item.name
-            try:
-                item_stat = item.stat()
-                size = item_stat.st_size if item.is_file() else None
-                mtime_ns = item_stat.st_mtime_ns
-            except OSError:
+                entry_path = rel + '/' + name
+            if lstat_result is not None:
+                is_file = stat.S_ISREG(lstat_result.st_mode)
+                size = lstat_result.st_size if is_file else None
+                mtime_ns = lstat_result.st_mtime_ns
+                is_dir_entry = stat.S_ISDIR(lstat_result.st_mode)
+            else:
                 size = None
                 mtime_ns = None
+                is_dir_entry = False
             entries.append({
-                'name': item.name,
+                'name': name,
                 'path': entry_path,
-                'type': 'dir' if item.is_dir() else 'file',
+                'type': 'dir' if is_dir_entry else 'file',
                 'size': size,
                 'mtime_ns': mtime_ns,
             })
-        if len(entries) >= 200:
-            break
+
+    if _DIR_FD_OK:
+        # #3398 TOCTOU hardening (Linux/macOS): open the directory via an anchored
+        # openat-walk (O_NOFOLLOW on every component) and enumerate via the verified
+        # fd (os.scandir(fd) + fd-relative fstatat/readlinkat), so a path component
+        # swapped to an escaping symlink after safe_resolve_ws() cannot redirect the
+        # listing.
+        def _sort_key_de(de):
+            try:
+                is_link = de.is_symlink()
+            except OSError:
+                is_link = False
+            is_file = False
+            if not is_link:
+                try:
+                    is_file = de.is_file()
+                except OSError:
+                    pass
+            return (not is_link, is_file, de.name.lower())
+
+        dir_fd = open_anchored_fd(workspace, target, want_dir=True)
+        try:
+            st = os.fstat(dir_fd)
+            if not stat.S_ISDIR(st.st_mode):
+                raise FileNotFoundError(f"Not a directory: {rel}")
+            with os.scandir(dir_fd) as scan:
+                scandir_entries = sorted(scan, key=_sort_key_de)
+            for de in scandir_entries:
+                name = de.name
+                is_symlink = de.is_symlink()
+                raw_link = None
+                if is_symlink:
+                    try:
+                        raw_link = os.readlink(name, dir_fd=dir_fd)
+                    except OSError:
+                        raw_link = None
+                try:
+                    lst = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                except OSError:
+                    lst = None
+                # reachable: follow-stat succeeds (filters ELOOP/broken symlinks).
+                reachable = True
+                if is_symlink:
+                    try:
+                        os.stat(name, dir_fd=dir_fd, follow_symlinks=True)
+                    except OSError:
+                        reachable = False
+                _process(name, is_symlink, raw_link, lst, reachable)
+                if len(entries) >= 200:
+                    break
+        finally:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+    else:
+        # Portability fallback (Windows / no dir_fd): path-based enumeration after
+        # safe_resolve_ws(). No anchored-fd race protection on these platforms, but
+        # no regression vs the prior behaviour (creating symlinks on Windows needs
+        # admin anyway), and safe_resolve_ws() still blocks the static escape.
+        def _sort_key_p(p: Path):
+            is_link = p.is_symlink()
+            is_file = False
+            if not is_link:
+                try:
+                    is_file = p.is_file()
+                except OSError:
+                    pass
+            return (not is_link, is_file, p.name.lower())
+
+        for item in sorted(target.iterdir(), key=_sort_key_p):
+            name = item.name
+            is_symlink = item.is_symlink()
+            raw_link = None
+            if is_symlink:
+                try:
+                    raw_link = os.readlink(str(item))
+                except OSError:
+                    raw_link = None
+            try:
+                lst = item.lstat()
+            except OSError:
+                lst = None
+            # reachable: follow-stat succeeds (filters ELOOP/broken symlinks).
+            reachable = True
+            if is_symlink:
+                try:
+                    os.stat(str(item), follow_symlinks=True)
+                except OSError:
+                    reachable = False
+            _process(name, is_symlink, raw_link, lst, reachable)
+            if len(entries) >= 200:
+                break
     return entries
 
 
@@ -796,6 +1449,7 @@ def dir_signature(workspace: Path, rel: str = '.', entries: list[dict] | None = 
             'size': entry.get('size'),
             'mtime_ns': entry.get('mtime_ns'),
             'target': entry.get('target'),
+            'target_outside_workspace': entry.get('target_outside_workspace'),
         })
     raw = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
@@ -805,11 +1459,220 @@ def read_file_content(workspace: Path, rel: str) -> dict:
     target = safe_resolve_ws(workspace, rel)
     if not target.is_file():
         raise FileNotFoundError(f"Not a file: {rel}")
-    size = target.stat().st_size
-    if size > MAX_FILE_BYTES:
-        raise ValueError(f"File too large ({size} bytes, max {MAX_FILE_BYTES})")
-    content = target.read_text(encoding='utf-8', errors='replace')
-    return {'path': rel, 'content': content, 'size': size, 'lines': content.count('\n') + 1}
+    # #3398 TOCTOU hardening: open the resolved file via an anchored openat-walk
+    # (O_NOFOLLOW on every component) so a path swapped to an escaping symlink
+    # after safe_resolve_ws() cannot be followed, then read from the fd (not the
+    # pathname) so the bytes returned are guaranteed to be the verified file.
+    fd = open_anchored_fd(workspace, target, want_dir=False)
+    with os.fdopen(fd, 'rb', closefd=True) as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise FileNotFoundError(f"Not a file: {rel}")
+        if st.st_size > MAX_FILE_BYTES:
+            raise ValueError(f"File too large ({st.st_size} bytes, max {MAX_FILE_BYTES})")
+        raw = fh.read(MAX_FILE_BYTES + 1)
+    if Path(str(rel)).suffix.lower() in {".docx", ".xlsx", ".pptx"}:
+        from api.office_documents import preview_office_document
+
+        return preview_office_document(rel, raw)
+    content = raw.decode('utf-8', errors='replace')
+    return {'path': rel, 'content': content, 'size': len(raw), 'lines': content.count('\n') + 1}
+
+
+def _normalize_workspace_rel_path(rel: str | Path) -> str:
+    raw = _strip_surrounding_quotes(str(rel or "")).strip().replace("\\", "/")
+    if not raw or raw == ".":
+        return "."
+    norm = posixpath.normpath(raw)
+    if not norm or norm == ".":
+        return "."
+    if norm == ".." or norm.startswith("../") or norm.startswith("/"):
+        raise ValueError(f"Path traversal blocked: {rel}")
+    return norm
+
+
+def _escape_virtual_path(root: str, rel: str) -> str:
+    root_norm = _normalize_workspace_rel_path(root)
+    rel_norm = _normalize_workspace_rel_path(rel)
+    if root_norm == ".":
+        return rel_norm
+    if rel_norm == ".":
+        return root_norm
+    return f"{root_norm}/{rel_norm}"
+
+
+def _escape_surface_target(workspace: Path, rel: str) -> tuple[Path, Path]:
+    workspace_root = workspace.resolve()
+    surface_rel = _normalize_workspace_rel_path(rel)
+    surface_posix = PurePosixPath(surface_rel)
+    parent_rel = str(surface_posix.parent)
+    if parent_rel in ("", "."):
+        parent_path = workspace_root
+    else:
+        parent_path = safe_resolve_ws(workspace_root, parent_rel)
+    surface_path = parent_path / surface_posix.name
+    if not surface_path.is_symlink():
+        raise ValueError(f"Path is not an escape-target symlink: {rel}")
+    target = surface_path.resolve()
+    if not target.exists():
+        raise ValueError(f"Path is no longer reachable: {rel}")
+    try:
+        target.relative_to(workspace_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(f"Path does not escape workspace: {rel}")
+    if _is_blocked_system_path(target):
+        raise ValueError(f"Path points to a system directory: {target}")
+    return surface_path, target
+
+
+def _escape_authorized_root(target: Path) -> tuple[Path, str]:
+    resolved_target = target.resolve()
+    if resolved_target.is_dir():
+        return resolved_target, "."
+    return resolved_target.parent, resolved_target.name
+
+
+class EscapeAuthorizationExpiredError(ValueError):
+    pass
+
+
+def _escape_prune_tokens(now: float | None = None) -> None:
+    cutoff = time.time() if now is None else now
+    expired = [token for token, record in _ESCAPE_AUTH_TOKENS.items() if float(record.get("expires_at") or 0.0) <= cutoff]
+    for token in expired:
+        _ESCAPE_AUTH_TOKENS.pop(token, None)
+
+
+def authorize_escape_target(workspace: Path, session_id: str, rel: str) -> dict:
+    """Mint a short-lived browser-only grant for one surfaced escape-target symlink."""
+    workspace_root = workspace.resolve()
+    _surface_path, target = _escape_surface_target(workspace_root, rel)
+    external_root, external_entry_rel = _escape_authorized_root(target)
+    token = secrets.token_urlsafe(24)
+    expires_at = time.time() + _ESCAPE_AUTH_TTL_SECONDS
+    record = {
+        "session_id": str(session_id or ""),
+        "workspace_root": str(workspace_root),
+        "surface_path": _normalize_workspace_rel_path(rel),
+        "external_root": str(external_root),
+        "external_entry_rel": external_entry_rel,
+        "surface_target": str(target),
+        "expires_at": expires_at,
+    }
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens()
+        _ESCAPE_AUTH_TOKENS[token] = record
+    return {
+        "token": token,
+        "path": record["surface_path"],
+        "is_dir": target.is_dir(),
+        "expires_at": expires_at,
+        "expires_in": _ESCAPE_AUTH_TTL_SECONDS,
+        "read_only": True,
+    }
+
+
+def _escape_authorization_record(workspace: Path, session_id: str, token: str) -> dict:
+    workspace_root = str(workspace.resolve())
+    token = str(token or "").strip()
+    if not token:
+        raise ValueError("Escape authorization token is required")
+    now = time.time()
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens(now)
+        record = dict(_ESCAPE_AUTH_TOKENS.get(token) or {})
+    if not record:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    if str(record.get("session_id") or "") != str(session_id or ""):
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    if str(record.get("workspace_root") or "") != workspace_root:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    surface_path = _normalize_workspace_rel_path(record.get("surface_path") or ".")
+    surface_target = str(record.get("surface_target") or "")
+    try:
+        _surface, current_target = _escape_surface_target(Path(workspace_root), surface_path)
+    except ValueError:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired") from None
+    if str(current_target.resolve()) != surface_target:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    if not current_target.exists() or _is_blocked_system_path(current_target):
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    return record
+
+
+def resolve_authorized_escape_request(workspace: Path, session_id: str, token: str, rel: str) -> dict:
+    record = _escape_authorization_record(workspace, session_id, token)
+    surface_path = _normalize_workspace_rel_path(record["surface_path"])
+    request_path = _normalize_workspace_rel_path(rel)
+    try:
+        requested_rel = str(PurePosixPath(request_path).relative_to(PurePosixPath(surface_path)))
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {rel}") from None
+    if not requested_rel:
+        requested_rel = "."
+    external_root = Path(str(record["external_root"]))
+    external_entry_rel = _normalize_workspace_rel_path(record.get("external_entry_rel") or ".")
+    if external_entry_rel == ".":
+        external_rel = requested_rel
+    elif requested_rel == ".":
+        external_rel = external_entry_rel
+    else:
+        external_rel = str(PurePosixPath(external_entry_rel) / PurePosixPath(requested_rel))
+    target = external_root / external_rel
+    return {
+        "record": record,
+        "workspace_root": Path(str(record["workspace_root"])),
+        "surface_path": surface_path,
+        "request_path": request_path,
+        "external_rel": external_rel,
+        "external_root": external_root,
+        "target": target,
+    }
+
+
+def list_authorized_escape_dir(workspace: Path, session_id: str, token: str, rel: str) -> dict:
+    resolved = resolve_authorized_escape_request(workspace, session_id, token, rel)
+    external_root = resolved["external_root"]
+    external_rel = resolved["external_rel"]
+    entries = list_dir(external_root, external_rel)
+    surface_path = resolved["surface_path"]
+    external_root_resolved = external_root.resolve()
+    for entry in entries:
+        entry["path"] = _escape_virtual_path(surface_path, entry.get("path") or ".")
+        entry["escape_read_only"] = True
+        target = entry.get("target")
+        if not target:
+            continue
+        try:
+            target_path = Path(str(target)).resolve()
+            target_rel = target_path.relative_to(external_root_resolved).as_posix()
+        except Exception:
+            entry.pop("target", None)
+            continue
+        entry["target"] = _escape_virtual_path(surface_path, target_rel)
+    return {
+        "path": resolved["request_path"],
+        "entries": entries,
+        "signature": dir_signature(external_root, external_rel, entries),
+        "virtual_root": surface_path,
+        "read_only": True,
+    }
+
+
+def read_authorized_escape_file_content(workspace: Path, session_id: str, token: str, rel: str) -> dict:
+    resolved = resolve_authorized_escape_request(workspace, session_id, token, rel)
+    payload = read_file_content(resolved["external_root"], resolved["external_rel"])
+    payload["path"] = resolved["request_path"]
+    payload["escape_read_only"] = True
+    return payload
+
+
+def raw_authorized_escape_target(workspace: Path, session_id: str, token: str, rel: str) -> tuple[Path, Path]:
+    resolved = resolve_authorized_escape_request(workspace, session_id, token, rel)
+    target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
+    return resolved["external_root"], target
 
 
 # ── Git detection ──────────────────────────────────────────────────────────

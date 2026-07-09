@@ -261,6 +261,98 @@ def test_redact_value_works_with_legacy_agent_redact_signature(monkeypatch):
         importlib.reload(helpers)
 
 
+def test_redaction_preserves_secret_key_literals_in_code_without_values():
+    import api.helpers as helpers
+
+    key = "DISCORD" + "_BOT" + "_TOKEN"
+    snippet = (
+        f'if line.startswith("{key}="):\n'
+        '    return line.split("=", 1)[1].strip()'
+    )
+
+    assert helpers._redact_value(snippet) == snippet
+
+
+def test_redaction_masks_authorization_bot_value_without_breaking_code_structure():
+    import ast
+    import api.helpers as helpers
+
+    token = "M" + ("T" * 40) + ".abc123"
+    snippet = (
+        'headers = ["-H", '
+        f'f"Authorization: Bot {token}", '
+        '"-H", "User-Agent: HermesBot/1.0"]'
+    )
+
+    redacted = helpers._redact_value(snippet)
+
+    assert token not in redacted
+    assert 'f"Authorization: Bot ' in redacted
+    assert '", "-H", "User-Agent: HermesBot/1.0"]' in redacted
+    ast.parse(redacted)
+
+
+def _reload_helpers_with_fallback_redactor(monkeypatch):
+    fake_agent = types.ModuleType("agent")
+    fake_redact = types.ModuleType("agent.redact")
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.redact", fake_redact)
+
+    import api.helpers as helpers
+    return importlib.reload(helpers)
+
+
+@pytest.mark.parametrize("text,leaked", [
+    ("API_KEY=val,with,commas", "val,with,commas"),
+    ('TOKEN="quoted"', "quoted"),
+    ("PASSWORD=ends)", "ends)"),
+])
+def test_fallback_env_redaction_masks_values_with_delimiters(monkeypatch, text, leaked):
+    helpers = _reload_helpers_with_fallback_redactor(monkeypatch)
+    try:
+        redacted = helpers._redact_value(text)
+        assert leaked not in redacted
+        assert "..." in redacted or "***" in redacted
+    finally:
+        importlib.reload(helpers)
+
+
+def test_agent_redaction_restore_is_occurrence_aware_for_code_key_literals(monkeypatch):
+    key = "DISCORD" + "_BOT" + "_TOKEN"
+    secret = "real-secret-value-123456789"
+    mask = "real-s...6789"
+    original = (
+        f"env line: {key}={secret}\n"
+        f'if line.startswith("{key}="):\n'
+        "    return True"
+    )
+
+    fake_agent = types.ModuleType("agent")
+    fake_redact = types.ModuleType("agent.redact")
+
+    def _fake_redact_sensitive_text(text, force=True):
+        assert force is True
+        return (
+            text
+            .replace(f"{key}={secret}", f"{key}={mask}")
+            .replace(f'{key}="):', f"{key}={mask}")
+        )
+
+    fake_redact.redact_sensitive_text = _fake_redact_sensitive_text
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.redact", fake_redact)
+
+    import api.helpers as helpers
+    helpers = importlib.reload(helpers)
+    try:
+        redacted = helpers._redact_value(original)
+        assert secret not in redacted
+        assert f'if line.startswith("{key}="):' in redacted
+        assert f"env line: {key}=\"):" not in redacted
+    finally:
+        importlib.reload(helpers)
+
+
 def test_redact_session_data_messages():
     """redact_session_data masks credentials in messages[]."""
     from api.helpers import redact_session_data
@@ -282,6 +374,54 @@ def test_redact_session_data_messages():
     # Safe fields remain intact
     assert result["session_id"] == "abc123"
     assert result["messages"][1]["content"] == "sure"
+
+def test_redact_session_data_todo_state_sidecar():
+    """redact_session_data masks credentials in derived todo_state sidecars."""
+    from api.helpers import redact_session_data
+    session = {
+        "session_id": "todo-redact",
+        "messages": [],
+        "tool_calls": [],
+        "todo_state": {
+            "todos": [
+                {"id": "1", "content": f"rotate api key {_FAKE_SK_KEY}", "status": "pending"},
+            ],
+            "summary": {"total": 1, "pending": 1},
+            "version": 1,
+        },
+    }
+    result = redact_session_data(session)
+    dump = json.dumps(result)
+    _assert_no_plaintext_credentials(dump, "todo_state redaction")
+    assert result["todo_state"]["todos"][0]["status"] == "pending"
+
+
+def test_redact_session_data_runtime_journal_snapshot():
+    """redact_session_data masks credentials in active run-journal snapshots."""
+    from api.helpers import redact_session_data
+    session = {
+        "session_id": "journal-redact",
+        "messages": [],
+        "tool_calls": [],
+        "runtime_journal_snapshot": {
+            "messages": [
+                {"role": "assistant", "content": f"token echoed: {_FAKE_GITHUB_PAT}"},
+            ],
+            "tool_calls": [
+                {
+                    "name": "terminal",
+                    "preview": f"using {_FAKE_SK_KEY}",
+                    "args": {"command": f"export TOKEN={_FAKE_GITHUB_PAT}"},
+                },
+            ],
+            "last_assistant_text": f"assistant saw {_FAKE_HF_TOKEN}",
+            "last_reasoning_text": f"reasoning saw {_FAKE_AWS_KEY}",
+        },
+    }
+    result = redact_session_data(session)
+    dump = json.dumps(result)
+    _assert_no_plaintext_credentials(dump, "runtime_journal_snapshot redaction")
+    assert result["runtime_journal_snapshot"]["tool_calls"][0]["name"] == "terminal"
 
 
 def test_redact_session_data_multiple_cred_types():
@@ -317,7 +457,7 @@ def test_redact_session_data_non_sensitive_unchanged():
 
 
 # ── API-level tests (require running test server started by conftest.py) ─────
-# Run via `start.sh && pytest tests/test_security_redaction.py -v`
+# Run via `./scripts/test.sh tests/test_security_redaction.py -v`
 
 def _create_session_with_credentials() -> str:
     """Write a session file with credential-containing messages directly to disk.
@@ -447,12 +587,19 @@ def test_fix_credential_permissions_corrects_loose_files(tmp_path, monkeypatch):
     fix_credential_permissions()
 
     import stat
-    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600, ".env not fixed to 600"
-    assert stat.S_IMODE(google_file.stat().st_mode) == 0o600, "google_token.json not fixed to 600"
+    assert env_file.exists(), ".env missing after permission repair"
+    assert google_file.exists(), "google_token.json missing after permission repair"
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600, ".env not fixed to 600"
+        assert stat.S_IMODE(google_file.stat().st_mode) == 0o600, "google_token.json not fixed to 600"
+    # Windows CI cannot assert a POSIX mode-bit repair here; keeping the files
+    # present after the repair pass is the strongest portable contract for now.
 
 
 def test_fix_credential_permissions_skips_correct_files(tmp_path, monkeypatch):
     """fix_credential_permissions() does not alter already-strict files."""
+    import os
+
     env_file = tmp_path / ".env"
     env_file.write_text("SECRET=abc")
     env_file.chmod(0o600)
@@ -463,4 +610,6 @@ def test_fix_credential_permissions_skips_correct_files(tmp_path, monkeypatch):
     fix_credential_permissions()
 
     import stat
-    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert env_file.exists(), ".env missing after strict-permission check"
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600

@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -22,6 +24,7 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
+from api.gateway_restart import restart_active_profile_gateway
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
 logger = logging.getLogger(__name__)
@@ -32,7 +35,7 @@ try:
 except ImportError:
     _AGENT_DIR = None
 
-_update_cache = {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': True}
+_update_cache = {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': True, 'channel': 'stable'}
 _SUMMARY_CACHE_MAX = 16
 _summary_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
@@ -42,7 +45,36 @@ CACHE_TTL = 1800  # 30 minutes
 _GIT_DIAGNOSTIC_MAX_CHARS = 300
 _CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
-_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|token|password|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+_QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|oauth_token|private_token|client_secret|app_secret|api[_-]?key|token|password|secret|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
+_FETCH_NETWORK_FAILURE_SIGNATURES = (
+    'could not resolve host',
+    'failed to connect',
+    'network is unreachable',
+    'no route to host',
+    'connection timed out',
+    'timed out after',
+    'connection reset by peer',
+    'remote end hung up unexpectedly',
+    'tls connection was non-properly terminated',
+    'ssl certificate problem',
+)
+# Phrases git emits when its own short-lived index/refs lock files block a
+# subsequent operation. Tuned to match only the true "lock file already exists"
+# semantics that warrant a lock-conflict response -- v2 deliberately drops the
+# broad "lock file" substring from the prior version to avoid false positives
+# on unrelated errors like "lock file lost during ref transaction".
+# Matched case-insensitively in _is_git_lock_error().
+_GIT_LOCK_SIGNATURES = (
+    "index.lock': file exists",
+    ".lock': file exists",
+    'another git process seems to be running',
+    'unable to create .git/index.lock',
+)
+# Lock files we previously enumerated for auto-removal in v2. v2.2 no longer
+# removes anything on the server, so the enumerable list is no longer needed;
+# ``_inventory_locks`` reports whatever ``.git/**/*.lock`` files currently exist
+# via plain ``rglob``.
+
 
 
 def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CHARS) -> str:
@@ -61,6 +93,17 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
     if len(sanitized) > limit:
         sanitized = sanitized[:limit].rstrip() + "…"
     return sanitized
+
+
+def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:
+    """Return the apply-path fetch failure message for the given stderr."""
+    detail = _sanitize_git_diagnostic(fetch_out)
+    if not detail:
+        return network_message
+    detail_lower = detail.lower()
+    if any(signature in detail_lower for signature in _FETCH_NETWORK_FAILURE_SIGNATURES):
+        return network_message
+    return f'fetch failed: {detail}'
 
 
 def _restart_blocker_snapshot() -> dict:
@@ -162,9 +205,12 @@ def _run_git(args, cwd, timeout=10):
     On failure, returns stderr (or stdout as fallback) so callers can
     surface actionable git error messages instead of empty strings.
     """
+    git_executable = _resolve_git_executable()
+    if not git_executable:
+        return 'git executable not found', False
     try:
         r = subprocess.run(
-            ['git'] + args, cwd=str(cwd), capture_output=True,
+            [git_executable] + args, cwd=str(cwd), capture_output=True,
             text=True, timeout=timeout,
             encoding='utf-8', errors='replace',
         )
@@ -183,6 +229,196 @@ def _run_git(args, cwd, timeout=10):
         return 'git executable not found', False
     except OSError as exc:
         return f'git failed to start: {exc}', False
+
+
+def _is_git_lock_error(output: str) -> bool:
+    if not output:
+        return False
+    lower_out = output.lower()
+    return any(sig in lower_out for sig in _GIT_LOCK_SIGNATURES)
+
+
+def _inventory_locks(path: Path) -> dict:
+    """Return a snapshot of lock files currently present under ``path/.git``.
+
+    v2.2: replaced v2's `_is_lock_held` + `_try_remove_lock` machinery with
+    pure inventory. Round-2 cert (gate-fail) proved that `fcntl.flock`
+    cannot detect a live git lock, because git uses `O_CREAT|O_EXCL` and
+    `rename(2)`, NOT advisory locking. Any auto-delete path can therefore
+    race against a running `git add` and corrupt the index. v2.2 stops
+    deleting locks from the server entirely: the only thing that removes
+    a lock is the user, on the host, via the manual command surfaced in
+    the response. Once the lock is gone, the user re-clicks Update Now
+    and the normal non-destructive apply path runs.
+    """
+    git_dir = path / '.git'
+    out = {
+        'well_known_lock_present': False,  # ``.git/index.lock`` exists?
+        'well_known_lock_path': None,      # absolute path of ``.git/index.lock``
+        'other_locks': [],                  # any other lock files, by relative path
+    }
+    if not git_dir.exists():
+        return out
+    well_known = git_dir / 'index.lock'
+    try:
+        out['well_known_lock_present'] = well_known.exists()
+    except OSError:
+        # Permission problem reading the directory -- treat conservatively.
+        out['well_known_lock_present'] = True
+    out['well_known_lock_path'] = str(well_known)
+
+    # Enumerate every other lock file under .git/ for diagnostic reporting.
+    # We never touch them; this is purely an inventory.
+    try:
+        for entry in sorted(git_dir.rglob('*.lock')):
+            try:
+                rel = str(entry.relative_to(git_dir))
+            except ValueError:
+                continue
+            if rel == 'index.lock':
+                continue
+            out['other_locks'].append(rel)
+    except OSError:
+        # rglob can fail on unreadable subtrees; skip quietly.
+        pass
+    return out
+
+
+def apply_clear_lock(target: str) -> dict:
+    """Manual-instruction lock recovery for ``target``.
+
+    v2.2: NEVER removes a lock file. Strategy:
+
+      - If ``.git/index.lock`` is absent: re-run the normal non-destructive
+        apply path so the user lands on the latest version without ever
+        touching destructive git operations.
+      - If ``.git/index.lock`` is present: do NOT touch it -- the server
+        has no reliable proof that no live git process is still using
+        it (round-2 cert showed `fcntl.flock` does not detect git's
+        actual ``O_CREAT|O_EXCL`` locking). Return a response with the
+        exact manual command the operator can run, plus the inventory of
+        any other lock files so they can investigate. The frontend then
+        surfaces a copyable ``rm`` line and a "I've removed the lock --
+        try update again" button that re-invokes this endpoint, which
+        (now that the lock is gone) will take the success branch and
+        re-run the normal apply.
+    """
+    blocker_snapshot = _restart_blocker_snapshot()
+    if blocker_snapshot.get('restart_blocked'):
+        return _restart_blocked_response(target, blocker_snapshot)
+
+    if not _apply_lock.acquire(blocking=False):
+        return {'ok': False, 'message': 'Update already in progress'}
+
+    try:
+        if target == 'webui':
+            path = REPO_ROOT
+        elif target == 'agent':
+            path = _AGENT_DIR
+        else:
+            return {'ok': False, 'message': f'Unknown target: {target}'}
+
+        if path is None or not (path / '.git').exists():
+            return {'ok': False, 'message': 'Not a git repository'}
+
+        inv = _inventory_locks(path)
+        manual_command = f"rm -f {inv['well_known_lock_path']}"
+
+        if not inv['well_known_lock_present']:
+            # Lock is gone. Run the normal non-destructive update flow and
+            # annotate the response with what we found for the user's
+            # records. Pass the configured channel through — otherwise an
+            # experimental-channel WebUI lock-recovery retry silently falls back
+            # to stable (Codex gate: _apply_update_inner defaults to stable).
+            with _cache_lock:
+                _update_cache['checked_at'] = 0
+            retry_result = _apply_update_inner(target, _read_update_channel())
+            retry_result = dict(retry_result)
+            retry_result['lock_recovery'] = {
+                'action': 'no-lock-found',
+                'manual_command': manual_command,
+                'other_locks': inv['other_locks'],
+            }
+            return retry_result
+
+        # Lock is present. The server cannot prove it's safe to delete;
+        # the only safe path is to ask the operator.
+        message = (
+            'A git lock file (.git/index.lock) is present. The server does '
+            'not delete locks automatically -- git uses O_CREAT|O_EXCL '
+            'locking, which cannot be detected with advisory probes. To '
+            'recover: confirm no other git process is running against '
+            f'this checkout, then run: {manual_command}  '
+            'Click "Retry update" once you have removed it.'
+        )
+        return {
+            'ok': False,
+            'message': message,
+            'lock_held': True,
+            'target': target,
+            'manual_command': manual_command,
+            'well_known_lock_path': inv['well_known_lock_path'],
+            'other_locks': inv['other_locks'],
+        }
+    finally:
+        _apply_lock.release()
+
+
+def _windows_git_from_registry():
+    """Best-effort resolve git.exe from the Git-for-Windows registry key.
+
+    Git for Windows records its install root at
+    ``HKLM\\SOFTWARE\\GitForWindows\\InstallPath`` (and the WOW6432Node mirror
+    for a 32-bit install on 64-bit Windows). ``git.exe`` lives under
+    ``<InstallPath>\\cmd\\git.exe``. This is the reliable way to find git when
+    it is installed but NOT on the launching process's PATH — e.g. the WebUI
+    server started from a venv python whose environment does not inherit the
+    interactive shell PATH, which otherwise degrades WEBUI_VERSION to
+    ``'unknown'`` and freezes the ``?v=`` static-asset cache-busting stamp.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return None
+    for hive, flag in (
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_CURRENT_USER, 0),
+    ):
+        try:
+            with winreg.OpenKey(
+                hive, r'SOFTWARE\GitForWindows', 0,
+                winreg.KEY_READ | flag,
+            ) as key:
+                install_path, _ = winreg.QueryValueEx(key, 'InstallPath')
+        except OSError:
+            continue
+        if not install_path:
+            continue
+        candidate = os.path.join(install_path, 'cmd', 'git.exe')
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _resolve_git_executable():
+    git_executable = shutil.which('git')
+    if git_executable:
+        return git_executable
+    if sys.platform == 'darwin' and os.path.exists('/usr/bin/git'):
+        return '/usr/bin/git'
+    if sys.platform == 'win32':
+        from_registry = _windows_git_from_registry()
+        if from_registry:
+            return from_registry
+        for candidate in (
+            os.path.expandvars(r'%ProgramFiles%\Git\cmd\git.exe'),
+            os.path.expandvars(r'%ProgramFiles(x86)%\Git\cmd\git.exe'),
+            os.path.expandvars(r'%LocalAppData%\Programs\Git\cmd\git.exe'),
+        ):
+            if candidate and os.path.exists(candidate):
+                return candidate
+    return None
 
 
 def _dirty_suffix(path: Path, timeout=1) -> str:
@@ -414,17 +650,102 @@ def _detect_default_branch(path):
     return 'master'
 
 
-def _release_tags(path):
-    """Return release tags newest-first, using the repo's version-sort order."""
-    out, ok = _run_git(['tag', '--list', 'v*', '--sort=-v:refname'], path)
+# ── Release channels ─────────────────────────────────────────────────────────
+# The self-updater tracks ONE of several release channels, selected in Settings
+# (``update_channel``). A channel is nothing more than *which glob of tags the
+# updater reads* on the single linear master line — no branches, no divergence,
+# so every hard-won ff-only guarantee (#2653/#2846/#3140) is preserved.
+#
+#   stable       -> 'v*'        promoted, soaked releases (the default). Same glob
+#                                the updater has always used — every existing
+#                                v0.51.N tag matches, so legacy installs and the
+#                                full existing test suite keep working unchanged.
+#   experimental -> 'exp-v*'    every release batch, tagged for testers who opt in.
+#
+# ``exp-v*`` deliberately does NOT match ``v*`` (exp tags start with 'e', not
+# 'v'): the two channels never leak into each other's tag list, and a legacy
+# install running the historical 'v*' glob never matches an exp tag, so it
+# auto-lands on the stable stream with zero action.
+DEFAULT_UPDATE_CHANNEL = 'stable'
+_CHANNEL_TAG_GLOBS = {
+    'stable': 'v*',
+    'experimental': 'exp-v*',
+}
+
+
+def _normalize_channel(channel) -> str:
+    """Return a known channel name, defaulting to stable for anything unknown."""
+    if isinstance(channel, str) and channel in _CHANNEL_TAG_GLOBS:
+        return channel
+    return DEFAULT_UPDATE_CHANNEL
+
+
+def _channel_tag_glob(channel) -> str:
+    """Return the ``git tag --list`` glob for the given channel."""
+    return _CHANNEL_TAG_GLOBS[_normalize_channel(channel)]
+
+
+def _read_update_channel() -> str:
+    """Read the configured update channel from settings (stable fallback).
+
+    Read lazily at request time — never baked at import — so a channel switch in
+    Settings takes effect on the next update check without a process restart.
+    """
+    try:
+        from api.config import load_settings
+        return _normalize_channel(load_settings().get('update_channel'))
+    except Exception:
+        return DEFAULT_UPDATE_CHANNEL
+
+
+def channel_version_badge(channel=None) -> str:
+    """Return a channel-scoped version string for the Settings display badge ONLY.
+
+    This is DELIBERATELY separate from ``WEBUI_VERSION``. ``WEBUI_VERSION`` is
+    load-bearing in exact-string-equality systems — asset cache-busting URLs, the
+    service-worker CACHE_NAME, the models-cache stamp, and the stale-client skew
+    banner — so it must stay channel-neutral and stable for the process lifetime.
+    Making it channel-dependent would falsely trip "hard refresh" banners and
+    spurious cache rebuilds on every channel flip. This helper is read at request
+    time purely to render ``WebUI: v0.52.47 · Experimental`` in Settings.
+
+    Returns the channel-matched ``git describe`` (e.g. ``v0.52.47`` on stable,
+    ``exp-v0.52.51`` on experimental), or falls back to ``WEBUI_VERSION`` when no
+    channel tag is reachable (fresh clone, Docker image without channel tags).
+    """
+    if channel is None:
+        channel = _read_update_channel()
+    channel = _normalize_channel(channel)
+    out, ok = _run_git(
+        ['describe', '--tags', '--always', '--match', _channel_tag_glob(channel)],
+        REPO_ROOT,
+    )
+    if ok and out:
+        return out + _dirty_suffix(REPO_ROOT)
+    return WEBUI_VERSION
+
+
+def _release_tags(path, channel=DEFAULT_UPDATE_CHANNEL):
+    """Return the channel's release tags newest-first, in version-sort order."""
+    glob = _channel_tag_glob(channel)
+    out, ok = _run_git(['tag', '--list', glob, '--sort=-v:refname'], path)
     if not (ok and out):
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _current_release_tag(path):
-    """Return the latest release tag reachable from HEAD, if one exists."""
-    out, ok = _run_git(['describe', '--tags', '--abbrev=0'], path)
+def _current_release_tag(path, channel=DEFAULT_UPDATE_CHANNEL):
+    """Return the latest channel release tag reachable from HEAD, if one exists.
+
+    MUST filter by the channel glob (``--match``): a commit tagged BOTH
+    ``v0.52.0`` and ``exp-v0.52.0`` describes as ``exp-v0.52.0`` (git prefers the
+    lexically-later tag), so an unfiltered ``describe`` would make stable-channel
+    math resolve to the experimental tag and fall through to the branch firehose.
+    """
+    out, ok = _run_git(
+        ['describe', '--tags', '--abbrev=0', '--match', _channel_tag_glob(channel)],
+        path,
+    )
     return out if ok and out else None
 
 
@@ -437,18 +758,25 @@ def _release_gap(tags, current, latest):
     return 1
 
 
-def _head_is_past_latest_tag(path, current_tag):
-    """Return True when HEAD has moved past the latest reachable release tag.
+def _head_is_past_latest_tag(path, current_tag, channel=DEFAULT_UPDATE_CHANNEL):
+    """Return True when HEAD has moved past the latest reachable channel tag.
 
-    `git describe --tags --always` returns the bare tag name (e.g. ``v2026.5.16``)
-    when HEAD is exactly on the tag, and a ``v2026.5.16-608-g1d22b9c2`` suffix
-    when HEAD has moved 608 commits past it. Used by both the update check and
-    the update apply path so they agree on which ref to advance to — see #2653
-    (check side) and #2846 (apply side).
+    `git describe --tags --always --match <glob>` returns the bare tag name
+    (e.g. ``v2026.5.16``) when HEAD is exactly on the tag, and a
+    ``v2026.5.16-608-g1d22b9c2`` suffix when HEAD has moved 608 commits past it.
+    Used by both the update check and the update apply path so they agree on
+    which ref to advance to — see #2653 (check side) and #2846 (apply side).
+
+    The ``--match`` filter is mandatory: without it, a HEAD sitting on a commit
+    that carries the other channel's tag would describe against that tag and
+    give a wrong past/at answer for THIS channel.
     """
     if not current_tag:
         return False
-    full_desc, ok = _run_git(['describe', '--tags', '--always'], path)
+    full_desc, ok = _run_git(
+        ['describe', '--tags', '--always', '--match', _channel_tag_glob(channel)],
+        path,
+    )
     return bool(ok and full_desc and full_desc != current_tag)
 
 
@@ -474,7 +802,7 @@ def _can_fast_forward_to(path, ref):
     return bool(ok)
 
 
-def _select_apply_compare_ref(path):
+def _select_apply_compare_ref(path, channel=DEFAULT_UPDATE_CHANNEL, target=None):
     """Return the same remote ref family that the update check reports.
 
     The update banner prefers published release tags when they exist. Applying
@@ -488,11 +816,24 @@ def _select_apply_compare_ref(path):
     decision — otherwise we run `git pull --ff-only <latest-tag>` against a
     checkout that's already past the tag, no-op, restart, and the banner
     re-appears with the same N commits available. See #2846.
+
+    CHANNEL SEMANTICS (webui only): the stable/experimental channels govern the
+    WebUI repo. For ``target == 'webui'`` on the ``stable`` channel, stable tags
+    are a *promoted subset* of master, so a stable install whose HEAD already
+    contains the latest stable tag but sits behind master's tip must NOT fall
+    through to the branch comparison (that would advance it to ``origin/master``
+    — the full experimental firehose, defeating the channel). We return ``None``
+    so the caller reports "no update". Every other case — the experimental
+    channel, and the AGENT repo (which is a separate project that legitimately
+    tracks master past its tags) — keeps the historical branch fallthrough
+    unchanged. This mirrors ``_check_repo_release``.
     """
-    tags = _release_tags(path)
+    channel = _normalize_channel(channel)
+    suppress_stable_fallthrough = (channel == 'stable' and target == 'webui')
+    tags = _release_tags(path, channel)
     if tags:
         latest_tag = tags[0]
-        current_tag = _current_release_tag(path)
+        current_tag = _current_release_tag(path, channel)
         behind = _release_gap(tags, current_tag, latest_tag)
         # Mirror the check side exactly: fall through to the branch comparison
         # whenever the checkout has already moved past the release tag that the
@@ -501,13 +842,18 @@ def _select_apply_compare_ref(path):
         # have behind > 0 after fetching a newer tag that HEAD already contains
         # (#3140). In both cases applying the tag would no-op, move backwards,
         # or fail fast-forward; branch comparison is the truthful update path.
+        # Short-circuit `or` preserves the original minimal git-call pattern.
         if (
-            behind == 0 and _head_is_past_latest_tag(path, current_tag)
-        ) or (
-            behind > 0 and _head_contains_ref(path, latest_tag)
-        ) or (
-            behind > 0 and not _can_fast_forward_to(path, latest_tag)
+            (behind == 0 and _head_is_past_latest_tag(path, current_tag, channel))
+            or (behind > 0 and _head_contains_ref(path, latest_tag))
+            or (behind > 0 and not _can_fast_forward_to(path, latest_tag))
         ):
+            # WebUI stable: "HEAD past/contains the latest stable tag" means
+            # up-to-date on the promoted subset — NOT a signal to advance to
+            # master. Return None so the caller reports no update.
+            if suppress_stable_fallthrough:
+                return None
+            # Experimental / agent: preserve the historical branch fallthrough.
             pass
         else:
             return latest_tag
@@ -520,14 +866,39 @@ def _select_apply_compare_ref(path):
     return f'origin/{branch}'
 
 
-def _check_repo_release(path, name):
-    """Check if a git repo is behind its latest published release tag."""
-    tags = _release_tags(path)
+def _channel_up_to_date_info(path, name, channel, current_tag):
+    """Return an 'up to date' payload for a channel that must NOT branch-compare.
+
+    Used by the stable channel: stable tags are a promoted subset of master, so
+    when HEAD already contains the latest stable tag we report up-to-date
+    (behind == 0) rather than falling through to the branch comparison, which
+    would advance the user onto the experimental firehose.
+    """
+    remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
+    remote_url = _normalize_remote_url(remote_url)
+    return {
+        'name': name,
+        'behind': 0,
+        'current_sha': current_tag,
+        'latest_sha': current_tag,
+        'branch': current_tag,
+        'repo_url': remote_url,
+        'release_based': True,
+        'current_version': current_tag,
+        'latest_version': current_tag,
+        'channel': channel,
+    }
+
+
+def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
+    """Check if a git repo is behind its latest published channel release tag."""
+    channel = _normalize_channel(channel)
+    tags = _release_tags(path, channel)
     if not tags:
         return None
 
     latest_tag = tags[0]
-    current_tag = _current_release_tag(path)
+    current_tag = _current_release_tag(path, channel)
     behind = _release_gap(tags, current_tag, latest_tag)
 
     # If behind == 0 but HEAD has moved past the tag (e.g. the agent repo
@@ -536,7 +907,16 @@ def _check_repo_release(path, name):
     # Fall through to _check_repo_branch so the real commit count is reported
     # instead. The same predicate is used by _select_apply_compare_ref so the
     # check and apply sides cannot drift again. See #2653 (check), #2846 (apply).
-    if behind == 0 and _head_is_past_latest_tag(path, current_tag):
+    #
+    # CHANNEL (webui only): for the WebUI repo on stable, stable tags are a
+    # promoted SUBSET of master, so "HEAD past the latest stable tag" means
+    # up-to-date on the promoted subset, NOT a signal to branch-compare against
+    # origin/master (the firehose). Report up-to-date. The AGENT repo and the
+    # experimental channel keep the historical fall-through.
+    suppress_stable_fallthrough = (channel == 'stable' and name == 'webui')
+    if behind == 0 and _head_is_past_latest_tag(path, current_tag, channel):
+        if suppress_stable_fallthrough:
+            return _channel_up_to_date_info(path, name, channel, current_tag)
         return None
 
     # Users tracking main can already contain the newest fetched release tag
@@ -545,12 +925,16 @@ def _check_repo_release(path, name):
     # Fall through to the branch check so the banner compares against the
     # configured upstream instead of advertising a tag that cannot fast-forward.
     if behind > 0 and _head_contains_ref(path, latest_tag):
+        if suppress_stable_fallthrough:
+            return _channel_up_to_date_info(path, name, channel, current_tag)
         return None
 
     # Patch releases can land on a side branch while day-to-day installs track
     # main past an older tag. A positive tag-name gap then advertises an update
     # that `git pull --ff-only <latest-tag>` cannot reach.
     if behind > 0 and not _can_fast_forward_to(path, latest_tag):
+        if suppress_stable_fallthrough:
+            return _channel_up_to_date_info(path, name, channel, current_tag)
         return None
 
     remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
@@ -568,6 +952,7 @@ def _check_repo_release(path, name):
         'release_based': True,
         'current_version': current_tag,
         'latest_version': latest_tag,
+        'channel': channel,
     }
 
 
@@ -642,10 +1027,26 @@ def _check_repo_branch(path, name, *, fetch=True):
     }
 
 
-def _check_repo(path, name):
-    """Check if a git repo is behind its latest release. Returns dict or None."""
+def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
+    """Check if a git repo is behind its latest release. Returns dict or None.
+
+    The returned dict (when not None) always carries a ``dirty: bool`` reflecting
+    the working-tree state vs HEAD. A dirty install at-or-past the latest release
+    tag used to silently report "Up to date" with no remediation affordance, so
+    the Settings panel reads this flag to offer ``apply_force_update`` (issue
+    #4085).
+
+    When ``.git`` is absent (Docker images, pip installs), returns a minimal dict
+    with ``no_git: True`` and ``behind: None`` so the frontend can distinguish
+    "can't check" from "up to date" (issue #4356).
+    """
+    channel = _normalize_channel(channel)
     if path is None or not (path / '.git').exists():
-        return None
+        return {
+            'name': name,
+            'behind': None,
+            'no_git': True,
+        }
 
     # Fetch tags first so update prompts track published releases, not every
     # development commit that lands on master/main after the latest release.
@@ -658,7 +1059,7 @@ def _check_repo(path, name):
     # See #2756.
     fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
-        release_info = _check_repo_release(path, name)
+        release_info = _check_repo_release(path, name, channel)
         message = 'fetch failed'
         if fetch_out:
             message = f'{message}: {_sanitize_git_diagnostic(fetch_out)}'
@@ -666,19 +1067,44 @@ def _check_repo(path, name):
             release_info = dict(release_info)
             release_info['error'] = message
             release_info['stale_check'] = True
+            release_info['dirty'] = _is_dirty(path)
             return release_info
         return {
             'name': name,
             'behind': None,
             'error': message,
             'stale_check': True,
+            'dirty': _is_dirty(path),
         }
 
-    release_info = _check_repo_release(path, name)
+    release_info = _check_repo_release(path, name, channel)
     if release_info is not None:
+        release_info = dict(release_info)
+        release_info['dirty'] = _is_dirty(path)
         return release_info
 
-    return _check_repo_branch(path, name, fetch=False)
+    branch_info = _check_repo_branch(path, name, fetch=False)
+    if branch_info is not None:
+        branch_info = dict(branch_info)
+        branch_info['dirty'] = _is_dirty(path)
+        branch_info['channel'] = channel
+        return branch_info
+    return None
+
+
+def _is_dirty(path: Path, timeout: int = 1) -> bool:
+    """Return True when the working tree has uncommitted changes vs HEAD.
+
+    Same primitive as ``_dirty_suffix`` (issue #4085): ``git diff-index
+    --quiet HEAD --`` exits 0 on a clean tree and 1 on a dirty tree (not an
+    error). Real errors (timeout, missing git, fatal) are conservatively
+    reported as clean so a transient probe failure never produces a false-
+    positive "local changes" alert.
+    """
+    out, ok = _run_git(['diff-index', '--quiet', 'HEAD', '--'], path, timeout=timeout)
+    if ok:
+        return False
+    return not out or out.startswith('git exited with status ')
 
 
 def _ignored_agent_update_info() -> dict:
@@ -686,31 +1112,70 @@ def _ignored_agent_update_info() -> dict:
     return {'name': 'agent', 'behind': 0, 'ignored': True}
 
 
-def check_for_updates(force=False, *, include_agent=True):
+def cached_update_status(*, include_agent=True, channel=None):
+    """Return cached update status without performing network or git mutations."""
+    include_agent = bool(include_agent)
+    if channel is None:
+        channel = _read_update_channel()
+    channel = _normalize_channel(channel)
+    with _cache_lock:
+        cached = dict(_update_cache)
+    # If the cache was populated for a different channel, it is not a valid
+    # answer for this channel — signal that so callers don't render stale
+    # cross-channel data as authoritative.
+    if cached.get('channel') != channel:
+        cached['channel'] = channel
+        cached['stale_channel'] = True
+    if cached.get('include_agent') != include_agent:
+        cached['include_agent'] = include_agent
+        if not include_agent:
+            cached['agent'] = _ignored_agent_update_info()
+    cached['cached'] = True
+    return cached
+
+
+def check_for_updates(force=False, *, include_agent=True, channel=None):
     """Return cached update status for webui and agent repos."""
     global _check_in_progress
     include_agent = bool(include_agent)
+    if channel is None:
+        channel = _read_update_channel()
+    channel = _normalize_channel(channel)
     with _cache_lock:
+        # Cache is only valid when BOTH the channel AND include_agent match —
+        # a channel switch must not serve the previous channel's answer, and an
+        # in-progress check for the other channel must not short-circuit this one
+        # with a stale cross-channel payload (Codex SILENT #5).
+        cache_matches = (
+            _update_cache.get('include_agent') == include_agent
+            and _update_cache.get('channel') == channel
+        )
         if (
             not force
-            and _update_cache.get('include_agent') == include_agent
+            and cache_matches
             and time.time() - _update_cache['checked_at'] < CACHE_TTL
         ):
             return dict(_update_cache)
-        if _check_in_progress:
-            return dict(_update_cache)  # another thread is already checking
+        if _check_in_progress and cache_matches:
+            return dict(_update_cache)  # another thread is already checking this channel
         _check_in_progress = True
 
     try:
         # Run checks outside the lock (network I/O)
-        webui_info = _check_repo(REPO_ROOT, 'webui')
-        agent_info = _check_repo(_AGENT_DIR, 'agent') if include_agent else _ignored_agent_update_info()
+        webui_info = _check_repo(REPO_ROOT, 'webui', channel)
+        # The update channel is a WebUI-only concept. The Agent is a separate
+        # project that tags plain v* and legitimately tracks master past its
+        # tags; it must ALWAYS use the default channel regardless of the user's
+        # WebUI channel selection. (Codex gate: passing 'experimental' here made
+        # the Agent ignore its v* tags and fall back to origin/master.)
+        agent_info = _check_repo(_AGENT_DIR, 'agent', DEFAULT_UPDATE_CHANNEL) if include_agent else _ignored_agent_update_info()
 
         with _cache_lock:
             _update_cache['webui'] = webui_info
             _update_cache['agent'] = agent_info
             _update_cache['checked_at'] = time.time()
             _update_cache['include_agent'] = include_agent
+            _update_cache['channel'] = channel
             return dict(_update_cache)
     finally:
         _check_in_progress = False
@@ -1012,6 +1477,34 @@ def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | 
 # ── Self-update application ───────────────────────────────────────────────────
 
 
+def _purge_agent_pycache(repo_dir: Path) -> None:
+    """Delete all __pycache__ dirs under *repo_dir* so the next import
+    recompiles from source, avoiding stale-bytecode errors after git pull.
+
+    ``os.execv()`` replaces the process image but does not touch the
+    on-disk bytecode cache.  When a ``git pull`` writes new ``.py`` files
+    whose mtime lands within the same second as the pre-existing ``.pyc``
+    files, CPython may trust the stale cache and serve an old class
+    definition.  The mismatch between cached class symbols and newly-imported
+    supporting modules causes ``AttributeError`` (e.g. a method added in
+    the same update is missing from the cached ``AIAgent`` class).
+
+    This is safe to call right before ``os.execv()`` because the current
+    process is about to be replaced — losing the bytecode cache is harmless
+    and forces a clean recompilation on the next startup.
+    """
+    if repo_dir is None or not repo_dir.exists():
+        return
+    try:
+        for pycache in repo_dir.rglob("__pycache__"):
+            try:
+                shutil.rmtree(pycache, ignore_errors=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _schedule_restart(delay: float = 2.0) -> None:
     """Re-exec this process after *delay* seconds.
 
@@ -1048,17 +1541,127 @@ def _schedule_restart(delay: float = 2.0) -> None:
         # released atomically by the kernel.
         with _apply_lock:
             _wait_until_restart_safe()
+            # Purge bytecode caches so the new process imports from
+            # current source.  Without this, Python may serve stale .pyc
+            # files whose mtime matches the just-pulled .py files,
+            # causing AttributeError when new methods are missing from
+            # cached class definitions.
+            if _AGENT_DIR is not None:
+                _purge_agent_pycache(Path(_AGENT_DIR))
+            _purge_agent_pycache(REPO_ROOT)
             try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                # Re-exec into the just-pulled image.
+                #
+                # sys.argv[0]'s meaning depends on how the server was launched:
+                #
+                #   * Source checkout (`python server.py` via bootstrap.py /
+                #     ctl.sh / start.sh): sys.argv[0] is the SCRIPT path
+                #     (e.g. "/root/hermes-webui/server.py"), sys.executable is
+                #     the interpreter. CPython treats argv[1] as the script to
+                #     run, so we must pass [sys.executable] + sys.argv.
+                #
+                #   * Frozen/packaged build (PyInstaller, embedded zipapp,
+                #     etc.): sys.argv[0] == sys.executable == <binary>. Passing
+                #     [sys.executable] + sys.argv would re-insert the binary as
+                #     argv[1] — the kernel launches it, the interpreter treats
+                #     the binary itself as the "script" to run, and execv
+                #     effectively becomes a recursive no-op that never reaches
+                #     bind(), leaving the WebUI stuck "offline" after every
+                #     self-update. Pass argv as-is instead.
+                #
+                # Distinguish the two cases with sys.frozen (set by
+                # PyInstaller / zipapp / similar). For source checkouts the
+                # `[sys.executable] + sys.argv` form is the canonical CPython
+                # re-exec idiom (same shape Flask/Django reloaders use) and
+                # is the correct path.
+                #
+                # IMPORTANT: On Windows, os.execv() does NOT replace the
+                # current process — it spawns a new process while the old
+                # one keeps running.  This causes "address already in use"
+                # because the old process still holds the port.  On Windows
+                # we use subprocess.Popen() + os._exit() instead.
+                if sys.platform == 'win32':
+                    import subprocess
+                    if getattr(sys, "frozen", False):
+                        args = sys.argv
+                    else:
+                        args = [sys.executable] + sys.argv
+                    # Prefer pythonw.exe over python.exe so the restarted
+                    # server does not create a visible console window.
+                    # sys.executable may point at python.exe (console
+                    # subsystem); substitute pythonw.exe if it exists
+                    # next to python.exe.
+                    _exe = sys.executable
+                    if _exe.lower().endswith('python.exe'):
+                        _w_exe = _exe[:-4] + 'w.exe'  # python.exe -> pythonw.exe
+                        if os.path.isfile(_w_exe):
+                            if getattr(sys, "frozen", False):
+                                args = sys.argv
+                            else:
+                                args = [_w_exe] + sys.argv
+                    # Start new process fully detached with NO console
+                    # window.  DETACHED_PROCESS alone is not sufficient
+                    # on modern Windows — without CREATE_NO_WINDOW a
+                    # python.exe (console-subsystem) child still flashes
+                    # an empty terminal window, which the user then
+                    # manually kills (taking the WebUI with it).
+                    subprocess.Popen(
+                        args,
+                        cwd=os.getcwd(),
+                        creationflags=(
+                            subprocess.DETACHED_PROCESS
+                            | subprocess.CREATE_NEW_PROCESS_GROUP
+                            | subprocess.CREATE_NO_WINDOW
+                        ),
+                        close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    # Exit immediately — the port is released as soon as
+                    # this process dies, allowing the new process to bind.
+                    os._exit(0)
+                else:
+                    if getattr(sys, "frozen", False):
+                        os.execv(sys.executable, sys.argv)
+                    else:
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
-                # Last-resort: if execv fails (e.g. frozen binary), just exit
-                # so the process supervisor (start.sh / Docker) restarts us.
+                # Last-resort: if execv fails for any reason, just exit so the
+                # process supervisor (start.sh / Docker) restarts us.
                 os._exit(0)
 
     threading.Thread(target=_do, daemon=True).start()
 
 
-def apply_force_update(target: str) -> dict:
+def _ensure_gateway_restart_for_agent_update() -> tuple[bool, dict]:
+    """Run the active-profile gateway restart when agent checkout changed.
+
+    Returns:
+        (ok, restart_payload) where:
+        - ok is False when restart did not complete and callers must abort success.
+        - restart_payload contains helper status fields for response shaping.
+    """
+    restart_result = restart_active_profile_gateway()
+    status = str(restart_result.get("status") or "")
+    if status in {"completed", "in_progress"}:
+        return True, restart_result
+    return False, restart_result
+
+
+def _agent_gateway_restart_failure_message(target: str, restart_result: dict) -> str:
+    if restart_result.get("message"):
+        return (
+            f'{target} updated, but gateway restart did not complete: '
+            f'{restart_result["message"]}. Run `hermes gateway restart` manually.'
+        )
+    return (
+        f'{target} updated, but gateway restart did not complete. '
+        'Run `hermes gateway restart` manually.'
+    )
+
+
+def apply_force_update(target: str, channel=None) -> dict:
     """Force-reset the target repo to the latest remote HEAD.
 
     Unlike apply_update() which requires a clean working tree and refuses
@@ -1069,7 +1672,17 @@ def apply_force_update(target: str) -> dict:
     Should only be called when apply_update() has already returned a
     response with ``conflict: True`` or ``diverged: True`` and the user
     has confirmed they want to discard local changes.
+
+    CHANNEL SAFETY (rewind guard): ``reset --hard`` is destructive. When the
+    selected channel resolves to a ref that is an ANCESTOR of HEAD (i.e. the
+    checkout is already ahead of the channel — e.g. an ex-experimental install
+    switching back to stable), resetting to it would REWIND code and on-disk
+    state. We refuse and return a clear message instead of silently downgrading.
+    A deliberate rollback would be a separate, explicit feature.
     """
+    if channel is None:
+        channel = _read_update_channel()
+    channel = _normalize_channel(channel)
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
         return _restart_blocked_response(target, blocker_snapshot)
@@ -1081,26 +1694,89 @@ def apply_force_update(target: str) -> dict:
             path = REPO_ROOT
         elif target == 'agent':
             path = _AGENT_DIR
+            # Channel is WebUI-only — the Agent always uses the default channel.
+            channel = DEFAULT_UPDATE_CHANNEL
         else:
             return {'ok': False, 'message': f'Unknown target: {target}'}
 
         if path is None or not (path / '.git').exists():
             return {'ok': False, 'message': 'Not a git repository'}
 
+        # NOTE: v2 of PR #5688 removed the prior stale-lock cleanup loop from
+        # this entry point. The mtime-based heuristic was empirically proven
+        # unsafe (a live `git add` was shown to hold .git/index.lock past 31 s
+        # with unchanged mtime) and unconditional pre-cleanup clobbered locks
+        # for force-update retries that had nothing to do with a lock error.
+        # Lock cleanup is now ONLY performed by the explicit
+        # /api/updates/clear_lock endpoint, where the user has opted in to
+        # a non-destructive retry.
+
         # --force so a remote re-tag (e.g. squash-merge that re-points an
         # existing release tag) doesn't jam the apply path with "would clobber
         # existing tag". See #2756.
-        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
+        fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
         if not fetch_ok:
             return {
                 'ok': False,
-                'message': 'Could not reach the remote repository. Check your connection.',
+                'message': _apply_fetch_failure_message(
+                    fetch_out,
+                    'Could not reach the remote repository. Check your connection.',
+                ),
             }
 
-        compare_ref = _select_apply_compare_ref(path)
+        compare_ref = _select_apply_compare_ref(path, channel, target)
+        # Stable channel, already up to date on the promoted subset: nothing to
+        # force to. Do NOT fall back to origin/master (firehose). See
+        # _select_apply_compare_ref channel semantics.
+        if compare_ref is None:
+            return {
+                'ok': True,
+                'message': f'{target} is already up to date on the {channel} channel.',
+                'target': target,
+                'up_to_date': True,
+                'channel': channel,
+            }
 
-        # Discard local modifications then reset to remote HEAD
+        # Rewind guard (Codex CORE #3): refuse to reset --hard onto a ref that
+        # is an ANCESTOR of HEAD — that would downgrade the checkout. This is the
+        # switch-back-to-stable-while-ahead case. A ref that is a descendant of
+        # HEAD (normal update / opt-in to experimental) fast-forwards fine and is
+        # allowed. Refs on a divergent line (neither ancestor nor descendant) are
+        # the legitimate force-update case (conflict/diverged recovery) and are
+        # also allowed — the guard fires ONLY on a pure-ancestor rewind.
+        if _head_contains_ref(path, compare_ref) and not _can_fast_forward_to(path, compare_ref):
+            return {
+                'ok': False,
+                'message': (
+                    f'{target} is already ahead of the {channel} channel '
+                    f'({compare_ref}); refusing to rewind the checkout. '
+                    'Switching to a slower channel keeps your current version '
+                    'until that channel catches up.'
+                ),
+                'target': target,
+                'channel': channel,
+                'refused_rewind': True,
+            }
+        # Discard local modifications and untracked colliders before resetting.
+        # Do not use -x: ignored build/cache artifacts should survive force update.
         _run_git(['checkout', '.'], path)
+        # Best-effort clean: a `git clean -fd` failure is NOT fatal. The
+        # following `reset --hard` overwrites any tracked-file collisions
+        # regardless, and residual untracked files that git can't delete are
+        # harmless. In particular, on Windows a file named after a reserved
+        # device name (nul, con, prn, aux, com1-9, lpt1-9) — which can appear
+        # in the working tree when a shell command redirects to `> nul` under
+        # Git Bash — cannot be removed via the normal Win32 path that git uses,
+        # so `clean` exits non-zero. Aborting the whole force update over that
+        # left users stuck (issue #4914). Log the stderr for diagnostics and
+        # proceed to the reset, which is what actually applies the update.
+        clean_out, clean_ok = _run_git(['clean', '-fd'], path)
+        if not clean_ok:
+            logger.warning(
+                'force_apply_update: `git clean -fd` failed (non-fatal, '
+                'continuing to reset --hard): %s',
+                clean_out,
+            )
         _, ok = _run_git(['reset', '--hard', compare_ref], path)
         if not ok:
             return {'ok': False, 'message': f'Force reset to {compare_ref} failed'}
@@ -1108,20 +1784,36 @@ def apply_force_update(target: str) -> dict:
         with _cache_lock:
             _update_cache['checked_at'] = 0
 
+        if target == 'agent':
+            gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+            if not gateway_ok:
+                return {
+                    'ok': False,
+                    'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                    'target': target,
+                    'gateway_restart': gateway_result.get('status'),
+                }
+
         _schedule_restart()
 
-        return {
+        response = {
             'ok': True,
             'message': f'{target} force-updated to {compare_ref}',
             'target': target,
             'restart_scheduled': True,
         }
+        if target == 'agent':
+            response['gateway_restart'] = gateway_result.get('status')
+        return response
     finally:
         _apply_lock.release()
 
 
-def apply_update(target):
+def apply_update(target, channel=None):
     """Stash, pull --ff-only, pop for the given target repo."""
+    if channel is None:
+        channel = _read_update_channel()
+    channel = _normalize_channel(channel)
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
         return _restart_blocked_response(target, blocker_snapshot)
@@ -1129,17 +1821,56 @@ def apply_update(target):
     if not _apply_lock.acquire(blocking=False):
         return {'ok': False, 'message': 'Update already in progress'}
     try:
-        return _apply_update_inner(target)
+        return _apply_update_inner(target, channel)
     finally:
         _apply_lock.release()
 
 
-def _apply_update_inner(target):
+def _restore_stash_after_pull_failure(
+    target: str,
+    path: Path,
+    pull_out: str,
+) -> str:
+    """Best-effort re-apply of a stash pushed earlier in `_apply_update_inner`.
+
+    Called when `git pull` failed with a lock error and we had already pushed
+    a stash for the user's local modifications. Without this, the user's
+    modifications remain in git stash with the working tree clean -- the
+    wrong user experience because the failure was a lock conflict, not a
+    stash-apply conflict, and the stash should re-apply cleanly.
+
+    Returns a human-readable note for inclusion in the response message.
+    """
+    _, pop_ok = _run_git(['stash', 'pop'], path)
+    if pop_ok:
+        return ('Local modifications were restored from the temporary stash.')
+
+    # `git stash pop` failed -- could be that the working tree changed under
+    # us. Try apply + drop to keep the change separation explicit.
+    _, apply_ok = _run_git(['stash', 'apply'], path)
+    if apply_ok:
+        _, _ = _run_git(['stash', 'drop'], path)
+        return ('Local modifications were restored from the temporary stash.')
+
+    detail = (pull_out or '').strip()[:200]
+    return (
+        'Your local modifications could not be restored automatically '
+        f'(stash pop failed after pull error: {detail or "no detail"}). '
+        'They remain safely in `git stash list`; run `git -C '
+        + str(path) + ' stash pop` once the lock is cleared.'
+    )
+
+
+def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
     """Inner implementation of apply_update, called under _apply_lock."""
+    channel = _normalize_channel(channel)
     if target == 'webui':
         path = REPO_ROOT
     elif target == 'agent':
         path = _AGENT_DIR
+        # Channel is WebUI-only — the Agent always uses the default channel
+        # regardless of the user's WebUI selection (see check_for_updates).
+        channel = DEFAULT_UPDATE_CHANNEL
     else:
         return {'ok': False, 'message': f'Unknown target: {target}'}
 
@@ -1148,17 +1879,35 @@ def _apply_update_inner(target):
 
     # Fetch before attempting pull, so the remote ref is current.
     # --force so a remote re-tag doesn't block the update path (see #2756).
-    _, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
+    fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
     if not fetch_ok:
+        if _is_git_lock_error(fetch_out):
+            return {
+                'ok': False,
+                'message': f'Fetch failed due to a repository lock: {fetch_out.strip()}',
+                'lock_conflict': True,
+            }
         return {
             'ok': False,
-            'message': (
-                'Could not reach the remote repository. '
-                'Check your internet connection and try again.'
+            'message': _apply_fetch_failure_message(
+                fetch_out,
+                'Could not reach the remote repository. Check your internet connection and try again.',
             ),
         }
 
-    compare_ref = _select_apply_compare_ref(path)
+    compare_ref = _select_apply_compare_ref(path, channel, target)
+    # On the stable channel a None ref means HEAD already contains the latest
+    # promoted stable tag (up-to-date on the promoted subset). Do NOT fall back
+    # to origin/master — that would advance the user onto the experimental
+    # firehose. Report success/no-op instead. See _select_apply_compare_ref.
+    if compare_ref is None:
+        return {
+            'ok': True,
+            'message': f'{target} is already up to date on the {channel} channel.',
+            'target': target,
+            'up_to_date': True,
+            'channel': channel,
+        }
 
     # Check for dirty working tree (ignore untracked files — git stash
     # doesn't include them, so stashing on '??' alone leaves nothing to pop)
@@ -1166,6 +1915,12 @@ def _apply_update_inner(target):
         ['status', '--porcelain', '--untracked-files=no'], path
     )
     if not status_ok:
+        if _is_git_lock_error(status_out):
+            return {
+                'ok': False,
+                'message': f'Failed to inspect repo status due to a repository lock: {status_out.strip()}',
+                'lock_conflict': True,
+            }
         return {'ok': False, 'message': f'Failed to inspect repo status: {status_out[:200]}'}
     # Fail early on unresolved merge conflicts
     if any(line[:2] in {'DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'}
@@ -1182,7 +1937,7 @@ def _apply_update_inner(target):
         }
     stashed = False
     if status_out:
-        _, ok = _run_git(['stash'], path)
+        _, ok = _run_git(['stash', 'push', '-m', 'hermes-update-autostash'], path)
         if not ok:
             return {'ok': False, 'message': 'Failed to stash local changes'}
         stashed = True
@@ -1198,47 +1953,192 @@ def _apply_update_inner(target):
         pull_args.extend(['origin', compare_ref])
     pull_out, pull_ok = _run_git(pull_args, path, timeout=30)
     if not pull_ok:
-        if stashed:
-            _run_git(['stash', 'pop'], path)
-
-        # Diagnose the most common failure modes and surface actionable messages.
-        pull_lower = pull_out.lower()
-        if 'not possible to fast-forward' in pull_lower or 'diverged' in pull_lower:
+        if _is_git_lock_error(pull_out):
+            # Lock conflict during pull. If a stash was pushed for the local
+            # modifications, attempt to restore it before returning so the
+            # user's working tree is not silently left empty with changes
+            # stranded in the stash (Greptile P1 on PR #5688).
+            stash_recovery_note = ''
+            if stashed:
+                stash_recovery_note = _restore_stash_after_pull_failure(
+                    target, path, pull_out
+                )
+            message = f'Pull failed due to a repository lock: {pull_out.strip()}'
+            if stash_recovery_note:
+                message = f'{message} {stash_recovery_note}'
             return {
                 'ok': False,
-                'message': (
-                    f'The local {target} repo has commits that are not on the remote '
-                    'branch, so a fast-forward update is not possible. '
-                    'Run: git -C ' + str(path) + ' fetch origin && '
-                    'git -C ' + str(path) + ' reset --hard ' + compare_ref
-                ),
+                'message': message,
+                'lock_conflict': True,
+            }
+        pull_lower = pull_out.lower()
+        detail = pull_out.strip()[:300] if pull_out.strip() else '(no output from git)'
+        untracked_collision = (
+            'untracked working tree files would be overwritten' in pull_lower
+        )
+        diverged_failure = (
+            'not possible to fast-forward' in pull_lower or 'diverged' in pull_lower
+        )
+        restored_stash = False
+        stash_drop_failed = False
+        if stashed:
+            _, apply_ok = _run_git(['stash', 'apply'], path)
+            if apply_ok:
+                _, drop_ok = _run_git(['stash', 'drop'], path)
+                restored_stash = True
+                stash_drop_failed = not drop_ok
+            else:
+                _, reset_ok = _run_git(['reset', '--hard', 'HEAD'], path)
+                if not reset_ok:
+                    response = {
+                        'ok': False,
+                        'message': (
+                            'Pull failed, and failed to clean up a stash-apply '
+                            'conflict while restoring local changes. Manual '
+                            'intervention needed: run git -C ' + str(path) + ' '
+                            'reset --hard HEAD to remove conflict markers. Your '
+                            'changes remain in the git stash. Pull error: '
+                            + detail
+                        ),
+                        'stash_conflict': True,
+                    }
+                    if diverged_failure:
+                        response['diverged'] = True
+                    return response
+                response = {
+                    'ok': False,
+                    'message': (
+                        f'Pull failed, and your local {target} modifications '
+                        'conflicted while restoring from stash. The index and '
+                        'tracked files were restored to HEAD, and your changes '
+                        'remain in the git stash. To inspect: git -C ' + str(path) + ' stash show -p. '
+                        'To re-apply: git -C ' + str(path) + ' stash apply, then '
+                        'resolve conflicts. Pull error: ' + detail
+                    ),
+                    'stash_conflict': True,
+                }
+                if diverged_failure:
+                    response['diverged'] = True
+                return response
+
+        restored_note_parts = []
+        if restored_stash:
+            restored_note_parts.append(
+                f'Local {target} modifications were restored to the working '
+                'tree; save or stash them before running destructive recovery '
+                'commands.'
+            )
+            if stash_drop_failed:
+                restored_note_parts.append(
+                    'The temporary stash entry may still be present because '
+                    'git stash drop failed.'
+                )
+        restored_note = ' '.join(restored_note_parts)
+
+        # Diagnose the most common failure modes and surface actionable messages.
+        if diverged_failure:
+            message_parts = [
+                f'The local {target} repo has commits that are not on the remote '
+                'branch, so a fast-forward update is not possible.'
+            ]
+            if restored_note:
+                message_parts.append(restored_note)
+            message_parts.append(
+                'Run: git -C ' + str(path) + ' fetch origin && '
+                'git -C ' + str(path) + ' reset --hard ' + compare_ref
+            )
+            return {
+                'ok': False,
+                'message': ' '.join(message_parts),
                 'diverged': True,
             }
         if 'does not track' in pull_lower or 'no tracking information' in pull_lower:
+            message_parts = [
+                f'The local {target} branch has no upstream tracking branch configured.'
+            ]
+            if restored_note:
+                message_parts.append(restored_note)
+            message_parts.append(
+                'Run: git -C ' + str(path) + ' branch --set-upstream-to=' + compare_ref
+            )
             return {
                 'ok': False,
-                'message': (
-                    f'The local {target} branch has no upstream tracking branch configured. '
-                    'Run: git -C ' + str(path) + ' branch --set-upstream-to=' + compare_ref
-                ),
+                'message': ' '.join(message_parts),
             }
         # Generic fallback — include the raw git output for debugging.
-        detail = pull_out.strip()[:300] if pull_out.strip() else '(no output from git)'
-        return {'ok': False, 'message': f'Pull failed: {detail}'}
+        message_parts = [f'Pull failed: {detail}']
+        if restored_note:
+            message_parts.append(restored_note)
+        response = {'ok': False, 'message': ' '.join(message_parts)}
+        if untracked_collision:
+            response['conflict'] = True
+        return response
 
-    # Pop stash if we stashed
+    # Re-apply stash if we stashed.
+    stash_drop_failed = False
     if stashed:
-        _, pop_ok = _run_git(['stash', 'pop'], path)
-        if not pop_ok:
-            return {
-                'ok': False,
-                'message': 'Updated but stash pop failed -- manual merge needed',
+        _, apply_ok = _run_git(['stash', 'apply'], path)
+        if apply_ok:
+            _, drop_ok = _run_git(['stash', 'drop'], path)
+            stash_drop_failed = not drop_ok
+        else:
+            _, reset_ok = _run_git(['reset', '--hard', 'HEAD'], path)
+            if not reset_ok:
+                return {
+                    'ok': False,
+                    'message': (
+                        'Updated successfully, but failed to clean up a '
+                        'stash-apply conflict. Manual intervention needed: '
+                        'run git -C ' + str(path) + ' reset --hard HEAD to '
+                        'remove conflict markers. Your changes remain in the '
+                        'git stash.'
+                    ),
+                    'stash_conflict': True,
+                }
+            with _cache_lock:
+                _update_cache['checked_at'] = 0
+
+            if target == 'agent':
+                gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+                if not gateway_ok:
+                    return {
+                        'ok': False,
+                        'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                        'target': target,
+                        'gateway_restart': gateway_result.get('status'),
+                    }
+            _schedule_restart()
+            response = {
+                'ok': True,
+                'message': (
+                    f'{target} updated to the latest version. Your local '
+                    'modifications conflicted with upstream changes and were '
+                    'set aside in a git stash. To inspect: '
+                    'git -C ' + str(path) + ' stash show -p. To re-apply: '
+                    'git -C ' + str(path) + ' stash apply, then resolve '
+                    'conflicts. Drop the stash after you are satisfied.'
+                ),
+                'target': target,
+                'restart_scheduled': True,
                 'stash_conflict': True,
             }
+            if target == 'agent':
+                response['gateway_restart'] = gateway_result.get('status')
+            return response
 
     # Invalidate cache
     with _cache_lock:
         _update_cache['checked_at'] = 0
+
+    if target == 'agent':
+        gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+        if not gateway_ok:
+            return {
+                'ok': False,
+                'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                'target': target,
+                'gateway_restart': gateway_result.get('status'),
+            }
 
     # Schedule a self-restart so the updated code is loaded fresh.  A plain
     # git pull leaves stale Python modules in sys.modules — agent imports that
@@ -1252,10 +2152,19 @@ def _apply_update_inner(target):
     # setTimeout(() => location.reload(), 1500) on success, so the page reload
     # and the restart land at roughly the same time.
     _schedule_restart()
+    message = f'{target} updated successfully'
+    if stash_drop_failed:
+        message += (
+            '. Local modifications were restored, but the temporary stash '
+            'entry may still be present because git stash drop failed.'
+        )
 
-    return {
+    response = {
         'ok': True,
-        'message': f'{target} updated successfully',
+        'message': message,
         'target': target,
         'restart_scheduled': True,
     }
+    if target == 'agent':
+        response['gateway_restart'] = gateway_result.get('status')
+    return response

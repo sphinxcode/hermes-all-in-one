@@ -23,6 +23,8 @@ REPO = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO.parent / ".hermes" / "hermes-agent"))
 
+from api.config import CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
+
 
 def read(rel):
     return (REPO / rel).read_text(encoding="utf-8")
@@ -171,6 +173,19 @@ class TestLiveModelsProviderNormalization:
         assert c._resolve_provider_alias(None) is None
 
 
+def test_shared_searchable_model_picker_helper_has_search_and_custom_controls():
+    src = read("static/ui.js")
+    m = re.search(r"function _mountSearchableModelSelect\(opts=\{\}\)\{.*?\n\}", src, re.DOTALL)
+    assert m, "_mountSearchableModelSelect helper not found in static/ui.js"
+    fn = m.group(0)
+    assert "model-search-input" in fn
+    assert "model-custom-input" in fn
+    assert "model-custom-btn" in fn
+    assert "onModelChange" in fn
+    assert "selectEl.selectedIndex=-1;" in fn
+    assert "onModelChange(lastListedValue);" in fn
+
+
 # ── api/routes.py — /api/models/live custom_providers fallback ────────────────
 
 class TestLiveModelsCustomProviderFallback:
@@ -245,7 +260,6 @@ class TestLiveModelsCustomProviderFallback:
             return True
         monkeypatch.setattr(r, "j", fake_j)
 
-        from urllib.parse import urlparse
         parsed = mock.MagicMock()
         parsed.query = "provider=custom"
 
@@ -366,10 +380,144 @@ class TestLiveModelsCustomProviderFallback:
             {
                 "url": "https://right.codes/codex/v1/models",
                 "authorization": "Bearer right-key",
-                "timeout": 8,
+                "timeout": CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
             }
         ]
         assert [m["id"] for m in resp["models"]] == ["right-live-model"]
+
+    def test_standard_provider_live_fetch_does_not_reuse_active_provider_key(self, monkeypatch):
+        """A requested provider must not receive another provider's top-level key."""
+        import urllib.request
+
+        requests = []
+
+        def fake_urlopen(req, timeout=None):
+            requests.append(
+                {
+                    "url": req.full_url,
+                    "authorization": req.headers.get("Authorization"),
+                    "timeout": timeout,
+                }
+            )
+            raise AssertionError("unexpected cross-provider live fetch")
+
+        cfg = {
+            "model": {
+                "provider": "openai",
+                "api_key": "active-provider-canary",
+            },
+            "providers": {"mistralai": {}},
+        }
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        resp = self._call_live_models(monkeypatch, cfg, "mistralai")
+
+        assert requests == []
+        assert resp["provider"] == "mistralai"
+        assert resp["models"], "static fallback models should still be returned"
+
+    def test_standard_provider_live_fetch_can_use_matching_top_level_key(self, monkeypatch):
+        """The active provider's top-level key remains valid for that same provider."""
+        import json
+        import urllib.request
+
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [{"id": "mistral-live-model"}]}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            requests.append(
+                {
+                    "url": req.full_url,
+                    "authorization": req.headers.get("Authorization"),
+                    "timeout": timeout,
+                }
+            )
+            return Response()
+
+        cfg = {
+            "model": {
+                "provider": "mistralai",
+                "api_key": "active-provider-canary",
+            },
+            "providers": {"mistralai": {}},
+        }
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        resp = self._call_live_models(monkeypatch, cfg, "mistralai")
+
+        assert requests == [
+            {
+                "url": "https://api.mistral.ai/v1/models",
+                "authorization": "Bearer active-provider-canary",
+                "timeout": 8,
+            }
+        ]
+        assert resp["provider"] == "mistralai"
+
+    def test_standard_provider_live_fetch_allows_matching_active_provider_alias(self, monkeypatch):
+        """Alias-equivalent active providers should still count as the same provider."""
+        import json
+        import urllib.request
+
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [{"id": "zai-live-model"}]}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            requests.append(
+                {
+                    "url": req.full_url,
+                    "authorization": req.headers.get("Authorization"),
+                    "timeout": timeout,
+                }
+            )
+            return Response()
+
+        cfg = {
+            "model": {
+                "provider": "z.ai",
+                "api_key": "active-provider-canary",
+            },
+            "providers": {"zai": {}},
+        }
+        import api.config as c
+        import api.routes as r
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(c, "get_config", lambda: cfg)
+        monkeypatch.setattr(r, "j", lambda _handler, payload, **_kw: payload)
+        self._install_provider_model_ids(monkeypatch, lambda _p: [])
+
+        parsed = mock.MagicMock()
+        parsed.query = "provider=zai"
+        r._clear_live_models_cache()
+        resp = r._handle_live_models(object(), parsed)
+
+        assert requests == [
+            {
+                "url": "https://api.z.ai/v1/models",
+                "authorization": "Bearer active-provider-canary",
+                "timeout": 8,
+            }
+        ]
+        assert resp["provider"] == "zai"
 
 
 # ── Regression: known-good providers still work ───────────────────────────────

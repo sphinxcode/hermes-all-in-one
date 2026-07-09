@@ -54,7 +54,9 @@ def test_deferred_model_resolution_refreshes_context_metadata():
     )
     assert "S.session.threshold_tokens" in block
     assert "_syncCtxIndicator" in block
-    assert "context_length:data.session.context_length||0" in block.replace(" ", "")
+    compact = block.replace(" ", "")
+    assert "constresolvedContextLength=data.session.context_length||S.session.context_length||0;" in compact
+    assert "context_length:resolvedContextLength||u.context_length||0" in compact
 
 
 def test_boot_does_not_block_session_restore_on_model_catalog():
@@ -62,9 +64,10 @@ def test_boot_does_not_block_session_restore_on_model_catalog():
 
     assert "if(s.default_model){" in src
     assert "window._defaultModel=s.default_model;" in src
-    assert "const _hydrateBootModelDropdown=()=>populateModelDropdown({preferProfileDefaultOnFreshBoot:true}).then" in src
+    assert "const _hydrateModelDropdown=({redirectIfUnauth=null}={})=>populateModelDropdown({" in src
     assert "window._modelDropdownReady=null;" in src
-    assert "window._ensureModelDropdownReady=_startBootModelDropdown;" in src
+    assert "window._startBootModelDropdown=_startBootModelDropdown;" in src
+    assert "window._ensureModelDropdownReady=_startModelDropdown;" in src
     assert "await populateModelDropdown()" not in src
 
 
@@ -78,7 +81,7 @@ def test_boot_primes_model_catalog_without_awaiting_it():
     """
     src = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
 
-    ensure_pos = src.index("window._ensureModelDropdownReady=_startBootModelDropdown;")
+    ensure_pos = src.index("window._ensureModelDropdownReady=_startModelDropdown;")
     prime_pos = src.index("Promise.resolve(_startBootModelDropdown()).catch(()=>{});", ensure_pos)
     session_restore_pos = src.index("await renderSessionList();", prime_pos)
 
@@ -98,18 +101,8 @@ def test_failed_boot_model_catalog_prime_is_retryable():
     src = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
     # #2726 parameterized the call: populateModelDropdown({preferProfileDefaultOnFreshBoot:true})
     # Match either signature shape — empty args (legacy) OR opts arg (post-#2726).
-    candidates = [
-        "const _hydrateBootModelDropdown=()=>populateModelDropdown().then",
-        "const _hydrateBootModelDropdown=()=>populateModelDropdown({preferProfileDefaultOnFreshBoot:true}).then",
-    ]
-    start = -1
-    for needle in candidates:
-        try:
-            start = src.index(needle)
-            break
-        except ValueError:
-            continue
-    assert start >= 0, "boot.js missing _hydrateBootModelDropdown wrapper around populateModelDropdown()"
+    needle = "const _hydrateModelDropdown=({redirectIfUnauth=null}={})=>populateModelDropdown({"
+    start = src.index(needle)
     end = src.index("const _startBootModelDropdown=()=>", start)
     block = src[start:end]
 

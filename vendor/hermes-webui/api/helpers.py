@@ -1,12 +1,16 @@
 """
 Hermes Web UI -- HTTP helper functions.
 """
+import functools
 import json as _json
+import logging
 import os
 import re as _re
 import ssl
 from pathlib import Path
 from api.config import IMAGE_EXTS, MD_EXTS
+
+logger = logging.getLogger(__name__)
 
 
 # Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
@@ -49,20 +53,135 @@ def safe_resolve(root: Path, requested: str) -> Path:
     return resolved
 
 
+_CSP_CONNECT_BASE = (
+    "'self' http://127.0.0.1:* http://localhost:* http://ipc.localhost "
+    "https://127.0.0.1:* https://localhost:* "
+    "ws://127.0.0.1:* ws://localhost:*"
+)
+_CSP_EXTRA_CONNECT_RE = _re.compile(
+    r"^(?:https?|wss?)://(?:\*\.)?[A-Za-z0-9._~-]+(?::(?P<port>\d{1,5}|\*))?$"
+)
+# Validator for an opt-in frame-src allowlist entry (HERMES_WEBUI_CSP_FRAME_EXTRA).
+# Only http(s) origins (optional wildcard subdomain + optional port) are accepted —
+# the same shape as the connect-extra validator minus the ws/wss schemes, since an
+# iframe src is always http(s).
+_CSP_EXTRA_FRAME_RE = _re.compile(
+    r"^https?://(?:\*\.)?[A-Za-z0-9._~-]+(?::(?P<port>\d{1,5}|\*))?$"
+)
+_CSP_HEADER_NAME = 'Content-Security-Policy'
+_CSP_SHARED_POLICY_TEMPLATE = (
+    "default-src 'self' https://*.cloudflareaccess.com; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:; "
+    "worker-src blob: 'self' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+    "img-src 'self' data: https: blob:; "
+    "font-src 'self' data: https://fonts.gstatic.com; "
+    "media-src 'self' data: blob:; "
+    "connect-src {connect_src}; "
+    "frame-src {frame_src}; "
+    "manifest-src 'self' https://*.cloudflareaccess.com; "
+    "base-uri 'self'; form-action 'self'"
+)
+# Base frame-src: same-origin only by default (so the existing same-origin
+# dashboard/extension iframes keep working). An operator can widen it, opt-in,
+# via HERMES_WEBUI_CSP_FRAME_EXTRA — e.g. to embed a self-hosted dashboard in an
+# extension tab. This governs what THIS page may embed; it does NOT affect
+# frame-ancestors (who may embed the WebUI), which stays 'none'.
+_CSP_FRAME_BASE = "'self'"
+
+
+def _valid_csp_extra_connect_source(source: str) -> bool:
+    match = _CSP_EXTRA_CONNECT_RE.fullmatch(source)
+    if not match:
+        return False
+    port = match.group("port")
+    if not port or port == "*":
+        return True
+    try:
+        return 1 <= int(port) <= 65535
+    except ValueError:
+        return False
+
+
+def _csp_extra_connect_src() -> str:
+    raw = os.getenv("HERMES_WEBUI_CSP_CONNECT_EXTRA", "").strip()
+    if not raw:
+        return ""
+    sources = raw.split()
+    if not sources or any(not _valid_csp_extra_connect_source(src) for src in sources):
+        logger.warning("Ignoring invalid HERMES_WEBUI_CSP_CONNECT_EXTRA value")
+        return ""
+    return " " + " ".join(sources)
+
+
+def _valid_csp_extra_frame_source(source: str) -> bool:
+    match = _CSP_EXTRA_FRAME_RE.fullmatch(source)
+    if not match:
+        return False
+    port = match.group("port")
+    if not port or port == "*":
+        return True
+    try:
+        return 1 <= int(port) <= 65535
+    except ValueError:
+        return False
+
+
+def _csp_extra_frame_src() -> str:
+    raw = os.getenv("HERMES_WEBUI_CSP_FRAME_EXTRA", "").strip()
+    if not raw:
+        return ""
+    sources = raw.split()
+    if not sources or any(not _valid_csp_extra_frame_source(src) for src in sources):
+        logger.warning("Ignoring invalid HERMES_WEBUI_CSP_FRAME_EXTRA value")
+        return ""
+    return " " + " ".join(sources)
+
+
+def _csp_connect_src(extra_connect_src: str = "") -> str:
+    return f"{_CSP_CONNECT_BASE} https://cdn.jsdelivr.net{extra_connect_src}"
+
+
+def _csp_frame_src(extra_frame_src: str = "") -> str:
+    return f"{_CSP_FRAME_BASE}{extra_frame_src}"
+
+
+def _build_csp_enforced_policy(
+    extra_connect_src: str | None = None,
+    extra_frame_src: str | None = None,
+) -> str:
+    if extra_connect_src is None:
+        extra_connect_src = _csp_extra_connect_src()
+    if extra_frame_src is None:
+        extra_frame_src = _csp_extra_frame_src()
+    return _CSP_SHARED_POLICY_TEMPLATE.format(
+        connect_src=_csp_connect_src(extra_connect_src),
+        frame_src=_csp_frame_src(extra_frame_src),
+    )
+
+
+def _build_csp_report_only_policy(
+    extra_connect_src: str | None = None,
+    extra_frame_src: str | None = None,
+) -> str:
+    return (
+        _build_csp_enforced_policy(extra_connect_src, extra_frame_src)
+        + "; report-uri /api/csp-report; report-to csp-endpoint"
+    )
+
+
 def _security_headers(handler):
     """Add security headers to every response."""
+    extra_connect_src = _csp_extra_connect_src()
+    extra_frame_src = _csp_extra_frame_src()
+    handler._csp_extra_connect_src = extra_connect_src
+    handler._csp_extra_frame_src = extra_frame_src
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('X-Frame-Options', 'DENY')
     handler.send_header('Referrer-Policy', 'same-origin')
-    handler.send_header(
-        'Content-Security-Policy',
-        "default-src 'self' https://*.cloudflareaccess.com; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
-        "img-src 'self' data: https: blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https://cdn.jsdelivr.net; "
-        "manifest-src 'self' https://*.cloudflareaccess.com; "
-        "base-uri 'self'; form-action 'self'"
-    )
+    handler.send_header(_CSP_HEADER_NAME, _build_csp_enforced_policy(extra_connect_src, extra_frame_src))
     handler.send_header(
         'Permissions-Policy',
         'camera=(), microphone=(self), geolocation=(), clipboard-write=(self)'
@@ -97,13 +216,26 @@ def _safe_write(handler, body: bytes) -> None:
         )
 
 
-def j(handler, payload, status: int=200, extra_headers: dict=None) -> None:
+def _json_response_body(payload, *, pretty: bool = True) -> bytes:
+    """Serialize API JSON responses.
+
+    Sidebar/session endpoints can return thousands of rows on large installs.
+    Pretty-printing large list responses inflates both CPU and wire bytes. Keep
+    the public helper default stable for existing tests/callers; hot paths can
+    opt into compact JSON with ``pretty=False``.
+    """
+    if pretty:
+        return _json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    return _json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+
+def j(handler, payload, status: int=200, extra_headers: dict=None, *, pretty: bool = True) -> None:
     """Send a JSON response.
 
     *extra_headers*: optional dict of additional headers to include
     (e.g., {'Set-Cookie': '...'}).  Headers are sent before end_headers().
     """
-    body = _json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+    body = _json_response_body(payload, pretty=pretty)
     handler.send_response(status)
     handler.send_header('Content-Type', 'application/json; charset=utf-8')
 
@@ -185,11 +317,15 @@ def _build_redact_fn():
         r"|brv_[A-Za-z0-9]{10,}"          # ByteRover API key
         r")(?![A-Za-z0-9_-])"
     )
-    _AUTH_HDR_RE = _re.compile(r"(Authorization:\s*Bearer\s+)(\S+)", _re.IGNORECASE)
+    _AUTH_HDR_RE = _re.compile(
+        r"""(Authorization:\s*(?:Bearer|Bot)\s+)([^\s'",\]\)]+)""",
+        _re.IGNORECASE,
+    )
     _ENV_RE = _re.compile(
         r"([A-Z0-9_]{0,50}(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]{0,50})"
         r"\s*=\s*(['\"]?)(\S+)\2"
     )
+
     _PRIVKEY_RE = _re.compile(
         r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
     )
@@ -197,14 +333,63 @@ def _build_redact_fn():
     def _mask(token: str) -> str:
         return f"{token[:6]}...{token[-4:]}" if len(token) >= 18 else "***"
 
+    def _env_replacement(match) -> str:
+        key, quote, value = match.group(1), match.group(2), match.group(3)
+        if not any(ch.isalnum() for ch in value):
+            return match.group(0)
+        return f"{key}={quote}{_mask(value)}{quote}"
+
+    _CODE_ENV_KEY_LITERAL_RE = _re.compile(
+        r"([A-Z0-9_]{0,50}(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]{0,50}=)([\"'][)\]:,]+|[)\]:,]+)"
+    )
+    _ENV_KEY_PREFIX_RE = _re.compile(
+        r"([A-Z0-9_]{0,50}(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Z0-9_]{0,50}=)"
+    )
+    _REDACTED_ENV_VALUE_RE = _re.compile(
+        r"(?:\*{3,}|[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,32}\.\.\.[A-Za-z0-9_.:/+-]{1,16})"
+    )
+
+    def _restore_code_env_key_literals(original: str, redacted: str) -> str:
+        if not isinstance(original, str) or not isinstance(redacted, str):
+            return redacted
+        literal_occurrences: dict[tuple[str, int], str] = {}
+        original_counts: dict[str, int] = {}
+        for match in _ENV_KEY_PREFIX_RE.finditer(original):
+            key_prefix = match.group(1)
+            occurrence = original_counts.get(key_prefix, 0)
+            original_counts[key_prefix] = occurrence + 1
+            literal_match = _CODE_ENV_KEY_LITERAL_RE.match(original, match.start())
+            if literal_match:
+                literal_occurrences[(key_prefix, occurrence)] = literal_match.group(2)
+        if not literal_occurrences:
+            return redacted
+        redacted_counts: dict[str, int] = {}
+        pieces = []
+        last = 0
+        for match in _ENV_KEY_PREFIX_RE.finditer(redacted):
+            key_prefix = match.group(1)
+            occurrence = redacted_counts.get(key_prefix, 0)
+            redacted_counts[key_prefix] = occurrence + 1
+            literal_suffix = literal_occurrences.get((key_prefix, occurrence))
+            if literal_suffix is None:
+                continue
+            value_match = _REDACTED_ENV_VALUE_RE.match(redacted, match.end())
+            if not value_match:
+                continue
+            pieces.append(redacted[last:value_match.start()])
+            pieces.append(literal_suffix)
+            last = value_match.end()
+        if not pieces:
+            return redacted
+        pieces.append(redacted[last:])
+        return "".join(pieces)
+
     def _fallback_redact(text: str) -> str:
         if not isinstance(text, str) or not text:
             return text
         text = _CRED_RE.sub(lambda m: _mask(m.group(1)), text)
         text = _AUTH_HDR_RE.sub(lambda m: m.group(1) + _mask(m.group(2)), text)
-        text = _ENV_RE.sub(
-            lambda m: f"{m.group(1)}={m.group(2)}{_mask(m.group(3))}{m.group(2)}", text
-        )
+        text = _ENV_RE.sub(_env_replacement, text)
         text = _PRIVKEY_RE.sub("[REDACTED PRIVATE KEY]", text)
         return text
 
@@ -226,12 +411,31 @@ def _build_redact_fn():
         except TypeError:
             # Older hermes-agent builds that predate the force kwarg.
             agent_redacted = redact_sensitive_text(text)
+        agent_redacted = _restore_code_env_key_literals(text, agent_redacted)
         return _fallback_redact(agent_redacted)
 
     return _combined_redact
 
 
-_redact_fn_cached = _build_redact_fn()
+_redact_fn_uncached = _build_redact_fn()
+
+# Repeated dashboard polls re-request the same unchanged session payloads, so
+# the combined redactor (~15 regex passes per string) was the dominant CPU cost
+# under concurrent polling — enough to wedge the single-process server behind
+# the GIL and surface as "Mất kết nối" in the browser. The redactor is pure and
+# deterministic (force=True, fixed masking), so identical strings always map to
+# identical output and are safe to memoize without invalidation.
+_redact_fn_lru = functools.lru_cache(maxsize=4096)(_redact_fn_uncached)
+
+# Cap per-entry size so a handful of giant tool-output dumps can't evict the
+# thousands of small recurring strings that actually benefit, or balloon RSS.
+_REDACT_CACHE_MAX_TEXT_LEN = 16384
+
+
+def _redact_fn_cached(text):
+    if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
+        return _redact_fn_uncached(text)
+    return _redact_fn_lru(text)
 
 
 _SENSITIVE_CASE_MARKERS = (
@@ -279,6 +483,7 @@ _SENSITIVE_CASE_MARKERS = (
 )
 _SENSITIVE_LOWER_MARKERS = (
     "authorization: bearer ",
+    "authorization: bot ",
     "private key",
     "postgres://",
     "postgresql://",
@@ -367,9 +572,10 @@ def _redact_value(v, *, _enabled: bool | None = None):
 
 
 def redact_session_data(session_dict: dict) -> dict:
-    """Redact credentials from message content and tool_call data before API response.
+    """Redact credentials from message content, tool data, and session sidecars.
 
-    Applies to: messages[], tool_calls[], and title.
+    Applies to: messages[], tool_calls[], todo_state, runtime_journal_snapshot,
+    and title.
     The underlying session file is not modified; redaction is response-layer only.
 
     Reads the ``api_redact_enabled`` setting ONCE for the entire response and
@@ -387,6 +593,13 @@ def redact_session_data(session_dict: dict) -> dict:
         result['messages'] = _redact_value(result['messages'], _enabled=_enabled)
     if 'tool_calls' in result:
         result['tool_calls'] = _redact_value(result['tool_calls'], _enabled=_enabled)
+    if 'todo_state' in result:
+        result['todo_state'] = _redact_value(result['todo_state'], _enabled=_enabled)
+    if 'runtime_journal_snapshot' in result:
+        result['runtime_journal_snapshot'] = _redact_value(
+            result['runtime_journal_snapshot'],
+            _enabled=_enabled,
+        )
     return result
 
 
@@ -423,15 +636,47 @@ def read_body(handler) -> dict:
 # ── Profile cookie helpers (issue #798) ─────────────────────────────────────
 
 PROFILE_COOKIE_NAME = 'hermes_profile'
+_PROFILE_COOKIE_ENV = 'HERMES_WEBUI_PROFILE_COOKIE_NAME'
+_LEGACY_PROFILE_COOKIE_ENV = 'WEBUI_PROFILE_COOKIE_NAME'
+_legacy_profile_cookie_warned = False
 
 
 def get_profile_cookie_name() -> str:
-    """Return the cookie name used to persist the active WebUI profile."""
-    return os.getenv('WEBUI_PROFILE_COOKIE_NAME', PROFILE_COOKIE_NAME)
+    """Return the cookie name used to persist the active WebUI profile.
+
+    Honours ``HERMES_WEBUI_PROFILE_COOKIE_NAME`` so multiple WebUI instances
+    sharing a hostname (different ports) can use distinct profile-cookie names
+    instead of trampling each other; browsers scope cookies by host, not
+    host+port (RFC 6265). The original ``WEBUI_PROFILE_COOKIE_NAME`` is still
+    honoured as a deprecated fallback (warned once per process, since this is
+    called on every request).
+    """
+    name = os.getenv(_PROFILE_COOKIE_ENV, '').strip()
+    if name:
+        return name
+    legacy = os.getenv(_LEGACY_PROFILE_COOKIE_ENV, '').strip()
+    if legacy:
+        global _legacy_profile_cookie_warned
+        if not _legacy_profile_cookie_warned:
+            logger.warning(
+                '%s is deprecated; use %s instead.',
+                _LEGACY_PROFILE_COOKIE_ENV,
+                _PROFILE_COOKIE_ENV,
+            )
+            _legacy_profile_cookie_warned = True
+        return legacy
+    return PROFILE_COOKIE_NAME
 
 
 def get_profile_cookie(handler) -> str | None:
-    """Extract the active-profile cookie value from the request, or None."""
+    """Extract and authenticate the active-profile cookie value.
+
+    When WebUI auth is enabled, the profile cookie is treated as an
+    authorization input for profile-scoped routes. Require it to be signed for
+    the current auth session so clients cannot forge ``hermes_profile`` to
+    impersonate another profile. In no-auth deployments, keep the historical
+    plain profile-name cookie behavior.
+    """
     cookie_header = handler.headers.get('Cookie', '')
     if not cookie_header:
         return None
@@ -443,16 +688,30 @@ def get_profile_cookie(handler) -> str | None:
         return None
     cookie_name = get_profile_cookie_name()
     morsel = cookie.get(cookie_name)
-    if morsel and morsel.value:
-        # Validate against profile-name pattern before trusting
-        from api.profiles import _PROFILE_ID_RE
-        val = morsel.value
-        if val == 'default' or _PROFILE_ID_RE.fullmatch(val):
-            return val
-    return None
+    if not (morsel and morsel.value):
+        return None
+
+    from api.profiles import _PROFILE_ID_RE
+
+    def _valid_profile_name(val: str) -> bool:
+        return val == 'default' or bool(_PROFILE_ID_RE.fullmatch(val))
+
+    raw_val = morsel.value
+    try:
+        from api.auth import is_auth_enabled, parse_cookie, verify_profile_cookie_value
+        if is_auth_enabled():
+            val = verify_profile_cookie_value(raw_val, parse_cookie(handler))
+            return val if val and _valid_profile_name(val) else None
+    except Exception:
+        logger.warning("Failed to verify active profile cookie", exc_info=True)
+        return None
+
+    # No-auth mode: the cookie is a per-browser UI preference, not an authz
+    # boundary, so retain the legacy plain profile-name format.
+    return raw_val if _valid_profile_name(raw_val) else None
 
 
-def build_profile_cookie(name: str) -> str:
+def build_profile_cookie(name: str, handler=None) -> str:
     """Build a Set-Cookie header value for the active-profile cookie.
 
     Always persist the selected profile in the cookie, including 'default'.
@@ -467,7 +726,27 @@ def build_profile_cookie(name: str) -> str:
     import http.cookies as _hc
     cookie = _hc.SimpleCookie()
     cookie_name = get_profile_cookie_name()
-    cookie[cookie_name] = name
+    value = name
+    # Guard against a future call site silently emitting an UNSIGNED profile
+    # cookie while auth is enabled (which a client could then... not forge, but
+    # it would weaken the binding). If auth is on we require a handler so the
+    # cookie is bound to the session. (#4023 Opus hardening.)
+    try:
+        from api.auth import is_auth_enabled
+        _auth_on = is_auth_enabled()
+    except Exception:
+        _auth_on = False
+    if _auth_on and handler is None:
+        raise RuntimeError("build_profile_cookie requires a request handler when auth is enabled (to bind the profile cookie to the session)")
+    if handler is not None:
+        try:
+            from api.auth import is_auth_enabled, parse_cookie, sign_profile_cookie_value
+            if is_auth_enabled():
+                value = sign_profile_cookie_value(name, parse_cookie(handler))
+        except Exception as exc:
+            logger.warning("Failed to sign active profile cookie", exc_info=True)
+            raise RuntimeError("could not sign active profile cookie") from exc
+    cookie[cookie_name] = value
     cookie[cookie_name]['path'] = '/'
     cookie[cookie_name]['httponly'] = True
     cookie[cookie_name]['samesite'] = 'Lax'

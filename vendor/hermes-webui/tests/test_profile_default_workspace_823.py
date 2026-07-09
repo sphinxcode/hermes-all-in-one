@@ -48,18 +48,18 @@ class TestProfileDefaultWorkspacePersistence:
         )
 
     def test_new_session_still_inherits_default_workspace(self):
-        """newSession must still pass a workspace to /api/session/new —
-        now via the _profileSwitchWorkspace → current session → _profileDefaultWorkspace chain."""
+        """newSession must still pass a workspace to /api/session/new,
+        now via the _profileSwitchWorkspace -> _profileDefaultWorkspace -> current session chain."""
         src = read('static/sessions.js')
         m = re.search(r'async function newSession\(.*?\n\}', src, re.DOTALL)
         assert m
         fn = m.group(0)
         # inheritWs must be computed and passed to /api/session/new
         assert 'inheritWs' in fn or 'inherit' in fn.lower(), (
-            "newSession must compute an inheritWs from switch/current/default workspace"
+            "newSession must compute an inheritWs from switch/default/current workspace"
         )
         assert '_profileDefaultWorkspace' in fn, (
-            "newSession must fall through to S._profileDefaultWorkspace as last resort"
+            "newSession must prefer S._profileDefaultWorkspace before current session workspace"
         )
 
 
@@ -126,9 +126,37 @@ class TestBlankPageAfterSessionDelete:
         """promptNewFile on blank page reads _profileDefaultWorkspace which must
         be non-null even after a newSession() + deleteSession() cycle."""
         src = read('static/ui.js')
-        m = re.search(r'async function promptNewFile\(\)\{.*?\n\}', src, re.DOTALL)
+        m = re.search(r'async function promptNewFile\([^)]*\)\{.*?\n\}', src, re.DOTALL)
         assert m, "promptNewFile not found"
         fn = m.group(0)
         assert '_profileDefaultWorkspace' in fn, (
             "promptNewFile must read S._profileDefaultWorkspace (must persist after newSession)"
         )
+
+
+class TestProfileActiveDefaultWorkspaceApi:
+    """GET /api/profile/active must expose profile-scoped default_workspace (#5169)."""
+
+    def test_profile_active_includes_default_workspace(self, monkeypatch):
+        import api.profiles as profiles
+        import api.routes as routes
+
+        expected_ws = "/tmp/my-profile-workspace"
+
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "work")
+        monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: "/home/.hermes/profiles/work")
+        monkeypatch.setattr(profiles, "_is_root_profile", lambda _n: False)
+        monkeypatch.setattr(routes, "get_profile_default_workspace", lambda: expected_ws)
+        monkeypatch.setattr(
+            routes,
+            "j",
+            lambda _handler, payload, status=200: {"status": status, "payload": payload},
+        )
+
+        from types import SimpleNamespace
+        from urllib.parse import urlparse
+
+        response = routes.handle_get(SimpleNamespace(), urlparse("/api/profile/active"))
+
+        assert response["payload"]["default_workspace"] == expected_ws
+        assert response["payload"]["name"] == "work"

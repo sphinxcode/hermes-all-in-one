@@ -1,6 +1,7 @@
 """Sprint 5 tests: workspace CRUD, file save, session index, JS serving."""
 import json, pathlib, uuid, urllib.request, urllib.error, urllib.parse
 import os
+import pytest
 
 from tests._pytest_port import BASE
 
@@ -138,6 +139,26 @@ def test_workspace_suggest_preserves_tilde_prefix_for_partial_child(monkeypatch,
     assert suggestions == ["~/Projects"]
 
 
+def test_workspace_suggest_expands_tilde_when_home_is_symlink(monkeypatch, tmp_path):
+    from api import workspace
+
+    actual_home = tmp_path / "actual-home"
+    child = actual_home / "Documents"
+    child.mkdir(parents=True)
+    link_home = tmp_path / "link-home"
+    try:
+        link_home.symlink_to(actual_home, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlinks are not available in this environment: {exc}")
+
+    monkeypatch.setenv("HOME", str(link_home))
+    monkeypatch.setattr(workspace, "_trusted_workspace_roots", lambda: [actual_home.resolve()])
+
+    suggestions = workspace.list_workspace_suggestions("~/Doc")
+
+    assert suggestions == ["~/Documents"]
+
+
 def test_workspace_suggest_keeps_absolute_prefix_absolute(monkeypatch, tmp_path):
     from api import workspace
 
@@ -204,8 +225,9 @@ def test_file_save_path_traversal_blocked(cleanup_test_sessions):
     assert status in (400, 500)
 
 def test_session_index_created_after_save(cleanup_test_sessions):
-    # Index is created in the TEST state dir, not the production dir
-    test_state_dir = pathlib.Path(os.environ.get("HERMES_WEBUI_TEST_STATE_DIR", str(pathlib.Path.home() / ".hermes" / "webui-mvp-test")))
+    # Index is created in the TEST state dir, not the production dir.
+    # Use the shared isolated TEST_STATE_DIR (temp-rooted, never ~/.hermes).
+    from tests._pytest_port import TEST_STATE_DIR as test_state_dir
     index_path = test_state_dir / "sessions" / "_index.json"
     make_session_tracked(cleanup_test_sessions)
     # Index may not exist yet if cleanup already wiped it -- just check the endpoint works

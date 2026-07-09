@@ -45,6 +45,9 @@ def test_reasoning_chip_html_starts_hidden():
         src
     )
     assert m, "composerReasoningWrap must start with style='display:none'"
+    assert 'data-effort="max"' not in src, (
+        "composer reasoning dropdown must not include Max"
+    )
 
 
 def test_ui_js_passes_model_context_to_reasoning_api():
@@ -53,7 +56,22 @@ def test_ui_js_passes_model_context_to_reasoning_api():
     assert "_reasoningEffortQuery" in src, (
         "ui.js must pass the active session model/provider to /api/reasoning"
     )
-    assert "api('/api/reasoning'+_reasoningEffortQuery())" in src
+    # The /api/reasoning GET must carry the model/provider query. #4650 captures
+    # the query into a local `key` first (for the in-flight storm + stale-success
+    # guards), so accept either the inlined form or the captured-key form — both
+    # pass _reasoningEffortQuery()'s output to the endpoint.
+    fetch_match = re.search(r"function fetchReasoningChip\(\)\{(.+?)\n\}", src, re.DOTALL)
+    assert fetch_match, "fetchReasoningChip function must exist"
+    fetch_body = fetch_match.group(1)
+    inlined = "api('/api/reasoning'+_reasoningEffortQuery())" in src
+    captured = (
+        re.search(r"const\s+key\s*=\s*_reasoningEffortQuery\(\)", fetch_body)
+        and "api('/api/reasoning'+key)" in fetch_body
+    )
+    assert inlined or captured, (
+        "fetchReasoningChip must pass _reasoningEffortQuery() (model/provider context) "
+        "to GET /api/reasoning, either inlined or via a captured key"
+    )
 
 
 def test_fetchReasoningChip_calls_apply():
@@ -117,10 +135,13 @@ def test_selectModelFromDropdown_defers_reasoning_sync_to_onchange():
 
 
 def test_model_dropdown_passes_provider_to_select():
-    """Composer model rows must pass provider context into selectModelFromDropdown."""
+    """Composer model rows must pass provider context through the shared picker callback."""
     with open("static/ui.js") as f:
         src = f.read()
+    assert "selectModelFromDropdown(value,provider)" in src, (
+        "composer default picker callback must still route to selectModelFromDropdown"
+    )
     assert re.search(
-        r"selectModelFromDropdown\(m\.value,\s*m\.providerId",
+        r"selectFromDropdown\(m\.value,\s*m\.providerId",
         src,
-    ), "model dropdown rows must pass providerId to selectModelFromDropdown"
+    ), "model dropdown rows must pass providerId through the shared callback"

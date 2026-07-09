@@ -2,6 +2,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/health_probe.sh
+. "${REPO_ROOT}/scripts/lib/health_probe.sh"
 HERMES_HOME="${HERMES_HOME:-${HOME}/.hermes}"
 PID_FILE="${HERMES_WEBUI_PID_FILE:-${HERMES_HOME}/webui.pid}"
 LOG_FILE="${HERMES_WEBUI_LOG_FILE:-${HERMES_HOME}/webui.log}"
@@ -27,6 +29,60 @@ ensure_home() {
   mkdir -p "${HERMES_HOME}" "${DEFAULT_STATE_DIR}"
 }
 
+_apply_env_file_safely() {
+  local env_file="$1"
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ "${line}" =~ ^export[[:space:]]+(.+)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+      line="${line#${line%%[![:space:]]*}}"
+    fi
+    [[ "${line}" == *=* ]] || continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "${key}" in
+      UID | GID | EUID | EGID | PPID) continue ;;
+    esac
+
+    value="${value#${value%%[![:space:]]*}}"
+    if [[ "${value}" =~ ^\"(([^\"\\]|\\.)*)\"([[:space:]]*\#.*)?[[:space:]]*$ ]]; then
+      value="${BASH_REMATCH[1]}"
+      value="$(printf '%s' "$value" | awk '{
+        i = 1
+        len = length($0)
+        while (i <= len) {
+          c = substr($0, i, 1)
+          if (c == "\\" && i < len) {
+            nc = substr($0, i+1, 1)
+            if (nc == "n") printf "\n"
+            else if (nc == "r") printf "\r"
+            else if (nc == "t") printf "\t"
+            else if (nc == "\"") printf "\""
+            else if (nc == "\\") printf "\\"
+            else { printf "\\%s", nc }
+            i += 2
+          } else {
+            printf "%s", c
+            i++
+          }
+        }
+      }')"
+    elif [[ "${value}" =~ ^\'([^\']*)\'([[:space:]]*\#.*)?[[:space:]]*$ ]]; then
+      value="${BASH_REMATCH[1]}"
+    else
+      value="${value%%[[:space:]]\#*}"
+      value="${value%${value##*[![:space:]]}}"
+    fi
+
+    export "${key}=${value}"
+  done < "${env_file}"
+}
+
 _load_repo_dotenv_preserving_env() {
   [[ "${HERMES_WEBUI_NO_DOTENV:-0}" == "1" ]] && return 0
   local env_file="${REPO_ROOT}/.env"
@@ -38,19 +94,66 @@ _load_repo_dotenv_preserving_env() {
     line="${line#${line%%[![:space:]]*}}"
     [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
     key="${line%%=*}"
-    key="${key#export }"
+    if [[ "${key}" =~ ^export[[:space:]]+(.+)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+    fi
     key="${key//[[:space:]]/}"
     [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    # Skip shell-readonly names (UID/GID/EUID/EGID/PPID); re-exporting them
+    # below would abort under `set -euo pipefail` with "readonly variable".
+    case "${key}" in
+      UID | GID | EUID | EGID | PPID) continue ;;
+    esac
     if [[ -n "${!key+x}" ]]; then
       value="${!key}"
       preserved+=("${key}=${value}")
     fi
   done < "${env_file}"
 
-  set -a
-  # shellcheck source=/dev/null
-  source "${env_file}"
-  set +a
+  _apply_env_file_safely "${env_file}"
+
+  local assignment
+  if [[ ${#preserved[@]} -gt 0 ]]; then
+    for assignment in "${preserved[@]}"; do
+      export "${assignment}"
+    done
+  fi
+}
+
+_load_hermes_dotenv() {
+  # Also load ~/.hermes/.env so that ${VAR} references in config.yaml can
+  # resolve against provider credentials defined in the Hermes env file.
+  # Repo .env takes precedence (loaded above); variables already exported
+  # into the shell environment (including those just set by repo .env) are
+  # captured in preserved[] before _apply_env_file_safely runs and are
+  # restored afterwards, so this acts as a fallback source for vars the
+  # repo .env did not define.
+  [[ "${HERMES_WEBUI_NO_DOTENV:-0}" == "1" ]] && return 0
+  local hermes_home="${HERMES_HOME:-${HOME}/.hermes}"
+  local hermes_env="${hermes_home}/.env"
+  [[ -f "${hermes_env}" ]] || return 0
+
+  local -a preserved=()
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#${line%%[![:space:]]*}}"
+    [[ -z "${line}" || "${line}" == \#* || "${line}" != *=* ]] && continue
+    key="${line%%=*}"
+    if [[ "${key}" =~ ^export[[:space:]]+(.+)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+    fi
+    key="${key//[[:space:]]/}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "${key}" in
+      UID | GID | EUID | EGID | PPID) continue ;;
+    esac
+    if [[ -n "${!key+x}" ]]; then
+      value="${!key}"
+      preserved+=("${key}=${value}")
+    fi
+  done < "${hermes_env}"
+
+  _apply_env_file_safely "${hermes_env}"
 
   local assignment
   if [[ ${#preserved[@]} -gt 0 ]]; then
@@ -165,21 +268,96 @@ _is_alive() {
   kill -0 "${pid}" >/dev/null 2>&1
 }
 
-_proc_args() {
+_is_windows_bash() {
+  [[ "${OS:-}" == "Windows_NT" ]] && return 0
+  case "$(uname -s 2>/dev/null || true)" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_windows_bash_path() {
+  local path="${1//\\//}" drive rest
+  if [[ "${path}" =~ ^([A-Za-z]):(.*)$ ]]; then
+    drive="${BASH_REMATCH[1],,}"
+    rest="${BASH_REMATCH[2]}"
+    printf '/%s%s\n' "${drive}" "${rest}"
+    return
+  fi
+  printf '%s\n' "${path}"
+}
+
+_windows_pid_for_bash_pid() {
   local pid="$1"
-  ps -p "${pid}" -o args= 2>/dev/null || true
+  ps -p "${pid}" -l 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+_stop_webui_pid() {
+  local pid="$1" signal="${2:-TERM}"
+  if _is_windows_bash && command -v taskkill >/dev/null 2>&1; then
+    local winpid
+    winpid="$(_windows_pid_for_bash_pid "${pid}")"
+    if [[ "${winpid}" =~ ^[0-9]+$ ]]; then
+      taskkill //F //T //PID "${winpid}" >/dev/null 2>&1 || true
+      return
+    fi
+  fi
+  if [[ "${signal}" == "KILL" ]]; then
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  else
+    kill "${pid}" >/dev/null 2>&1 || true
+  fi
+}
+
+_proc_args() {
+  local pid="$1" args
+  args="$(ps -p "${pid}" -o args= 2>/dev/null || true)"
+  if [[ -n "${args}" ]]; then
+    printf '%s\n' "${args}"
+    return
+  fi
+  if _is_windows_bash; then
+    local winpid
+    winpid="$(_windows_pid_for_bash_pid "${pid}")"
+    if [[ "${winpid}" =~ ^[0-9]+$ ]] && command -v wmic >/dev/null 2>&1; then
+      args="$(wmic process where "ProcessId=${winpid}" get CommandLine //value 2>/dev/null | sed -n 's/^CommandLine=//p' | tr -d '\r')"
+      if [[ -n "${args}" ]]; then
+        printf '%s\n' "${args}"
+        return
+      fi
+    fi
+    ps -p "${pid}" -f 2>/dev/null | awk 'NR == 2 { for (i = 8; i <= NF; i++) printf "%s%s", (i == 8 ? "" : " "), $i; print "" }'
+  fi
 }
 
 _is_owned_webui_pid() {
-  local pid="$1" args state_repo="" state_python=""
+  local pid="$1" args args_slash state_repo="" state_repo_slash="" state_repo_win="" state_repo_win_slash="" state_python="" state_python_slash="" state_python_bash=""
   [[ -f "${STATE_FILE}" ]] || return 1
   _load_state_if_present
   state_repo="${REPO_ROOT:-}"
   state_python="${PYTHON_EXE:-}"
+  state_repo_slash="${state_repo//\\//}"
+  state_python_slash="${state_python//\\//}"
+  if _is_windows_bash; then
+    state_repo_win="$(cygpath -w "${state_repo}" 2>/dev/null || true)"
+    state_repo_win_slash="${state_repo_win//\\//}"
+  fi
+  if [[ -n "${state_python}" ]] && _is_windows_bash; then
+    state_python_bash="$(_windows_bash_path "${state_python}")"
+  fi
   [[ "${state_repo}" == "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" ]] || return 1
   args="$(_proc_args "${pid}")"
   [[ -n "${args}" ]] || return 1
-  [[ "${args}" == *"${state_repo}/bootstrap.py"* || "${args}" == *"${state_repo}/server.py"* || "${args}" == *"${state_repo}/start.sh"* || ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ]]
+  args_slash="${args//\\//}"
+  [[ "${args_slash}" == *"${state_repo_slash}/bootstrap.py"* ||
+     "${args_slash}" == *"${state_repo_slash}/server.py"* ||
+     "${args_slash}" == *"${state_repo_slash}/start.sh"* ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/bootstrap.py"* ) ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/server.py"* ) ||
+     ( -n "${state_repo_win_slash}" && "${args_slash}" == *"${state_repo_win_slash}/start.sh"* ) ||
+     ( -n "${state_python}" && "${args}" == *"${state_python}"* ) ||
+     ( -n "${state_python_slash}" && "${args_slash}" == *"${state_python_slash}"* ) ||
+     ( -n "${state_python_bash}" && "${args_slash}" == *"${state_python_bash}"* ) ]]
 }
 
 _current_pid() {
@@ -249,6 +427,7 @@ _launchd_webui_pid() {
 start_cmd() {
   ensure_home
   _load_repo_dotenv_preserving_env
+  _load_hermes_dotenv
   export HERMES_WEBUI_STATE_DIR="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
   mkdir -p "${HERMES_WEBUI_STATE_DIR}"
   _parse_launch_binding "$@"
@@ -308,7 +487,7 @@ stop_cmd() {
   fi
 
   echo "[ctl] Stopping Hermes WebUI (PID ${pid})"
-  kill "${pid}" >/dev/null 2>&1 || true
+  _stop_webui_pid "${pid}" TERM
   local i
   for i in {1..50}; do
     if ! _is_alive "${pid}"; then
@@ -320,17 +499,21 @@ stop_cmd() {
   done
 
   echo "[ctl] Process did not exit after SIGTERM; sending SIGKILL" >&2
-  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  _stop_webui_pid "${pid}" KILL
   rm -f "${PID_FILE}" "${STATE_FILE}"
 }
 
 _health_line() {
-  local host="$1" port="$2" url result
-  url="http://${host}:${port}/health"
-  if command -v curl >/dev/null 2>&1; then
-    if result="$(curl -fsS --max-time 2 "${url}" 2>/dev/null)"; then
-      if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "${result}" | python3 -c 'import json,sys
+  local host="$1" port="$2" url scheme result
+  scheme="$(hermes_webui_probe_scheme)"
+  url="${scheme}://${host}:${port}/health"
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "unknown (curl/wget not found; ${url})"
+    return 0
+  fi
+  if result="$(hermes_webui_probe_health "${host}" "${port}" "/health" 2)"; then
+    if command -v python3 >/dev/null 2>&1; then
+      printf '%s' "${result}" | python3 -c 'import json,sys
 try:
     data=json.load(sys.stdin)
     sessions=data.get("sessions", data.get("session_count", "?"))
@@ -339,19 +522,18 @@ try:
     print(f"ok ({sessions} sessions, {active} active streams)" if status == "ok" else status)
 except Exception:
     print("ok")'
-      else
-        echo "ok"
-      fi
     else
-      echo "unreachable (${url})"
+      echo "ok"
     fi
   else
-    echo "unknown (curl not found; ${url})"
+    echo "unreachable (${url})"
   fi
 }
 
 status_cmd() {
   ensure_home
+  _load_repo_dotenv_preserving_env
+  _load_hermes_dotenv
   _load_state_if_present
   local host="${HOST:-${HERMES_WEBUI_HOST:-127.0.0.1}}"
   local port="${PORT:-${HERMES_WEBUI_PORT:-8787}}"

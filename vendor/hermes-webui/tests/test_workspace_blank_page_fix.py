@@ -71,13 +71,32 @@ class TestBootJsProfileDefaultWorkspace:
             "S._profileDefaultWorkspace must be set in the same settings-fetch block"
         )
 
+    def test_boot_sets_profile_default_workspace_from_profile_active(self):
+        """Profile active bootstrap must override settings with p.default_workspace (#5169)."""
+        src = read('static/boot.js')
+        active_idx = src.find("api('/api/profile/active'")
+        assert active_idx != -1, "/api/profile/active fetch not found in boot.js"
+        block = src[active_idx:active_idx + 1200]
+        assert 'p.default_workspace' in block, (
+            "boot.js must read default_workspace from /api/profile/active response"
+        )
+        assert '_profileDefaultWorkspace' in block, (
+            "boot.js must assign S._profileDefaultWorkspace from profile active bootstrap"
+        )
+        assert re.search(
+            r"if\s*\(\s*p\.default_workspace\s*\)\s*S\._profileDefaultWorkspace\s*=\s*p\.default_workspace",
+            block,
+        ), (
+            "boot.js must set S._profileDefaultWorkspace when p.default_workspace is present"
+        )
+
 
 class TestPromptNewFileNoSession:
     """promptNewFile/promptNewFolder must auto-create a session on blank page."""
 
     def test_prompt_new_file_auto_creates_session(self):
         src = read('static/ui.js')
-        m = re.search(r'async function promptNewFile\(\)\{.*?\n\}', src, re.DOTALL)
+        m = re.search(r'async function promptNewFile\([^)]*\)\{.*?\n\}', src, re.DOTALL)
         assert m, "promptNewFile not found"
         fn = m.group(0)
         # Must have auto-create path (not just early return when no session)
@@ -92,7 +111,7 @@ class TestPromptNewFileNoSession:
 
     def test_prompt_new_folder_auto_creates_session(self):
         src = read('static/ui.js')
-        m = re.search(r'async function promptNewFolder\(\)\{.*?\n\}', src, re.DOTALL)
+        m = re.search(r'async function promptNewFolder\([^)]*\)\{.*?\n\}', src, re.DOTALL)
         assert m, "promptNewFolder not found"
         fn = m.group(0)
         assert '_profileDefaultWorkspace' in fn, (
@@ -105,7 +124,7 @@ class TestPromptNewFileNoSession:
     def test_prompt_new_file_still_returns_early_without_default(self):
         """If no default workspace, the function should return early (not crash)."""
         src = read('static/ui.js')
-        m = re.search(r'async function promptNewFile\(\)\{.*?\n\}', src, re.DOTALL)
+        m = re.search(r'async function promptNewFile\([^)]*\)\{.*?\n\}', src, re.DOTALL)
         assert m
         fn = m.group(0)
         # Must have a guard for empty workspace
@@ -129,6 +148,22 @@ class TestWorkspaceSwitcherBlankPage:
             "switchToWorkspace must call /api/session/new when S.session is null"
         )
 
+    def test_switch_to_workspace_keeps_busy_guard_after_blank_page_create(self):
+        src = read('static/panels.js')
+        start = src.find('async function switchToWorkspace(')
+        assert start != -1, "switchToWorkspace not found"
+        fn = src[start:src.find('async function toggleWorktreePanel', start)]
+        assert "t('workspace_busy_switch')" in fn, (
+            "switchToWorkspace must keep the busy-session workspace switch toast"
+        )
+        blank_create = fn.index("api('/api/session/new'")
+        busy_guard = fn.index('if(S.busy)')
+        update_call = fn.index("api('/api/session/update'")
+        assert blank_create < busy_guard < update_call, (
+            "switchToWorkspace must auto-create blank-page sessions before the busy guard, "
+            "then return before workspace update while busy"
+        )
+
     def test_prompt_workspace_path_auto_creates_session(self):
         src = read('static/panels.js')
         m = re.search(r'async function promptWorkspacePath\(\)\{.*?\n\}', src, re.DOTALL)
@@ -150,4 +185,19 @@ class TestWorkspaceSwitcherBlankPage:
         )
         assert '!hasSession && composerDropdown' not in fn, (
             "Regression guard: !hasSession for dropdown close must be removed"
+        )
+
+
+class TestWorkspaceDropdownBlankPageCurrentWs:
+    """Blank-page workspace dropdown must highlight profile default (#5169)."""
+
+    def test_render_workspace_dropdown_uses_profile_default_on_blank_page(self):
+        src = read('static/panels.js')
+        assert re.search(
+            r"renderWorkspaceDropdownInto\([^,]+,\s*[^,]+,\s*"
+            r"S\.session\?\.workspace\|\|S\._profileDefaultWorkspace\|\|data\.last\|\|''\)",
+            src,
+        ), (
+            "renderWorkspaceDropdownInto must use session, profile default, or data.last "
+            "as current workspace on blank page"
         )

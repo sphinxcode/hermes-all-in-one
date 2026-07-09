@@ -40,7 +40,9 @@ def test_llm_wiki_status_reads_synthetic_fixture_without_exposing_content(tmp_pa
     assert status["page_count"] == 2
     assert status["raw_source_count"] == 1
     assert status["last_updated"] is not None
-    assert status["last_writer"] is None
+    # log.md in the fixture has a "## [2026-05-04] update | ..." heading,
+    # so the new last-writer reader must surface that action verb.
+    assert status["last_writer"] == "ai-agent (update)"
     assert status["toggle_available"] is False
     assert status["docs_url"].endswith("/research-llm-wiki")
     serialized = repr(status)
@@ -98,3 +100,214 @@ def test_insights_panel_fetches_and_renders_llm_wiki_status_card():
     assert "wiki-status-card" in style_src
     assert "raw/" in panels_src
     assert "recent_entries" not in panels_src
+
+
+def test_last_writer_reads_frontmatter(tmp_path):
+    """#3455 part 2: the Last writer field reads page frontmatter updated_by/writer/author."""
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    _write(wiki / "entities" / "a.md", "---\ntitle: A\nupdated_by: alice\n---\nbody\n")
+    pages = routes._llm_wiki_page_files(wiki)
+    assert routes._llm_wiki_last_writer(wiki, pages) == "alice"
+
+
+def test_llm_wiki_status_rechecks_cached_page_targets(monkeypatch, tmp_path):
+    import os as _os
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    page = _write(wiki / "concepts" / "sub" / "real.md", "---\nauthor: public\n---\nbody\n")
+    _write(wiki / ".env", "---\nauthor: hidden-author\n---\nPRIVATE=1\n")
+
+    routes._llm_wiki_clear_page_files_cache()
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+    monkeypatch.setattr(routes, "_WIKI_ALLOWLIST_TTL", 60.0)
+
+    assert routes._llm_wiki_page_files(wiki) == [page]
+
+    page.unlink()
+    try:
+        page.symlink_to(_os.path.join("..", "..", ".env"))
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks not supported on this platform")
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["page_count"] == 0
+    assert status["last_writer"] == "ai-agent"
+    assert "hidden-author" not in repr(status)
+
+
+def test_llm_wiki_status_drops_cached_entry_replaced_by_directory(monkeypatch, tmp_path):
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    page = _write(wiki / "concepts" / "sub" / "real.md", "---\nauthor: public\n---\nbody\n")
+
+    routes._llm_wiki_clear_page_files_cache()
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+    monkeypatch.setattr(routes, "_WIKI_ALLOWLIST_TTL", 60.0)
+
+    assert routes._llm_wiki_page_files(wiki) == [page]
+
+    page.unlink()
+    page.mkdir()
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["page_count"] == 0
+    assert status["last_writer"] == "ai-agent"
+
+
+def test_llm_wiki_status_last_writer_rechecks_identity(monkeypatch, tmp_path):
+    import os as _os
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    page = _write(wiki / "concepts" / "real.md", "---\nauthor: public\n---\nbody\n")
+    _write(wiki / ".env", "---\nauthor: hidden-author\n---\nPRIVATE=1\n")
+
+    routes._llm_wiki_clear_page_files_cache()
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+
+    original = routes._llm_wiki_allowlisted_entries
+
+    def swapped(root):
+        entries = original(root)
+        page.unlink()
+        page.symlink_to(_os.path.join("..", ".env"))
+        return entries
+
+    monkeypatch.setattr(routes, "_llm_wiki_allowlisted_entries", swapped)
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["page_count"] == 0
+    assert status["last_updated"] is None
+    assert status["last_writer"] == "ai-agent"
+    assert "hidden-author" not in repr(status)
+
+
+def test_llm_wiki_status_log_heading_rechecks_identity(monkeypatch, tmp_path):
+    import os as _os
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    _write(wiki / "log.md", "## [2026-06-19] update | safe\n",)
+    _write(wiki / ".env", "## [2026-06-19] leak | hidden\n")
+
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+
+    original_open = routes.os.open
+    swapped = {"done": False}
+
+    def fake_open(path, flags, mode=0o777):
+        if not swapped["done"] and Path(path) == wiki / "log.md":
+            swapped["done"] = True
+            (wiki / "log.md").unlink()
+            (wiki / "log.md").symlink_to(_os.path.join(".env"))
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(routes.os, "open", fake_open)
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["last_writer"] == "ai-agent"
+
+
+def test_llm_wiki_status_log_heading_rechecks_preopen_symlink_swap(monkeypatch, tmp_path):
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    _write(wiki / "log.md", "## [2026-06-19] update | safe\n")
+    _write(wiki / ".env", "## [2026-06-19] leak | hidden\n")
+
+    try:
+        link = wiki / "probe"
+        link.symlink_to(".env")
+        link.unlink()
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks not supported on this platform")
+
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+
+    original_lstat = Path.lstat
+    swapped = {"done": False}
+
+    def fake_lstat(self):
+        if not swapped["done"] and self == wiki / "log.md":
+            swapped["done"] = True
+            (wiki / "log.md").unlink()
+            (wiki / "log.md").symlink_to(".env")
+        return original_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["last_writer"] == "ai-agent"
+
+
+def test_llm_wiki_status_last_updated_rechecks_status_file_identity(monkeypatch, tmp_path):
+    import api.routes as routes
+
+    wiki = tmp_path / "wiki"
+    log_path = _write(wiki / "log.md", "## [2026-06-19] update | safe\n")
+    hidden = _write(wiki / ".env", "PRIVATE=1\n")
+
+    try:
+        log_path.unlink()
+        log_path.symlink_to(hidden.name)
+        log_path.unlink()
+        log_path.write_text("## [2026-06-19] update | safe\n", encoding="utf-8")
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks not supported on this platform")
+
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+
+    original_stat = Path.stat
+    swapped = {"done": False}
+
+    def fake_stat(self, *args, **kwargs):
+        if not swapped["done"] and self == log_path:
+            swapped["done"] = True
+            log_path.unlink()
+            log_path.symlink_to(hidden.name)
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+    status = routes._build_llm_wiki_status()
+
+    assert status["last_updated"] is None
+
+
+def test_last_writer_rejects_symlink_outside_wiki(tmp_path):
+    """#3455 review (Codex): a symlinked .md page resolving OUTSIDE the wiki must
+    not be read — its frontmatter must never leak into the status card."""
+    import api.routes as routes
+
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    secret = outside / "private.md"
+    secret.write_text("---\nauthor: outside-secret\n---\nprivate body\n", encoding="utf-8")
+
+    wiki = tmp_path / "wiki" / "entities"
+    wiki.mkdir(parents=True, exist_ok=True)
+    link = wiki / "linked.md"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("symlinks not supported on this platform")
+
+    wiki_root = tmp_path / "wiki"
+    pages = routes._llm_wiki_page_files(wiki_root)
+    writer = routes._llm_wiki_last_writer(wiki_root, pages)
+    # The external symlink's frontmatter must NOT surface; falls back to ai-agent.
+    assert writer != "outside-secret"
+    assert "outside-secret" not in writer

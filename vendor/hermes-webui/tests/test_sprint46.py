@@ -102,7 +102,7 @@ def _install_fake_compression_runtime(monkeypatch, agent_cls):
     )
 
 
-def _make_session(messages=None):
+def _make_session(messages=None, tool_calls=None):
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     messages = messages or [
         {"role": "user", "content": "one"},
@@ -116,6 +116,7 @@ def _make_session(messages=None):
         workspace="/tmp/hermes-webui-test",
         model="openai/gpt-5.4-mini",
         messages=messages,
+        tool_calls=tool_calls or [],
     )
     s.save(touch_updated_at=False)
     return s.session_id
@@ -130,7 +131,23 @@ def test_session_compress_requires_session_id(cleanup_test_sessions):
 
 def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     created = cleanup_test_sessions
-    sid = _make_session()
+    original_messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    compressed_messages = [original_messages[0], original_messages[-1]]
+    settled_tool_calls = [
+        {
+            "id": "call_1",
+            "name": "terminal",
+            "assistant_msg_idx": 1,
+            "done": True,
+            "result": "schema.sql",
+        }
+    ]
+    sid = _make_session(original_messages, tool_calls=settled_tool_calls)
     created.append(sid)
 
     _install_fake_compression_runtime(monkeypatch, _FakeAgent)
@@ -144,18 +161,37 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert payload["focus_topic"] == "database schema"
     assert payload["summary"]["headline"] == "Compressed: 4 → 2 messages"
     assert payload["session"]["session_id"] == sid
-    assert payload["session"]["messages"] == [
-        {"role": "user", "content": "one"},
-        {"role": "assistant", "content": "four"},
-    ]
+    assert payload["session"]["messages"] == original_messages
+    assert payload["session"]["tool_calls"] == settled_tool_calls
+    assert payload["session"]["message_count"] == len(original_messages)
     assert payload["session"]["compression_anchor_summary"] is not None
-    assert payload["session"]["compression_anchor_visible_idx"] == 1
+    assert payload["session"]["compression_anchor_visible_idx"] == 3
     assert isinstance(payload["session"]["compression_anchor_message_key"], dict)
     assert payload["session"]["compression_anchor_message_key"].get("role") == "assistant"
+    assert payload["session"]["compression_anchor_message_key"].get("text") == "four"
     loaded = get_session(sid)
+    persisted = Session.load(sid)
+    assert loaded.messages == original_messages
+    assert [m.get("role") for m in loaded.context_messages] == [m.get("role") for m in compressed_messages]
+    assert [m.get("content") for m in loaded.context_messages] == [m.get("content") for m in compressed_messages]
+    assert loaded.tool_calls == settled_tool_calls
+    assert persisted.messages == original_messages
+    assert [m.get("role") for m in persisted.context_messages] == [m.get("role") for m in compressed_messages]
+    assert [m.get("content") for m in persisted.context_messages] == [m.get("content") for m in compressed_messages]
+    assert persisted.tool_calls == settled_tool_calls
     assert loaded.compression_anchor_summary == payload["session"]["compression_anchor_summary"]
     assert loaded.compression_anchor_visible_idx == payload["session"]["compression_anchor_visible_idx"]
     assert loaded.compression_anchor_message_key == payload["session"]["compression_anchor_message_key"]
+    assert loaded.compression_anchor_mode == "manual"
+    assert loaded.truncation_watermark is not None
+    assert loaded.truncation_boundary == loaded.truncation_watermark
+    assert loaded.last_prompt_tokens is not None
+    assert persisted.compression_anchor_mode == "manual"
+    assert persisted.truncation_watermark == loaded.truncation_watermark
+    assert persisted.truncation_boundary == loaded.truncation_boundary
+    assert not (SESSION_DIR / f"{sid}.json.bak").exists()
+    assert persisted.compression_anchor_visible_idx == 3
+    assert persisted.compression_anchor_message_key == payload["session"]["compression_anchor_message_key"]
     assert _FakeAgent.last_instance is not None
     assert _FakeAgent.last_instance.context_compressor.calls[0]["focus_topic"] == "database schema"
 
@@ -185,7 +221,16 @@ def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cle
             self.instances.append(self)
 
     created = cleanup_test_sessions
-    sid = _make_session()
+    settled_tool_calls = [
+        {
+            "id": "call_async_1",
+            "name": "read_file",
+            "assistant_msg_idx": 1,
+            "done": True,
+            "result": "config.yaml",
+        }
+    ]
+    sid = _make_session(tool_calls=settled_tool_calls)
     created.append(sid)
     _install_fake_compression_runtime(monkeypatch, BlockingAgent)
     try:
@@ -227,8 +272,17 @@ def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cle
     assert done_payload["summary"]["headline"] == "Compressed: 4 → 2 messages"
     assert done_payload["session"]["messages"] == [
         {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
         {"role": "assistant", "content": "four"},
     ]
+    assert done_payload["session"]["tool_calls"] == settled_tool_calls
+    persisted = Session.load(sid)
+    assert persisted.tool_calls == settled_tool_calls
+    # /compress now stamps missing message timestamps, so compare role/content
+    # rather than full-dict equality (mirrors test_session_compress_roundtrip).
+    assert [m.get("role") for m in persisted.context_messages] == ["user", "assistant"]
+    assert [m.get("content") for m in persisted.context_messages] == ["one", "four"]
 
 
 def test_session_compress_status_reports_worker_error_without_raw_paths(monkeypatch, cleanup_test_sessions):
